@@ -81,6 +81,7 @@ var daemonDiskUsageCmd = &cobra.Command{
 func init() {
 	f := daemonStartCmd.Flags()
 	f.Bool("foreground", false, "Run in the foreground instead of background")
+	f.Bool("takeover", false, "If another daemon already owns this machine, ask it to stop and take over instead of failing")
 	f.String("daemon-id", "", "Unique daemon identifier (env: MULTICA_DAEMON_ID)")
 	f.String("device-name", "", "Human-readable device name (env: MULTICA_DAEMON_DEVICE_NAME)")
 	f.String("runtime-name", "", "Runtime display name (env: MULTICA_AGENT_RUNTIME_NAME)")
@@ -101,6 +102,7 @@ func init() {
 	// restart shares all the same flags as start
 	rf := daemonRestartCmd.Flags()
 	rf.Bool("foreground", false, "Run in the foreground instead of background")
+	rf.Bool("takeover", false, "If another daemon already owns this machine, ask it to stop and take over instead of failing")
 	rf.String("daemon-id", "", "Unique daemon identifier (env: MULTICA_DAEMON_ID)")
 	rf.String("device-name", "", "Human-readable device name (env: MULTICA_DAEMON_DEVICE_NAME)")
 	rf.String("runtime-name", "", "Runtime display name (env: MULTICA_AGENT_RUNTIME_NAME)")
@@ -234,6 +236,109 @@ func healthPortForProfile(profile string) int {
 	return daemon.DefaultHealthPort + 1 + (h % 1000)
 }
 
+// prepareDaemonOwnership makes sure it is safe to (re)start a daemon on this
+// machine before one is spawned. At most one daemon may own the machine-global
+// lock at cli.ProfileDir("")/daemon.lock, which spans every profile — so it
+// catches a Desktop-spawned daemon running under a different profile that the
+// per-profile health-port guard cannot see (VWO-365).
+//
+// It runs in the LAUNCHER purely to give a fast, actionable error (or perform a
+// requested takeover); the spawned daemon's Run re-acquires the lock for real.
+//
+//   - break-glass (MULTICA_DAEMON_ALLOW_MULTIPLE set) → skip.
+//   - lock free → nil.
+//   - lock held, --takeover → ask the incumbent to stop, wait for release.
+//   - lock held, no --takeover → the actionable conflict error.
+//
+// ownershipHandoffWait bounds how long the launcher waits for a shutting-down
+// incumbent to release the machine lock. It covers the gap between a daemon's
+// health port closing (at the start of shutdown) and its ownership lock
+// releasing (after it finishes deregistering runtimes), so a `daemon restart`
+// or a stop-then-start does not spuriously report a conflict.
+const ownershipHandoffWait = 15 * time.Second
+
+func prepareDaemonOwnership(cmd *cobra.Command) error {
+	if daemon.OwnershipBypassed() {
+		return nil
+	}
+	baseDir, err := cli.ProfileDir("")
+	if err != nil {
+		return fmt.Errorf("resolve base config dir for daemon ownership lock: %w", err)
+	}
+	free, incumbent, ok, err := daemon.ProbeOwnership(baseDir)
+	if err != nil {
+		return err
+	}
+	if free {
+		return nil
+	}
+	if takeover, _ := cmd.Flags().GetBool("takeover"); takeover {
+		return takeoverDaemonOwner(baseDir, incumbent)
+	}
+	// The lock is held. If the incumbent is genuinely live (its health port
+	// answers), reject immediately with an actionable error. If it is NOT
+	// answering, it is shutting down — the daemon a `restart`/`stop` just asked
+	// to exit, still finishing deregister before it releases the lock — so wait
+	// a bounded time for the clean handoff rather than reject a legitimate
+	// restart. A wedged daemon that never releases falls through to the same
+	// conflict error after the wait.
+	if ok && incumbent.HealthPort > 0 && daemonAliveOnPort(incumbent.HealthPort) {
+		return ownershipConflictErr(baseDir, incumbent, ok)
+	}
+	if waitForOwnershipFree(baseDir, ownershipHandoffWait) {
+		return nil
+	}
+	return ownershipConflictErr(baseDir, incumbent, ok)
+}
+
+func ownershipConflictErr(baseDir string, incumbent daemon.OwnerInfo, hasInfo bool) error {
+	return &daemon.OwnershipConflict{Path: daemon.OwnershipLockPath(baseDir), Incumbent: incumbent, HasInfo: hasInfo}
+}
+
+// daemonAliveOnPort reports whether a daemon health endpoint answers on port.
+func daemonAliveOnPort(port int) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	return daemonAlive(checkDaemonHealthOnPort(ctx, port))
+}
+
+// waitForOwnershipFree polls until the machine lock is free or timeout elapses.
+func waitForOwnershipFree(baseDir string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if free, _, _, err := daemon.ProbeOwnership(baseDir); err == nil && free {
+			return true
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return false
+}
+
+// takeoverDaemonOwner asks the incumbent daemon to shut down (via its recorded
+// health port — cross-platform, no OS signals) and waits until it releases the
+// machine lock. The OS drops the incumbent's advisory lock the instant its
+// process exits, so a successful shutdown frees the lock with no stale window.
+func takeoverDaemonOwner(baseDir string, incumbent daemon.OwnerInfo) error {
+	if incumbent.HealthPort <= 0 {
+		return fmt.Errorf("cannot take over: owner health port unknown (owner pid %d); stop it manually with `multica daemon stop`", incumbent.PID)
+	}
+	fmt.Fprintf(os.Stderr, "Taking over from daemon pid %d (profile %q) on health port %d...\n",
+		incumbent.PID, incumbent.Profile, incumbent.HealthPort)
+	if err := requestDaemonShutdown(incumbent.HealthPort); err != nil {
+		fmt.Fprintf(os.Stderr, "Graceful shutdown request failed: %v — falling back to forced kill.\n", err)
+		if incumbent.PID > 0 {
+			if p, perr := os.FindProcess(incumbent.PID); perr == nil {
+				_ = p.Kill()
+			}
+		}
+	}
+	if waitForOwnershipFree(baseDir, 30*time.Second) {
+		fmt.Fprintln(os.Stderr, "Previous daemon released the machine; continuing.")
+		return nil
+	}
+	return fmt.Errorf("takeover timed out: daemon pid %d did not release the machine lock within 30s", incumbent.PID)
+}
+
 // --- daemon start ---
 
 func runDaemonStart(cmd *cobra.Command, _ []string) error {
@@ -259,6 +364,14 @@ func runDaemonBackground(cmd *cobra.Command) error {
 		}
 		pid, _ := health["pid"].(float64)
 		return fmt.Errorf("%s is already running (pid %v). Use 'daemon restart' to restart it", label, int(pid))
+	}
+
+	// Reject (or take over) a daemon owning this machine under ANY profile — the
+	// cross-profile case the same-profile health check above misses (VWO-365).
+	// Done before spawning so the user sees an actionable error immediately, not
+	// the generic "may not have started" timeout after the child fails to lock.
+	if err := prepareDaemonOwnership(cmd); err != nil {
+		return err
 	}
 
 	// Resolve current executable so the foreground child reuses this binary.
@@ -423,6 +536,18 @@ func runDaemonForeground(cmd *cobra.Command) error {
 	util.EnsureHiddenConsole()
 
 	profile := resolveProfile(cmd)
+
+	// Honor --takeover on a direct `daemon start --foreground --takeover`: free
+	// the incumbent before Run tries to acquire the machine lock. Without
+	// --takeover we skip the pre-check entirely — Run's acquire is the sole
+	// authority and returns the conflict error itself — so the common
+	// background→foreground child path (which inherits no --takeover) does not
+	// re-probe.
+	if takeover, _ := cmd.Flags().GetBool("takeover"); takeover {
+		if err := prepareDaemonOwnership(cmd); err != nil {
+			return err
+		}
+	}
 
 	// Pick the log sink. A user who runs `daemon start --foreground` in a shell
 	// keeps live, colored logging on their terminal (a documented debugging
