@@ -41,11 +41,15 @@ multica runtime usage <runtime-id> --output json
 multica runtime activity <runtime-id> --output json
 multica runtime update <runtime-id> --target-version <version> --output json
 multica runtime delete <runtime-id>
+multica daemon drain --timeout 2h
+multica daemon status --output json
 multica repo checkout <url>
 multica repo checkout <url> --ref <branch-or-sha>
 ```
 
 `runtime update` and `runtime delete` are writes. `runtime delete` removes a runtime registration; if active agents are still bound, it refuses unless the user explicitly passes `--cascade`, which archives those agents and cancels their queued/running tasks before deleting the runtime. `repo checkout` creates a git worktree in the task working directory.
+
+`daemon drain` is the safe maintenance boundary. It pauses new claims immediately, lets claims already in flight and active tasks finish, then stops without changing queued server rows. A CLI wait timeout leaves the daemon draining; it does not cancel work or resume admission. `daemon stop`, `restart`, and `start --takeover` are lifecycle controls, not maintenance drains.
 
 `repo checkout` requires `MULTICA_DAEMON_PORT`; it is intended to run inside a daemon task. If absent, you are not in the normal agent checkout path. When a project `github_repo` resource has `resource_ref.ref`, `repo checkout <url>` uses that ref by default for the current task; an explicit `repo checkout <url> --ref <branch-or-sha>` overrides it.
 

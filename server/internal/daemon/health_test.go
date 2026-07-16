@@ -53,6 +53,12 @@ func TestHealthHandlerReportsCLIVersionAndActiveTaskCount(t *testing.T) {
 	if got, want := raw["active_task_count"], float64(3); got != want {
 		t.Errorf("active_task_count key: got %v, want %v", got, want)
 	}
+	if got, want := raw["claims_paused"], false; got != want {
+		t.Errorf("claims_paused key: got %v, want %v", got, want)
+	}
+	if got, want := raw["claims_in_flight"], float64(0); got != want {
+		t.Errorf("claims_in_flight key: got %v, want %v", got, want)
+	}
 	if got, want := raw["status"], "running"; got != want {
 		t.Errorf("status key: got %v, want %q", got, want)
 	}
@@ -133,6 +139,145 @@ func TestHealthHandlerActiveTaskCountTracksCounter(t *testing.T) {
 
 	d.activeTasks.Add(-1)
 	assertActiveTaskCount(t, handler, 0)
+}
+
+func TestDrainPausesClaimsAndWaitsForCurrentWork(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d := &Daemon{
+		cancelFunc: cancel,
+		logger:     slog.Default(),
+		workspaces: map[string]*workspaceState{},
+	}
+	d.ready.Store(true)
+	d.activeTasks.Store(1)
+	if !d.tryEnterClaim() {
+		t.Fatal("initial claim should be admitted")
+	}
+
+	if err := d.beginDrain(); err != nil {
+		t.Fatalf("beginDrain: %v", err)
+	}
+	if d.tryEnterClaim() {
+		t.Fatal("new claim was admitted after drain started")
+	}
+	if d.trySetClaimBarrier() {
+		t.Fatal("auto-update barrier should not acquire while drain owns admission")
+	}
+	if err := d.beginDrain(); err != nil {
+		t.Fatalf("second beginDrain should be idempotent: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	d.healthHandler(time.Now()).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+	var health HealthResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &health); err != nil {
+		t.Fatalf("decode health response: %v", err)
+	}
+	if health.Status != "draining" || !health.ClaimsPaused {
+		t.Fatalf("health state = status %q paused %v, want draining/true", health.Status, health.ClaimsPaused)
+	}
+	if health.ActiveTaskCount != 1 || health.ClaimsInFlight != 1 {
+		t.Fatalf("health counts = active %d claims %d, want 1/1", health.ActiveTaskCount, health.ClaimsInFlight)
+	}
+
+	d.finishActiveTask()
+	select {
+	case <-ctx.Done():
+		t.Fatal("drain stopped daemon while a claim was still in flight")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	d.exitClaim()
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("drain did not stop daemon after claims and tasks reached zero")
+	}
+}
+
+func TestDrainHandlerReportsAcceptedCounts(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d := &Daemon{cancelFunc: cancel, logger: slog.Default()}
+	d.activeTasks.Store(2)
+
+	rec := httptest.NewRecorder()
+	d.drainHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/drain", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var response DrainResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode drain response: %v", err)
+	}
+	if response.Status != "draining" || response.ActiveTaskCount != 2 || response.ClaimsInFlight != 0 {
+		t.Fatalf("unexpected drain response: %+v", response)
+	}
+	d.finishActiveTask()
+	d.finishActiveTask()
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("accepted drain did not finish after active count reached zero")
+	}
+}
+
+func TestDrainWaitsForTaskHandedOffByInFlightClaim(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d := &Daemon{cancelFunc: cancel, logger: slog.Default()}
+	if !d.tryEnterClaim() {
+		t.Fatal("claim should be admitted before drain")
+	}
+	if err := d.beginDrain(); err != nil {
+		t.Fatalf("beginDrain: %v", err)
+	}
+
+	// Match the batch-poller transition: the claimed task becomes active
+	// before the in-flight claim marker is released. The drain must observe at
+	// least one side of that handoff at all times.
+	d.activeTasks.Add(1)
+	d.exitClaim()
+	select {
+	case <-ctx.Done():
+		t.Fatal("drain stopped during claim-to-active-task handoff")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	d.finishActiveTask()
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("drain did not stop after handed-off task finished")
+	}
+}
+
+func TestDrainHandlerRejectsNonPost(t *testing.T) {
+	d := &Daemon{logger: slog.Default()}
+	rec := httptest.NewRecorder()
+	d.drainHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/drain", nil))
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405, got %d", rec.Code)
+	}
+	paused, draining, _, _ := d.claimState()
+	if paused || draining {
+		t.Fatal("GET /drain changed daemon admission state")
+	}
+}
+
+func TestDrainConflictsWithAutoUpdateBarrier(t *testing.T) {
+	d := &Daemon{logger: slog.Default()}
+	if !d.trySetClaimBarrier() {
+		t.Fatal("expected auto-update barrier")
+	}
+	if err := d.beginDrain(); err == nil {
+		t.Fatal("beginDrain should reject an active auto-update barrier")
+	}
+	_, draining, _, _ := d.claimState()
+	if draining {
+		t.Fatal("rejected drain changed daemon to draining")
+	}
 }
 
 func TestShutdownHandlerPostCancelsDaemonContext(t *testing.T) {

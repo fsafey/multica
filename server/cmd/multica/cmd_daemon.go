@@ -44,6 +44,14 @@ var daemonStopCmd = &cobra.Command{
 	RunE:  runDaemonStop,
 }
 
+var daemonDrainCmd = &cobra.Command{
+	Use:   "drain",
+	Short: "Stop claiming new tasks, finish current work, then stop",
+	Long: "Pause new task claims immediately, wait for claims already in flight and active tasks to finish, then stop the daemon.\n" +
+		"Queued tasks remain queued. If the CLI wait times out, the daemon remains in draining mode and still exits only after current work finishes.",
+	RunE: runDaemonDrain,
+}
+
 var daemonStatusCmd = &cobra.Command{
 	Use:   "status",
 	Short: "Show daemon status",
@@ -98,6 +106,7 @@ func init() {
 	daemonLogsCmd.Flags().IntP("lines", "n", 50, "Number of lines to show")
 
 	daemonStatusCmd.Flags().String("output", "table", "Output format: table or json")
+	daemonDrainCmd.Flags().Duration("timeout", 30*time.Minute, "How long the CLI waits for drain completion; 0 waits indefinitely")
 
 	// restart shares all the same flags as start
 	rf := daemonRestartCmd.Flags()
@@ -124,11 +133,119 @@ func init() {
 	df.Bool("all-profiles", false, "Scan every workspace root (default root + all ~/.multica/profiles/* roots, incl. the Desktop app's) and report a combined total")
 
 	daemonCmd.AddCommand(daemonStartCmd)
+	daemonCmd.AddCommand(daemonDrainCmd)
 	daemonCmd.AddCommand(daemonStopCmd)
 	daemonCmd.AddCommand(daemonRestartCmd)
 	daemonCmd.AddCommand(daemonStatusCmd)
 	daemonCmd.AddCommand(daemonLogsCmd)
 	daemonCmd.AddCommand(daemonDiskUsageCmd)
+}
+
+// --- daemon drain ---
+
+func runDaemonDrain(cmd *cobra.Command, _ []string) error {
+	profile := resolveProfile(cmd)
+	healthPort := healthPortForProfile(profile)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	health := checkDaemonHealthOnPort(ctx, healthPort)
+	cancel()
+	if !daemonAlive(health) {
+		label := "Daemon"
+		if profile != "" {
+			label = fmt.Sprintf("Daemon [%s]", profile)
+		}
+		fmt.Fprintf(os.Stderr, "%s is not running.\n", label)
+		return nil
+	}
+
+	drain, err := requestDaemonDrain(healthPort)
+	if err != nil {
+		// An idle daemon may finish the drain quickly enough to close its health
+		// server before the POST response reaches this process. Confirm that
+		// outcome before returning a delivery error.
+		checkCtx, checkCancel := context.WithTimeout(context.Background(), time.Second)
+		stillAlive := daemonAlive(checkDaemonHealthOnPort(checkCtx, healthPort))
+		checkCancel()
+		if !stillAlive {
+			os.Remove(daemonPIDPathForProfile(profile))
+			fmt.Fprintln(os.Stderr, "Daemon drained and stopped.")
+			return nil
+		}
+		return fmt.Errorf("start daemon drain: %w", err)
+	}
+
+	fmt.Fprintf(os.Stderr, "Draining daemon: %d active task(s), %d claim(s) in flight. New task claims are paused.\n",
+		drain.ActiveTaskCount, drain.ClaimsInFlight)
+
+	timeout, _ := cmd.Flags().GetDuration("timeout")
+	waitCtx := context.Background()
+	waitCancel := func() {}
+	if timeout > 0 {
+		waitCtx, waitCancel = context.WithTimeout(context.Background(), timeout)
+	}
+	defer waitCancel()
+
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		checkCtx, checkCancel := context.WithTimeout(context.Background(), time.Second)
+		current := checkDaemonHealthOnPort(checkCtx, healthPort)
+		checkCancel()
+		if !daemonAlive(current) {
+			os.Remove(daemonPIDPathForProfile(profile))
+			fmt.Fprintln(os.Stderr, "Daemon drained and stopped.")
+			return nil
+		}
+
+		select {
+		case <-waitCtx.Done():
+			return fmt.Errorf("timed out waiting for daemon drain after %s; new task claims remain paused and the daemon will stop after current work finishes", timeout)
+		case <-ticker.C:
+		}
+	}
+}
+
+type daemonDrainResponse struct {
+	Status          string `json:"status"`
+	ActiveTaskCount int64  `json:"active_task_count"`
+	ClaimsInFlight  int    `json:"claims_in_flight"`
+}
+
+func requestDaemonDrain(healthPort int) (daemonDrainResponse, error) {
+	return requestDaemonDrainURL(fmt.Sprintf("http://127.0.0.1:%d/drain", healthPort))
+}
+
+func requestDaemonDrainURL(url string) (daemonDrainResponse, error) {
+	var result daemonDrainResponse
+	req, err := http.NewRequest(http.MethodPost, url, nil)
+	if err != nil {
+		return result, err
+	}
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return result, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		message := strings.TrimSpace(string(body))
+		if resp.StatusCode == http.StatusNotFound {
+			return result, fmt.Errorf("running daemon does not support maintenance drain; wait until it is idle, stop it, and upgrade the CLI first")
+		}
+		if message == "" {
+			message = http.StatusText(resp.StatusCode)
+		}
+		return result, fmt.Errorf("daemon returned status %d: %s", resp.StatusCode, message)
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return result, fmt.Errorf("decode drain response: %w", err)
+	}
+	if result.Status != "draining" {
+		return result, fmt.Errorf("unexpected drain status %q", result.Status)
+	}
+	return result, nil
 }
 
 // daemonDirForProfile returns the state directory for the given profile.
@@ -854,7 +971,7 @@ func runDaemonStatus(cmd *cobra.Command, _ []string) error {
 	}
 
 	switch health["status"] {
-	case "running":
+	case "running", "draining":
 		printDaemonStatusReport(os.Stdout, label, health)
 	case "starting":
 		fmt.Fprintf(os.Stdout, "%s: starting (pid %v)\n", label, health["pid"])
@@ -869,8 +986,18 @@ func runDaemonStatus(cmd *cobra.Command, _ []string) error {
 // "Daemon [profile]" row stays in step with the static rows below it.
 func printDaemonStatusReport(w io.Writer, label string, health map[string]any) {
 	type row struct{ key, value string }
+	state := "running"
+	if status, ok := health["status"].(string); ok && status != "" {
+		state = status
+	}
 	rows := []row{
-		{label, fmt.Sprintf("running (pid %v, uptime %v)", health["pid"], health["uptime"])},
+		{label, fmt.Sprintf("%s (pid %v, uptime %v)", state, health["pid"], health["uptime"])},
+	}
+	if state == "draining" {
+		rows = append(rows,
+			row{"Active tasks", fmt.Sprint(health["active_task_count"])},
+			row{"Claims in flight", fmt.Sprint(health["claims_in_flight"])},
+		)
 	}
 	if version, ok := health["cli_version"].(string); ok && version != "" {
 		rows = append(rows, row{"Version", version})
@@ -913,13 +1040,14 @@ func runDaemonLogs(cmd *cobra.Command, _ []string) error {
 }
 
 // daemonAlive reports whether a health response indicates a live daemon
-// process on the port — either fully "running" (ready) or still "starting"
-// (port bound, preflight in progress). Lifecycle commands that only need to
-// know "is a daemon there" (already-running guard, restart, stop) use this,
+// process on the port: fully "running" (ready), still "starting" (port bound,
+// preflight in progress), or "draining" (admission closed until current work
+// finishes). Lifecycle commands that only need to
+// know "is a daemon there" (already-running guard, restart, stop, drain) use this,
 // whereas `daemon start`'s readiness wait gates on the stricter "running".
 func daemonAlive(health map[string]any) bool {
 	switch health["status"] {
-	case "running", "starting":
+	case "running", "starting", "draining":
 		return true
 	default:
 		return false

@@ -336,10 +336,16 @@ async function fetchHealth(): Promise<DaemonStatus> {
     if (authExpired) {
       return { state: "auth_expired", profile: active.name };
     }
+    // A maintenance drain is still a live daemon. Surface it as stopping so
+    // auto-start cannot race it with a replacement process while current work
+    // is finishing.
+    if (data?.status === "draining") {
+      return { state: "stopping", profile: active.name };
+    }
     // The daemon binds /health before preflight finishes and self-reports
-    // "starting" until it's ready. Trust that over our own currentState, so a
-    // daemon booting on its own — or started via the CLI — surfaces as
-    // "starting" instead of "stopped".
+    // "starting" until it is ready. Trust that over our own currentState, so a
+    // daemon booting on its own or started via the CLI surfaces as "starting"
+    // instead of "stopped".
     if (data?.status === "starting") {
       return { state: "starting", profile: active.name };
     }
@@ -705,7 +711,7 @@ async function syncToken(
   if (userChanged) {
     try {
       const existing = await fetchHealthAtPort(active.port);
-      if (daemonStatusAlive(existing?.status)) {
+      if (existing?.status === "running" || existing?.status === "starting") {
         // Restart whether it's "running" or still "starting" — a booting daemon
         // already loaded the old token at startup, so it must be restarted to
         // pick up the rotated credentials.
@@ -826,9 +832,8 @@ async function startDaemon(): Promise<{ success: boolean; error?: string }> {
   const active = await ensureActiveProfile();
   const existing = await fetchHealthAtPort(active.port);
   if (daemonStatusAlive(existing?.status)) {
-    // A daemon is already up ("running") or booting ("starting") on this port —
-    // don't spawn a second one (the CLI rejects that as "already running").
-    // Let polling track it through to "running".
+    // A daemon is already up, booting, or draining on this port. Do not spawn a
+    // second one. Let polling track it through readiness or final shutdown.
     pollOnce();
     return { success: true };
   }

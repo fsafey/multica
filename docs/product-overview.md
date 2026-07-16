@@ -325,7 +325,8 @@ Agent 是 Multica 的灵魂。几乎所有功能都围绕"如何让一个 agent 
 | `multica login` | 浏览器打开 OAuth 登录，保存 90 天 PAT 到 `~/.multica/config.json` |
 | `multica login --token <pat>` | 无头登录（SSH/CI） |
 | `multica daemon start` | 后台启动 daemon（写 PID 到 `~/.multica/daemon.pid`，日志到 `~/.multica/daemon.log`） |
-| `multica daemon stop` | 发 SIGTERM，优雅关闭（等待进行中的任务完成，超时 30s） |
+| `multica daemon drain` | 立即停止领取新任务，等待已有 claim 和运行中任务全部完成，再关闭 daemon；队列任务保持 queued |
+| `multica daemon stop` | 通过本地 HTTP 立即取消 daemon context，并最多等待 30 秒完成本地任务清理 |
 | `multica daemon status` | 打印 daemon 状态、探测到的 agent、watch 中的 workspace |
 | `multica daemon logs -f` | 实时跟随日志 |
 | `multica daemon start --profile <name>` | 启动独立配置的 daemon（用于多环境，比如同时连 staging 和生产） |

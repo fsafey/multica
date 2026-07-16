@@ -115,6 +115,19 @@ multica daemon start --foreground
 multica daemon stop
 ```
 
+`stop` cancels the daemon context immediately and waits up to 30 seconds for local task cleanup. Use it for an ordinary stop, not to establish a maintenance window around long-running work.
+
+### Drain for maintenance
+
+```bash
+multica daemon drain
+multica daemon drain --timeout 2h
+```
+
+`drain` closes task admission immediately, lets claims already in flight settle, waits for every active task to finish, and then stops the daemon. Server-side queued tasks remain queued. The CLI waits up to 30 minutes by default; `--timeout 0` waits indefinitely. A CLI timeout does not cancel work or reopen admission: the daemon remains `draining` and stops when the current work reaches zero.
+
+An older running daemon that does not expose the drain endpoint is rejected without falling back to `stop`. Wait until that daemon is idle, stop it, upgrade the CLI, and use `drain` for later maintenance windows.
+
 ### Status
 
 ```bash
@@ -122,7 +135,7 @@ multica daemon status
 multica daemon status --output json
 ```
 
-Shows PID, uptime, detected agents, and watched workspaces.
+Shows PID, uptime, detected agents, and watched workspaces. While a maintenance drain is active it also shows active-task and in-flight-claim counts.
 
 ### Logs
 

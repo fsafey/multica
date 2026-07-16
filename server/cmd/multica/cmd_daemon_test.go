@@ -25,6 +25,7 @@ func TestDaemonAlive(t *testing.T) {
 	}{
 		{"running", true},
 		{"starting", true},
+		{"draining", true},
 		{"stopped", false},
 		{"", false},
 		{nil, false},
