@@ -245,7 +245,8 @@ type Daemon struct {
 	// the lock so a slow per-runtime claim cannot stall auto-update or any
 	// other poller.
 	//
-	// The pair is the auto-update path's barrier against the issue's
+	// The counters support both maintenance drain and the auto-update path's
+	// barrier against the issue's
 	// requirement that "升级过程中如果有 task 进来，会延后升级而不是中断 task":
 	// runRuntimePoller refuses to call ClaimTask while pauseClaims is set, and
 	// tryAutoUpdate refuses to flip pauseClaims while any poller is mid-claim
@@ -253,8 +254,10 @@ type Daemon struct {
 	// race where a new task slipping in during the release-metadata fetch
 	// would be cancelled by triggerRestart's root-ctx cancel.
 	claimMu        sync.Mutex
+	claimCond      *sync.Cond
 	pauseClaims    bool // when true, the batch poller skips claiming
 	claimsInFlight int  // pollers that have decided to claim but haven't yet handed the task off to handleTask
+	draining       bool // when true, admission stays closed until all current work finishes and the daemon exits
 
 	activeEnvRootsMu sync.Mutex
 	activeEnvRoots   map[string]int // env root path -> reference count (handles reuse paths marked twice)
@@ -2641,6 +2644,22 @@ func (d *Daemon) handleUpdate(ctx context.Context, runtimeID string, update *Pen
 	}
 	defer d.updating.Store(false)
 
+	// Coordinate with the maintenance drain under claimMu. If drain won the
+	// race, do not replace the CLI or restart the daemon while the operator is
+	// waiting for current tasks to finish. If this update won the CAS first,
+	// beginDrain observes updating=true and returns a conflict instead.
+	d.claimMu.Lock()
+	drainInProgress := d.draining
+	d.claimMu.Unlock()
+	if drainInProgress {
+		d.logger.Info("refusing CLI self-update while maintenance drain is active", "runtime_id", runtimeID, "update_id", update.ID)
+		d.reportUpdateResult(ctx, runtimeID, update.ID, map[string]any{
+			"status": "failed",
+			"error":  "maintenance drain is active",
+		})
+		return
+	}
+
 	d.logger.Info("CLI update requested", "runtime_id", runtimeID, "update_id", update.ID, "target_version", update.TargetVersion)
 
 	// Report running status.
@@ -2748,7 +2767,8 @@ func (d *Daemon) reportUpdateResultWithRetry(ctx context.Context, runtimeID, upd
 }
 
 // tryEnterClaim records the intent to call ClaimTask. Returns true if the
-// caller may proceed, false if the auto-update barrier is in effect. Every
+// caller may proceed, false if an auto-update or maintenance-drain barrier is
+// in effect. Every
 // successful call MUST be paired with an exitClaim() on every exit path —
 // either right after a failed/empty claim, or via the handleTask goroutine's
 // defer once the task is handed off.
@@ -2767,6 +2787,81 @@ func (d *Daemon) exitClaim() {
 	d.claimMu.Lock()
 	defer d.claimMu.Unlock()
 	d.claimsInFlight--
+	d.claimConditionLocked().Broadcast()
+}
+
+// claimConditionLocked returns the condition variable used to wake a pending
+// maintenance drain. Callers must hold claimMu. Lazy initialization keeps
+// tests that construct Daemon literals instead of calling New working.
+func (d *Daemon) claimConditionLocked() *sync.Cond {
+	if d.claimCond == nil {
+		d.claimCond = sync.NewCond(&d.claimMu)
+	}
+	return d.claimCond
+}
+
+// claimState is a consistent snapshot of the local admission and execution
+// counters exposed by /health and /drain.
+func (d *Daemon) claimState() (paused bool, draining bool, inFlight int, active int64) {
+	d.claimMu.Lock()
+	defer d.claimMu.Unlock()
+	return d.pauseClaims, d.draining, d.claimsInFlight, d.activeTasks.Load()
+}
+
+// beginDrain closes task admission immediately and schedules daemon shutdown
+// only after any claim already in flight has either failed or handed its tasks
+// to handleTask, and every handed-off task has finished. Queued server rows are
+// never claimed or mutated by this operation.
+func (d *Daemon) beginDrain() error {
+	d.claimMu.Lock()
+	if d.draining {
+		d.claimMu.Unlock()
+		return nil
+	}
+	if d.pauseClaims || d.updating.Load() {
+		d.claimMu.Unlock()
+		return errors.New("daemon cannot drain while a CLI update claim barrier is active")
+	}
+	d.pauseClaims = true
+	d.draining = true
+	d.claimConditionLocked()
+	d.claimMu.Unlock()
+
+	d.logger.Info("maintenance drain started; new task claims are paused")
+	go d.waitForDrain()
+	return nil
+}
+
+// waitForDrain waits without a deadline. The daemon must not cancel live agent
+// processes merely because an operator's CLI wait timed out. Once admission is
+// closed, exitClaim and finishActiveTask are the only state transitions needed
+// to reach zero and both wake this waiter.
+func (d *Daemon) waitForDrain() {
+	d.claimMu.Lock()
+	cond := d.claimConditionLocked()
+	for d.draining && (d.claimsInFlight > 0 || d.activeTasks.Load() > 0) {
+		cond.Wait()
+	}
+	shouldStop := d.draining
+	cancel := d.cancelFunc
+	d.claimMu.Unlock()
+
+	if !shouldStop {
+		return
+	}
+	d.logger.Info("maintenance drain complete; stopping daemon")
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// finishActiveTask preserves the activeTasks counter while also waking a
+// maintenance drain when the final task finishes.
+func (d *Daemon) finishActiveTask() {
+	d.claimMu.Lock()
+	d.activeTasks.Add(-1)
+	d.claimConditionLocked().Broadcast()
+	d.claimMu.Unlock()
 }
 
 // trySetClaimBarrier atomically pauses new ClaimTask calls if the daemon is
@@ -2779,7 +2874,7 @@ func (d *Daemon) exitClaim() {
 func (d *Daemon) trySetClaimBarrier() bool {
 	d.claimMu.Lock()
 	defer d.claimMu.Unlock()
-	if d.claimsInFlight > 0 || d.activeTasks.Load() > 0 {
+	if d.pauseClaims || d.claimsInFlight > 0 || d.activeTasks.Load() > 0 {
 		return false
 	}
 	d.pauseClaims = true
@@ -2941,8 +3036,9 @@ func (d *Daemon) runBatchPoller(pollerCtx, parentCtx context.Context, sem chan i
 		}
 		slots := append([]int{slot}, drainAvailableSlots(sem, d.cfg.MaxConcurrentTasks-1)...)
 
-		// Auto-update barrier: refuse to claim while an update prepares to roll
-		// the process (paired with the re-check in tryAutoUpdate).
+		// Admission barrier: refuse to claim while a maintenance drain is active
+		// or an update prepares to roll the process. The latter is paired with the
+		// re-check in tryAutoUpdate.
 		if !d.tryEnterClaim() {
 			releaseSlots(slots)
 			if err := sleepWithContextOrWakeup(pollerCtx, d.cfg.PollInterval, wakeup); err != nil {
@@ -2983,7 +3079,7 @@ func (d *Daemon) runBatchPoller(pollerCtx, parentCtx context.Context, sem chan i
 			d.activeTasks.Add(1)
 			go func(t Task, slot int) {
 				defer taskWG.Done()
-				defer d.activeTasks.Add(-1)
+				defer d.finishActiveTask()
 				defer func() {
 					// Release local capacity before waking the poller. The task's
 					// terminal callback and local cleanup have both finished at this

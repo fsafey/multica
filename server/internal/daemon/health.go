@@ -32,8 +32,17 @@ type HealthResponse struct {
 	ServerURL       string            `json:"server_url"`
 	CLIVersion      string            `json:"cli_version"`
 	ActiveTaskCount int64             `json:"active_task_count"`
+	ClaimsPaused    bool              `json:"claims_paused"`
+	ClaimsInFlight  int               `json:"claims_in_flight"`
 	Agents          []string          `json:"agents"`
 	Workspaces      []healthWorkspace `json:"workspaces"`
+}
+
+// DrainResponse is returned when the local maintenance drain is accepted.
+type DrainResponse struct {
+	Status          string `json:"status"`
+	ActiveTaskCount int64  `json:"active_task_count"`
+	ClaimsInFlight  int    `json:"claims_in_flight"`
 }
 
 type healthWorkspace struct {
@@ -87,9 +96,14 @@ func (d *Daemon) healthHandler(startedAt time.Time) http.HandlerFunc {
 		// liveness/diagnostics, so callers must not treat a reachable endpoint
 		// as ready — they gate on this status. Consumers that only know
 		// "running" (older CLI/desktop) safely treat "starting" as not-ready.
+		claimsPaused, draining, claimsInFlight, activeTaskCount := d.claimState()
+
 		status := "starting"
 		if d.ready.Load() {
 			status = "running"
+		}
+		if draining {
+			status = "draining"
 		}
 
 		resp := HealthResponse{
@@ -101,13 +115,39 @@ func (d *Daemon) healthHandler(startedAt time.Time) http.HandlerFunc {
 			DeviceName:      d.cfg.DeviceName,
 			ServerURL:       d.cfg.ServerBaseURL,
 			CLIVersion:      d.cfg.CLIVersion,
-			ActiveTaskCount: d.activeTasks.Load(),
+			ActiveTaskCount: activeTaskCount,
+			ClaimsPaused:    claimsPaused,
+			ClaimsInFlight:  claimsInFlight,
 			Agents:          agents,
 			Workspaces:      wsList,
 		}
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
+	}
+}
+
+// drainHandler closes task admission and lets current work finish before the
+// daemon exits. Unlike /shutdown, it never cancels a running task and never
+// falls back to a forced process kill.
+func (d *Daemon) drainHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if err := d.beginDrain(); err != nil {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+
+		_, _, claimsInFlight, activeTaskCount := d.claimState()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(DrainResponse{
+			Status:          "draining",
+			ActiveTaskCount: activeTaskCount,
+			ClaimsInFlight:  claimsInFlight,
+		})
 	}
 }
 
@@ -138,6 +178,7 @@ func (d *Daemon) shutdownHandler() http.HandlerFunc {
 func (d *Daemon) serveHealth(ctx context.Context, ln net.Listener, startedAt time.Time) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", d.healthHandler(startedAt))
+	mux.HandleFunc("/drain", d.drainHandler())
 	mux.HandleFunc("/shutdown", d.shutdownHandler())
 	mux.HandleFunc("/repo/checkout", d.repoCheckoutHandler())
 

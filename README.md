@@ -141,6 +141,7 @@ The `multica` CLI connects your local machine to Multica — authenticate, manag
 |---------|-------------|
 | `multica login` | Authenticate (opens browser) |
 | `multica daemon start` | Start the local agent runtime |
+| `multica daemon drain` | Pause new claims, finish current work, then stop |
 | `multica daemon status` | Check daemon status |
 | `multica setup` | One-command setup for Multica Cloud (configure + login + start daemon) |
 | `multica setup self-host` | Same, but for self-hosted deployments |
@@ -191,4 +192,3 @@ make dev
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the full development workflow, worktree support, testing, and troubleshooting.
 
 An iOS mobile client lives in [`apps/mobile/`](apps/mobile/) — see its [README](apps/mobile/README.md) for how to build it onto your own iPhone.
-

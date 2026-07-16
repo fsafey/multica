@@ -13,6 +13,10 @@ describe("daemonStatusAlive", () => {
     expect(daemonStatusAlive("starting")).toBe(true);
   });
 
+  it("treats a maintenance-draining daemon as alive", () => {
+    expect(daemonStatusAlive("draining")).toBe(true);
+  });
+
   it("treats stopped / unknown / missing as not alive", () => {
     expect(daemonStatusAlive("stopped")).toBe(false);
     expect(daemonStatusAlive("bogus")).toBe(false);

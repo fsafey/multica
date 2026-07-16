@@ -69,6 +69,18 @@ Confirm version compatibility on a self-hosted server:
 multica daemon logs | grep -Ei 'server version|incompatible|prepare-lease'
 ```
 
+## Establishing a maintenance window
+
+Use the admission-closing drain when a deployment must preserve current agent work:
+
+```bash
+multica daemon drain --timeout 2h
+```
+
+The daemon immediately refuses new claims, finishes claims already in flight and all active tasks, then exits and releases the ownership lock. Queued server tasks stay queued. If the CLI timeout expires, the daemon remains in `draining` state; inspect progress with `multica daemon status` and do not replace it until the health endpoint disappears.
+
+Do not use `daemon stop`, `restart`, or `--takeover` as a maintenance drain. Those paths cancel the daemon first and have bounded shutdown waits.
+
 ## Handing ownership over (supported takeover)
 
 To replace the running daemon (e.g. switch the owner from the CLI daemon to the

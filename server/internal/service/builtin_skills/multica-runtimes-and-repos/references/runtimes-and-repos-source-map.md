@@ -4,6 +4,8 @@
 - `runtime list` reads `/api/runtimes` and prints `id`, `name`, `runtime_mode`, `provider`, `status`, and `last_seen_at`.
 - `runtime update` posts to `/api/runtimes/{runtime-id}/update`; with `--wait` it polls update status.
 - `runtime delete` deletes `/api/runtimes/{runtime-id}`; with `--cascade`, it first reads the `runtime_has_active_agents` conflict payload and posts those ids to `/api/runtimes/{runtime-id}/archive-agents-and-delete`.
+- `server/cmd/multica/cmd_daemon.go` registers `daemon drain`, posts to the local `/drain` endpoint, and waits for the health endpoint to disappear without forcing shutdown on timeout.
+- `server/internal/daemon/health.go` exposes `draining`, `claims_paused`, and `claims_in_flight`; its `/drain` handler closes admission and schedules shutdown after local claim and active-task counts reach zero.
 - `server/cmd/multica/cmd_repo.go` registers `repo checkout <url> [--ref]`.
 - `repo checkout` requires `MULTICA_DAEMON_PORT`, sends `workspace_id`, `workdir`, `ref`, `agent_name`, and `task_id` to local daemon `/repo/checkout`, then prints the checked-out path.
 - `server/internal/daemon/health.go` resolves the checkout ref: request `ref` wins; otherwise it asks `server/internal/daemon/daemon.go` for the current task's project repo default ref.
