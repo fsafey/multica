@@ -15,17 +15,19 @@ test.describe("Settings", () => {
     await waitForPageText(page, "General");
 
     // Change workspace name
-    const nameInput = page
-      .locator('input[type="text"]')
-      .first();
+    const nameInput = page.getByLabel("Name");
     await nameInput.clear();
     const newName = "Renamed WS " + Date.now();
     await nameInput.fill(newName);
 
-    // Save
-    await page.locator("button", { hasText: "Save" }).click();
-
-    await expect(page.getByText("Workspace settings saved").first()).toBeVisible({ timeout: 5000 });
+    // Workspace details auto-save on blur.
+    const renameResponse = page.waitForResponse(
+      (response) =>
+        response.request().method() === "PATCH" &&
+        new URL(response.url()).pathname.startsWith("/api/workspaces/"),
+    );
+    await nameInput.blur();
+    expect((await renameResponse).ok()).toBe(true);
 
     // Sidebar should reflect the new name WITHOUT page refresh
     await expect(page.getByRole("button", { name: new RegExp(newName) }).first()).toBeVisible();
@@ -33,8 +35,13 @@ test.describe("Settings", () => {
     // Restore original name so other tests aren't affected
     await nameInput.clear();
     await nameInput.fill(originalName.trim());
-    await page.locator("button", { hasText: "Save" }).click();
-    await expect(page.getByText("Workspace settings saved").first()).toBeVisible({ timeout: 5000 });
+    const restoreResponse = page.waitForResponse(
+      (response) =>
+        response.request().method() === "PATCH" &&
+        new URL(response.url()).pathname.startsWith("/api/workspaces/"),
+    );
+    await nameInput.blur();
+    expect((await restoreResponse).ok()).toBe(true);
     await expect(page.getByRole("button", { name: new RegExp(originalName) }).first()).toBeVisible();
   });
 
@@ -46,6 +53,16 @@ test.describe("Settings", () => {
   test("connecting a Composio toolkit shows a toast and refreshes the list", async ({
     page,
   }) => {
+    await page.route("**/api/config", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          feature_flags: { composio_mcp_apps: true },
+        }),
+      }),
+    );
+
     const workspaceSlug = await loginAsDefault(page);
     const settingsUrl = `/${workspaceSlug}/settings?tab=integrations`;
 
