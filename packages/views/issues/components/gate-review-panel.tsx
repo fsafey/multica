@@ -103,6 +103,9 @@ function GateReviewCard({ issueId, review }: { issueId: string; review: GateRevi
         {review.review.changes && review.review.changes.length > 0 && (
           <div className="sm:col-span-2"><dt className="font-medium text-muted-foreground">{t(($) => $.gate_review.changes)}</dt><dd className="mt-1"><ReviewList values={review.review.changes} empty={t(($) => $.gate_review.no_changes)} /></dd></div>
         )}
+        {review.decision?.outcome === "changes_requested" && review.decision.reason && (
+          <div className="sm:col-span-2"><dt className="font-medium text-muted-foreground">{t(($) => $.gate_review.reason_label)}</dt><dd className="mt-1 whitespace-pre-wrap">{review.decision.reason}</dd></div>
+        )}
       </dl>
 
       <details className="mt-4 text-xs text-muted-foreground">

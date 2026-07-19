@@ -116,6 +116,24 @@ describe("GateReviewPanel", () => {
     expect(screen.queryByRole("button", { name: /Approve revision/ })).not.toBeInTheDocument();
   });
 
+  it("shows the immutable requested-changes reason", async () => {
+    mockState.reviews = [request({
+      decision: {
+        id: "decision-1",
+        outcome: "changes_requested",
+        reason: "Use the corrected book-law logical name.",
+        actor_id: "member-1",
+        actor_name: "Faried",
+        created_at: "2026-07-19T12:05:00Z",
+      },
+      wake: { state: "pending" },
+    })];
+    renderPanel();
+    expect(await screen.findByText(/Changes requested by member Faried/)).toBeInTheDocument();
+    expect(screen.getByText("Use the corrected book-law logical name.")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Approve revision/ })).not.toBeInTheDocument();
+  });
+
   it("selects the highest revision per gate even when the API response is unordered", async () => {
     mockState.reviews = [request({ id: "older", revision: 2 }), request({ id: "newer", revision: 4 })];
     renderPanel();
