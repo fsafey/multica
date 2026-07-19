@@ -73,6 +73,7 @@ type GateReviewRequestResponse struct {
 	Review        GateReviewData              `json:"review"`
 	ActorType     string                      `json:"actor_type"`
 	ActorID       string                      `json:"actor_id"`
+	ActorName     string                      `json:"actor_name,omitempty"`
 	CreatedAt     string                      `json:"created_at"`
 	Decision      *GateReviewDecisionResponse `json:"decision,omitempty"`
 	Wake          *GateDecisionWakeResponse   `json:"wake,omitempty"`
@@ -307,6 +308,7 @@ func (h *Handler) ListGateReviews(w http.ResponseWriter, r *http.Request) {
 			ReviewData: row.ReviewData, ActorType: row.ActorType, ActorID: row.ActorID,
 			CreatedAt: row.CreatedAt,
 		})
+		base.ActorName = row.RequestActorName
 		if row.DecisionID.Valid {
 			base.Decision = &GateReviewDecisionResponse{
 				ID: uuidToString(row.DecisionID), Outcome: row.DecisionOutcome.String,

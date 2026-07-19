@@ -364,6 +364,7 @@ func (q *Queries) GetNextPendingGateDecisionWake(ctx context.Context) (GateDecis
 const listGateReviewRequestsForIssue = `-- name: ListGateReviewRequestsForIssue :many
 SELECT
     r.id, r.workspace_id, r.issue_id, r.gate, r.revision, r.subject_digest, r.review_data, r.actor_type, r.actor_id, r.created_at,
+    COALESCE(request_member.name, request_agent.name, r.actor_id::text) AS request_actor_name,
     d.id AS decision_id,
     d.outcome AS decision_outcome,
     d.reason AS decision_reason,
@@ -373,6 +374,10 @@ SELECT
     w.state AS wake_state,
     w.task_id AS wake_task_id
 FROM gate_review_request r
+LEFT JOIN "user" request_member
+    ON r.actor_type = 'member' AND request_member.id = r.actor_id
+LEFT JOIN agent request_agent
+    ON r.actor_type = 'agent' AND request_agent.id = r.actor_id
 LEFT JOIN gate_review_decision d ON d.request_id = r.id
 LEFT JOIN "user" u ON u.id = d.actor_id
 LEFT JOIN gate_decision_wake w ON w.decision_id = d.id
@@ -396,6 +401,7 @@ type ListGateReviewRequestsForIssueRow struct {
 	ActorType         string             `json:"actor_type"`
 	ActorID           pgtype.UUID        `json:"actor_id"`
 	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	RequestActorName  string             `json:"request_actor_name"`
 	DecisionID        pgtype.UUID        `json:"decision_id"`
 	DecisionOutcome   pgtype.Text        `json:"decision_outcome"`
 	DecisionReason    pgtype.Text        `json:"decision_reason"`
@@ -426,6 +432,7 @@ func (q *Queries) ListGateReviewRequestsForIssue(ctx context.Context, arg ListGa
 			&i.ActorType,
 			&i.ActorID,
 			&i.CreatedAt,
+			&i.RequestActorName,
 			&i.DecisionID,
 			&i.DecisionOutcome,
 			&i.DecisionReason,
@@ -447,7 +454,8 @@ func (q *Queries) ListGateReviewRequestsForIssue(ctx context.Context, arg ListGa
 
 const listPendingGateDecisionWakesForIssue = `-- name: ListPendingGateDecisionWakesForIssue :many
 SELECT decision_id, workspace_id, issue_id, state, task_id, attempt_count, last_error, created_at, delivered_at, next_attempt_at FROM gate_decision_wake
-WHERE workspace_id = $1 AND issue_id = $2 AND state = 'pending'
+WHERE workspace_id = $1 AND issue_id = $2
+  AND state = 'pending' AND next_attempt_at <= now()
 ORDER BY created_at ASC, decision_id ASC
 `
 

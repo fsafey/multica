@@ -49,6 +49,7 @@ function request(overrides: Partial<GateReviewRequest> = {}): GateReviewRequest 
     },
     actor_type: "agent",
     actor_id: "agent-1",
+    actor_name: "Pub Intake",
     created_at: "2026-07-19T12:00:00Z",
     ...overrides,
   };
@@ -80,6 +81,7 @@ describe("GateReviewPanel", () => {
     expect(screen.getByText("Page extent remains unknown")).toBeInTheDocument();
     expect(screen.getByText("No paid extraction authorized")).toBeInTheDocument();
     expect(screen.getByText("Selected attachment changed")).toBeInTheDocument();
+    expect(screen.getByText(/Requested by agent Pub Intake/)).toBeInTheDocument();
     fireEvent.click(screen.getByText("Canonical decision subject"));
     expect(screen.getByText(/"attachment_id": "att-123"/)).toBeInTheDocument();
     expect(screen.queryByText(/GATE APPROVED|GATE REJECTED|MANIFEST ACCEPTED/)).not.toBeInTheDocument();

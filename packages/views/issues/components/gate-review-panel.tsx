@@ -43,7 +43,7 @@ function GateReviewCard({ issueId, review }: { issueId: string; review: GateRevi
     : review.decision?.outcome === "changes_requested"
       ? t(($) => $.gate_review.changes_requested)
       : t(($) => $.gate_review.awaiting_decision);
-  const actor = review.decision?.actor_name || review.decision?.actor_id || review.actor_id;
+  const actor = review.decision?.actor_name || review.decision?.actor_id || review.actor_name || review.actor_id;
   const actorType = review.actor_type === "agent"
     ? t(($) => $.gate_review.actor_agent)
     : t(($) => $.gate_review.actor_member);

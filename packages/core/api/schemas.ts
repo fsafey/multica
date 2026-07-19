@@ -199,6 +199,7 @@ export const GateReviewRequestSchema = z.object({
   review: GateReviewDataSchema,
   actor_type: z.enum(["member", "agent"]),
   actor_id: z.string(),
+  actor_name: z.string().optional(),
   created_at: z.string(),
   decision: GateReviewDecisionSchema.optional(),
   wake: GateDecisionWakeSchema.optional(),

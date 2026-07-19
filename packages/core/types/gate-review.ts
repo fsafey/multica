@@ -34,6 +34,7 @@ export interface GateReviewRequest {
   review: GateReviewData;
   actor_type: "member" | "agent";
   actor_id: string;
+  actor_name?: string;
   created_at: string;
   decision?: GateReviewDecision;
   wake?: GateDecisionWake;

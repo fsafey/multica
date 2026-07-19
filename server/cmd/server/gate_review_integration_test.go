@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/multica-ai/multica/server/internal/auth"
+	"github.com/multica-ai/multica/server/internal/util"
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
 func gateReviewBody(revision int) map[string]any {
@@ -313,6 +315,19 @@ func TestGateDecisionWakeWorkerDoesNotStarveBehindOrphan(t *testing.T) {
 	}
 	if orphanAttempts != 1 {
 		t.Fatalf("orphan attempts=%d, want 1", orphanAttempts)
+	}
+	pending, err := testHandler.Queries.ListPendingGateDecisionWakesForIssue(
+		context.Background(),
+		db.ListPendingGateDecisionWakesForIssueParams{
+			WorkspaceID: util.MustParseUUID(testWorkspaceID),
+			IssueID:     util.MustParseUUID(orphanIssueID),
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("issue-scoped reconcile bypassed wake backoff: got %d pending", len(pending))
 	}
 
 	worked, err = testHandler.GateDecisionWakeWorker.ProcessNext(context.Background())

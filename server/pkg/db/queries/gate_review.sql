@@ -22,6 +22,7 @@ WHERE id = @id AND workspace_id = @workspace_id AND issue_id = @issue_id;
 -- name: ListGateReviewRequestsForIssue :many
 SELECT
     r.*,
+    COALESCE(request_member.name, request_agent.name, r.actor_id::text) AS request_actor_name,
     d.id AS decision_id,
     d.outcome AS decision_outcome,
     d.reason AS decision_reason,
@@ -31,6 +32,10 @@ SELECT
     w.state AS wake_state,
     w.task_id AS wake_task_id
 FROM gate_review_request r
+LEFT JOIN "user" request_member
+    ON r.actor_type = 'member' AND request_member.id = r.actor_id
+LEFT JOIN agent request_agent
+    ON r.actor_type = 'agent' AND request_agent.id = r.actor_id
 LEFT JOIN gate_review_decision d ON d.request_id = r.id
 LEFT JOIN "user" u ON u.id = d.actor_id
 LEFT JOIN gate_decision_wake w ON w.decision_id = d.id
@@ -79,7 +84,8 @@ RETURNING *;
 
 -- name: ListPendingGateDecisionWakesForIssue :many
 SELECT * FROM gate_decision_wake
-WHERE workspace_id = @workspace_id AND issue_id = @issue_id AND state = 'pending'
+WHERE workspace_id = @workspace_id AND issue_id = @issue_id
+  AND state = 'pending' AND next_attempt_at <= now()
 ORDER BY created_at ASC, decision_id ASC;
 
 -- name: GetNextPendingGateDecisionWake :one
