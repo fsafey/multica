@@ -998,6 +998,20 @@ type CreateCommentRequest struct {
 	SuppressAgentIDs []string `json:"suppress_agent_ids"`
 }
 
+// containsReservedHumanGateControl detects the legacy control families whose
+// authority belongs exclusively to a member decision record. Escaped brackets
+// and Markdown quoting do not turn a machine-authored control into harmless
+// prose: agents must refer to the native gate review instead of reproducing a
+// writable human token, even as an example.
+func containsReservedHumanGateControl(content string) bool {
+	content = strings.ReplaceAll(content, `\[`, "[")
+	content = strings.ReplaceAll(content, `\]`, "]")
+	normalized := strings.ToUpper(content)
+	return strings.Contains(normalized, "[GATE APPROVED]") ||
+		strings.Contains(normalized, "[GATE REJECTED]") ||
+		strings.Contains(normalized, "[MANIFEST ACCEPTED]")
+}
+
 type CommentTriggerPreviewRequest struct {
 	Content          string  `json:"content"`
 	ParentID         *string `json:"parent_id"`
@@ -1305,6 +1319,10 @@ func (h *Handler) CreateComment(w http.ResponseWriter, r *http.Request) {
 
 	// Determine author identity: agent (via X-Agent-ID header) or member.
 	authorType, authorID := h.resolveActor(r, userID, uuidToString(issue.WorkspaceID))
+	if authorType == "agent" && containsReservedHumanGateControl(req.Content) {
+		writeError(w, http.StatusForbidden, "human gate controls must be submitted through the member decision endpoint")
+		return
+	}
 
 	// Defense against resumed-session drift: when an agent posts from inside a
 	// comment-triggered task AND the comment is being posted on that same

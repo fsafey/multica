@@ -392,6 +392,9 @@ func main() {
 	if h.WebhookDeliveryWorker != nil {
 		go h.WebhookDeliveryWorker.Run(sweepCtx)
 	}
+	if h.GateDecisionWakeWorker != nil {
+		go h.GateDecisionWakeWorker.Run(sweepCtx)
+	}
 
 	// Channel inbound supervisor (MUL-3620): holds the §4.4 WS lease per
 	// installation and drives each channel.Channel. It is built
@@ -477,6 +480,9 @@ func main() {
 	heartbeatScheduler.Stop()
 	if h.WebhookDeliveryWorker != nil && !h.WebhookDeliveryWorker.WaitWithTimeout(5*time.Second) {
 		slog.Warn("webhook delivery worker did not exit within shutdown timeout")
+	}
+	if h.GateDecisionWakeWorker != nil && !h.GateDecisionWakeWorker.WaitWithTimeout(5*time.Second) {
+		slog.Warn("gate decision wake worker did not exit within shutdown timeout")
 	}
 
 	// Join the channel supervisor's per-installation goroutines so the

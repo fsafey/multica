@@ -136,6 +136,8 @@ export const issueKeys = {
   tasksAll: () => ["issues", "tasks"] as const,
   /** Per-issue task list (issue-detail Execution log section). */
   tasks: (issueId: string) => [...issueKeys.tasksAll(), issueId] as const,
+  gateReviewsAll: () => ["issues", "gate-reviews"] as const,
+  gateReviews: (issueId: string) => [...issueKeys.gateReviewsAll(), issueId] as const,
 };
 
 export type MyIssuesFilter = Pick<

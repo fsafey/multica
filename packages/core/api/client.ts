@@ -78,6 +78,8 @@ import type {
   HasPendingChatTasksResponse,
   SendChatMessageResponse,
   CancelTaskResponse,
+  GateReviewsResponse,
+  CreateGateReviewDecisionResponse,
   Project,
   CreateProjectRequest,
   UpdateProjectRequest,
@@ -259,6 +261,8 @@ import {
   EMPTY_LABEL,
   EMPTY_LIST_LABELS_RESPONSE,
   EMPTY_RESOURCE_LABELS_RESPONSE,
+  GateReviewsResponseSchema,
+  CreateGateReviewDecisionResponseSchema,
 } from "./schemas";
 
 /** Identifies the calling client to the server.
@@ -867,6 +871,56 @@ export class ApiClient {
     return parseWithFallback(raw, TimelineEntriesSchema, EMPTY_TIMELINE_ENTRIES, {
       endpoint: "GET /api/issues/:id/timeline",
     });
+  }
+
+  async listGateReviews(issueId: string): Promise<GateReviewsResponse> {
+    const raw = await this.fetch<unknown>(`/api/issues/${issueId}/gate-reviews/`);
+    return parseWithFallback(raw, GateReviewsResponseSchema, { gate_reviews: [] }, {
+      endpoint: "GET /api/issues/:id/gate-reviews",
+    });
+  }
+
+  async createGateReviewDecision(
+    issueId: string,
+    requestId: string,
+    outcome: "approved" | "changes_requested",
+    reason?: string,
+  ): Promise<CreateGateReviewDecisionResponse> {
+    const raw = await this.fetch<unknown>(
+      `/api/issues/${issueId}/gate-reviews/${requestId}/decision`,
+      {
+        method: "POST",
+        body: JSON.stringify({ outcome, ...(reason ? { reason } : {}) }),
+      },
+    );
+    return parseWithFallback(
+      raw,
+      CreateGateReviewDecisionResponseSchema,
+      {
+        request: {
+          id: requestId,
+          issue_id: issueId,
+          gate: "",
+          revision: 1,
+          subject_digest: "",
+          review: {
+            selected_source: "",
+            scope: "",
+            defaults: [],
+            rights: "",
+            uncertainties: [],
+            cost: "",
+            canonical_detail: {},
+          },
+          actor_type: "member",
+          actor_id: "",
+          created_at: "",
+        },
+        decision: { id: "", outcome, reason: reason ?? "", actor_id: "", created_at: "" },
+        wake: { state: "pending" },
+      },
+      { endpoint: "POST /api/issues/:id/gate-reviews/:requestId/decision" },
+    );
   }
 
   async getAssigneeFrequency(): Promise<AssigneeFrequencyEntry[]> {

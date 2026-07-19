@@ -170,7 +170,21 @@ LIMIT 1;
 -- (loadIssueForUser / GetIssueInWorkspace) already enforce membership today,
 -- but a future loader bypass or a new caller skipping the loader would be
 -- silently catastrophic without this guard. See incident #1661.
-DELETE FROM issue WHERE id = $1 AND workspace_id = $2;
+WITH deleted_wakes AS (
+    DELETE FROM gate_decision_wake
+    WHERE gate_decision_wake.issue_id = sqlc.arg('id')
+      AND gate_decision_wake.workspace_id = sqlc.arg('workspace_id')
+), deleted_decisions AS (
+    DELETE FROM gate_review_decision
+    WHERE gate_review_decision.issue_id = sqlc.arg('id')
+      AND gate_review_decision.workspace_id = sqlc.arg('workspace_id')
+), deleted_requests AS (
+    DELETE FROM gate_review_request
+    WHERE gate_review_request.issue_id = sqlc.arg('id')
+      AND gate_review_request.workspace_id = sqlc.arg('workspace_id')
+)
+DELETE FROM issue
+WHERE issue.id = sqlc.arg('id') AND issue.workspace_id = sqlc.arg('workspace_id');
 
 -- name: ListOpenIssues :many
 -- See ListIssues for the semantics of involves_user_id (mirrors the 4-branch

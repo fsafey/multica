@@ -200,6 +200,41 @@ VALUES ($1, $2, 'owner')
 `, wsID, testUserID); err != nil {
 		t.Fatalf("create owner member: %v", err)
 	}
+	var issueID, requestID, decisionID string
+	if err := testPool.QueryRow(ctx, `
+INSERT INTO issue (workspace_id, title, status, priority, creator_type, creator_id, number)
+VALUES ($1, 'Gate review workspace cleanup', 'todo', 'medium', 'member', $2, 1)
+RETURNING id
+`, wsID, testUserID).Scan(&issueID); err != nil {
+		t.Fatalf("create gate review issue: %v", err)
+	}
+	if err := testPool.QueryRow(ctx, `
+INSERT INTO gate_review_request (
+    workspace_id, issue_id, gate, revision, subject_digest, review_data, actor_type, actor_id
+)
+VALUES ($1, $2, 'P0', 1, 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', '{}'::jsonb, 'member', $3)
+RETURNING id
+`, wsID, issueID, testUserID).Scan(&requestID); err != nil {
+		t.Fatalf("create gate review request: %v", err)
+	}
+	if err := testPool.QueryRow(ctx, `
+INSERT INTO gate_review_decision (workspace_id, issue_id, request_id, outcome, actor_id)
+VALUES ($1, $2, $3, 'approved', $4)
+RETURNING id
+`, wsID, issueID, requestID, testUserID).Scan(&decisionID); err != nil {
+		t.Fatalf("create gate review decision: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+INSERT INTO gate_decision_wake (decision_id, workspace_id, issue_id)
+VALUES ($1, $2, $3)
+`, decisionID, wsID, issueID); err != nil {
+		t.Fatalf("create gate decision wake: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM gate_decision_wake WHERE workspace_id = $1`, wsID)
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM gate_review_decision WHERE workspace_id = $1`, wsID)
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM gate_review_request WHERE workspace_id = $1`, wsID)
+	})
 	if _, err := testPool.Exec(ctx, `
 INSERT INTO github_pending_check_suite (
 	workspace_id, installation_id, repo_owner, repo_name, pr_number,
@@ -252,6 +287,20 @@ RETURNING id
 	}
 	if propertyCount != 0 {
 		t.Fatalf("issue properties were not cleaned up for deleted workspace: %d", propertyCount)
+	}
+
+	for table, query := range map[string]string{
+		"gate review requests":  `SELECT count(*) FROM gate_review_request WHERE workspace_id = $1`,
+		"gate review decisions": `SELECT count(*) FROM gate_review_decision WHERE workspace_id = $1`,
+		"gate decision wakes":   `SELECT count(*) FROM gate_decision_wake WHERE workspace_id = $1`,
+	} {
+		var count int
+		if err := testPool.QueryRow(ctx, query, wsID).Scan(&count); err != nil {
+			t.Fatalf("verify %s cleanup: %v", table, err)
+		}
+		if count != 0 {
+			t.Fatalf("%s were not cleaned up for deleted workspace: %d", table, count)
+		}
 	}
 }
 

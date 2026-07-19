@@ -24,6 +24,40 @@ afterEach(() => {
 // app in past incidents. The contract is: a malformed response degrades to
 // an empty/safe shape, never throws into React.
 describe("ApiClient schema fallback", () => {
+  describe("listGateReviews", () => {
+    it("falls back to an empty list when a gate review response is malformed", async () => {
+      stubFetchJson({ gate_reviews: "not-an-array" });
+      const client = new ApiClient("https://api.example.test");
+      await expect(client.listGateReviews("issue-1")).resolves.toEqual({ gate_reviews: [] });
+    });
+
+    it("defaults additive review arrays for an older response", async () => {
+      stubFetchJson({
+        gate_reviews: [{
+          id: "review-1",
+          issue_id: "issue-1",
+          gate: "P0",
+          revision: 1,
+          subject_digest: `sha256:${"a".repeat(64)}`,
+          review: {
+            selected_source: "Attachment att-1",
+            scope: "One book",
+            rights: "Scholar supplied",
+            cost: "No paid extraction authorized",
+            canonical_detail: { source: { attachment_id: "att-1" } },
+          },
+          actor_type: "agent",
+          actor_id: "agent-1",
+          created_at: "2026-07-19T12:00:00Z",
+        }],
+      });
+      const client = new ApiClient("https://api.example.test");
+      const response = await client.listGateReviews("issue-1");
+      expect(response.gate_reviews[0]?.review.defaults).toEqual([]);
+      expect(response.gate_reviews[0]?.review.uncertainties).toEqual([]);
+    });
+  });
+
   describe("listTimeline", () => {
     it("falls back to an empty array when the body is null", async () => {
       stubFetchJson(null);

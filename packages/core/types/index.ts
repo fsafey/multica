@@ -1,5 +1,14 @@
 export type { Issue, IssueStatus, IssuePriority, IssueAssigneeType, IssueMetadata, IssueMetadataValue, IssueReaction } from "./issue";
 export type {
+  GateReviewOutcome,
+  GateReviewData,
+  GateReviewDecision,
+  GateDecisionWake,
+  GateReviewRequest,
+  GateReviewsResponse,
+  CreateGateReviewDecisionResponse,
+} from "./gate-review";
+export type {
   Agent,
   AgentStatus,
   AgentRuntimeMode,

@@ -148,6 +148,7 @@ type AgentTaskQueue struct {
 	TriggerEvidenceRefID pgtype.UUID `json:"trigger_evidence_ref_id"`
 	// The one human accountable for this run, for audit / visibility / cost only — NEVER consulted for authorization (that is originator_user_id). Invariant: when originator_user_id IS NOT NULL, this equals it; the two diverge only when originator_user_id IS NULL (autopilot rule_owner / degraded owner_fallback name an accountable human while authorization carries none). No FK, no cascade (MUL-4302 §1/§7). NULL means no accountable human was resolved: a pre-migration row, OR a NEW row whose audit source is not-yet-resolved / unattributed (e.g. run_only autopilot until rule_owner lands) — NOT pre-migration only.
 	AccountableUserID pgtype.UUID `json:"accountable_user_id"`
+	GateDecisionID    pgtype.UUID `json:"gate_decision_id"`
 }
 
 type AgentToLabel struct {
@@ -459,6 +460,43 @@ type Feedback struct {
 	Message     string             `json:"message"`
 	Metadata    []byte             `json:"metadata"`
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+}
+
+type GateDecisionWake struct {
+	DecisionID    pgtype.UUID        `json:"decision_id"`
+	WorkspaceID   pgtype.UUID        `json:"workspace_id"`
+	IssueID       pgtype.UUID        `json:"issue_id"`
+	State         string             `json:"state"`
+	TaskID        pgtype.UUID        `json:"task_id"`
+	AttemptCount  int32              `json:"attempt_count"`
+	LastError     string             `json:"last_error"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	DeliveredAt   pgtype.Timestamptz `json:"delivered_at"`
+	NextAttemptAt pgtype.Timestamptz `json:"next_attempt_at"`
+}
+
+type GateReviewDecision struct {
+	ID          pgtype.UUID        `json:"id"`
+	WorkspaceID pgtype.UUID        `json:"workspace_id"`
+	IssueID     pgtype.UUID        `json:"issue_id"`
+	RequestID   pgtype.UUID        `json:"request_id"`
+	Outcome     string             `json:"outcome"`
+	Reason      string             `json:"reason"`
+	ActorID     pgtype.UUID        `json:"actor_id"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+}
+
+type GateReviewRequest struct {
+	ID            pgtype.UUID        `json:"id"`
+	WorkspaceID   pgtype.UUID        `json:"workspace_id"`
+	IssueID       pgtype.UUID        `json:"issue_id"`
+	Gate          string             `json:"gate"`
+	Revision      int32              `json:"revision"`
+	SubjectDigest string             `json:"subject_digest"`
+	ReviewData    []byte             `json:"review_data"`
+	ActorType     string             `json:"actor_type"`
+	ActorID       pgtype.UUID        `json:"actor_id"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
 }
 
 type GithubInstallation struct {

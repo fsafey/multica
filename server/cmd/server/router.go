@@ -1052,6 +1052,11 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Delete("/", h.DeleteIssue)
 					r.Post("/comments/trigger-preview", h.PreviewCommentTriggers)
 					r.Post("/comments", h.CreateComment)
+					r.Route("/gate-reviews", func(r chi.Router) {
+						r.Get("/", h.ListGateReviews)
+						r.Post("/", h.CreateGateReviewRequest)
+						r.With(handler.RequireHumanActor).Post("/{requestId}/decision", h.CreateGateReviewDecision)
+					})
 					r.Get("/comments", h.ListComments)
 					r.Get("/timeline", h.ListTimeline)
 					r.Get("/subscribers", h.ListIssueSubscribers)

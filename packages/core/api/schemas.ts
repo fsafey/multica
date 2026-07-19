@@ -37,6 +37,7 @@ import type {
   User,
   WebhookDelivery,
 } from "../types";
+import type { GateReviewsResponse, CreateGateReviewDecisionResponse } from "../types/gate-review";
 import type { CloudRuntimeNode } from "../runtimes/cloud-runtime";
 import type { CreateFeedbackResponse } from "../feedback/types";
 
@@ -163,6 +164,55 @@ export const IssuePropertiesResponseSchema = z.object({
 export const EMPTY_ISSUE_PROPERTIES_RESPONSE: IssuePropertiesResponse = {
   properties: {},
 };
+
+export const GateReviewDataSchema = z.object({
+  selected_source: z.string(),
+  scope: z.string(),
+  defaults: z.array(z.string()).default([]),
+  rights: z.string(),
+  uncertainties: z.array(z.string()).default([]),
+  cost: z.string(),
+  changes: z.array(z.string()).optional(),
+  canonical_detail: z.record(z.string(), z.unknown()),
+}).loose();
+
+export const GateReviewDecisionSchema = z.object({
+  id: z.string(),
+  outcome: z.enum(["approved", "changes_requested"]),
+  reason: z.string().default(""),
+  actor_id: z.string(),
+  actor_name: z.string().optional(),
+  created_at: z.string(),
+}).loose();
+
+export const GateDecisionWakeSchema = z.object({
+  state: z.enum(["pending", "delivered"]),
+  task_id: z.string().optional(),
+}).loose();
+
+export const GateReviewRequestSchema = z.object({
+  id: z.string(),
+  issue_id: z.string(),
+  gate: z.string(),
+  revision: z.number().int().positive(),
+  subject_digest: z.string(),
+  review: GateReviewDataSchema,
+  actor_type: z.enum(["member", "agent"]),
+  actor_id: z.string(),
+  created_at: z.string(),
+  decision: GateReviewDecisionSchema.optional(),
+  wake: GateDecisionWakeSchema.optional(),
+}).loose();
+
+export const GateReviewsResponseSchema: z.ZodType<GateReviewsResponse> = z.object({
+  gate_reviews: z.array(GateReviewRequestSchema).default([]),
+}).loose();
+
+export const CreateGateReviewDecisionResponseSchema: z.ZodType<CreateGateReviewDecisionResponse> = z.object({
+  request: GateReviewRequestSchema,
+  decision: GateReviewDecisionSchema,
+  wake: GateDecisionWakeSchema,
+}).loose();
 
 export interface AppConfigResponse {
   cdn_domain: string;

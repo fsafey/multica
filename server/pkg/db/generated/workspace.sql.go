@@ -113,6 +113,15 @@ cleared_installations AS (
 cleared_issue_properties AS (
     DELETE FROM issue_property WHERE workspace_id = $1
 ),
+deleted_gate_decision_wakes AS (
+    DELETE FROM gate_decision_wake WHERE workspace_id = $1
+),
+deleted_gate_review_decisions AS (
+    DELETE FROM gate_review_decision WHERE workspace_id = $1
+),
+deleted_gate_review_requests AS (
+    DELETE FROM gate_review_request WHERE workspace_id = $1
+),
 deleted_pending_check_suites AS (
     DELETE FROM github_pending_check_suite WHERE workspace_id = $1
 )
