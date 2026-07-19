@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { GateReviewRequest } from "@multica/core/types";
@@ -93,7 +93,9 @@ describe("GateReviewPanel", () => {
     fireEvent.click(approve);
     expect(screen.getByRole("alertdialog")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Confirm approval" })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm approval" }));
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument());
+    expect(mockState.mutateAsync).toHaveBeenCalledWith({ requestId: "review-1", outcome: "approved" });
     fireEvent.click(screen.getByRole("button", { name: "Request changes" }));
     expect(screen.getByLabelText("Reason for requested changes (optional)")).toBeInTheDocument();
   });

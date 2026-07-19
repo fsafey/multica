@@ -62,6 +62,7 @@ function GateReviewCard({ issueId, review }: { issueId: string; review: GateRevi
         outcome,
         ...(outcome === "changes_requested" && reason.trim() ? { reason: reason.trim() } : {}),
       });
+      setApproveOpen(false);
       setRequestingChanges(false);
       setReason("");
     } catch (error) {
