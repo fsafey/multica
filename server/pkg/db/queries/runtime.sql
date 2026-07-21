@@ -285,7 +285,15 @@ DELETE FROM agent_runtime WHERE id = $1;
 -- System agents are invisible execution infrastructure (for example the Agent
 -- Builder). Remove them before deleting their runtime so the RESTRICT runtime
 -- FK cannot block an otherwise dependency-free delete.
-DELETE FROM agent WHERE runtime_id = $1 AND kind = 'system';
+WITH target_agents AS (
+    SELECT agent.id FROM agent WHERE agent.runtime_id = $1 AND agent.kind = 'system'
+), cleared_task_execution_evidence AS (
+    DELETE FROM task_execution_evidence
+    WHERE task_id IN (
+        SELECT id FROM agent_task_queue WHERE agent_id IN (SELECT id FROM target_agents)
+    )
+)
+DELETE FROM agent WHERE id IN (SELECT id FROM target_agents);
 
 -- name: CountActiveAgentsByRuntime :one
 SELECT count(*) FROM agent WHERE runtime_id = $1 AND archived_at IS NULL;
@@ -295,11 +303,19 @@ SELECT count(*)
 FROM squad
 WHERE archived_at IS NULL
   AND leader_id IN (
-    SELECT id FROM agent WHERE runtime_id = $1 AND archived_at IS NOT NULL
+    SELECT agent.id FROM agent WHERE agent.runtime_id = $1 AND agent.archived_at IS NOT NULL
   );
 
 -- name: DeleteArchivedAgentsByRuntime :exec
-DELETE FROM agent WHERE runtime_id = $1 AND archived_at IS NOT NULL;
+WITH target_agents AS (
+    SELECT agent.id FROM agent WHERE agent.runtime_id = $1 AND agent.archived_at IS NOT NULL
+), cleared_task_execution_evidence AS (
+    DELETE FROM task_execution_evidence
+    WHERE task_id IN (
+        SELECT id FROM agent_task_queue WHERE agent_id IN (SELECT id FROM target_agents)
+    )
+)
+DELETE FROM agent WHERE id IN (SELECT id FROM target_agents);
 
 -- name: PauseAutopilotsByAgentAssignees :exec
 -- Pauses every active autopilot whose agent assignee is in the supplied list.

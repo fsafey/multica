@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/multica-ai/multica/server/pkg/executionevidence"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
@@ -78,6 +79,11 @@ func isPrepareLeaseUnsupported(err error) bool {
 	return true
 }
 
+func isTaskMessageSequenceConflict(err error) bool {
+	var reqErr *requestError
+	return errors.As(err, &reqErr) && reqErr.StatusCode == http.StatusConflict
+}
+
 // isUnauthorizedError returns true if the error is a 401 from the server.
 // Used by the token-renewal loop to surface a clear "re-login required"
 // message instead of a generic transport-level retry.
@@ -133,6 +139,8 @@ type Client struct {
 	workspaceCache                 []WorkspaceInfo
 	workspaceCacheValid            bool
 	legacyWorkspaceEndpointEnabled bool
+	issueGCBatchMu                 sync.Mutex
+	legacyIssueGCBatchEnabled      bool
 }
 
 // NewClient creates a new daemon API client.
@@ -342,6 +350,27 @@ func (c *Client) StartTask(ctx context.Context, taskID string) error {
 	return c.postJSON(ctx, fmt.Sprintf("/api/daemon/tasks/%s/start", taskID), map[string]any{}, nil)
 }
 
+func (c *Client) RecordTaskExecutionEvidence(ctx context.Context, taskID string, snapshot executionevidence.Snapshot) error {
+	digest, err := snapshot.Digest()
+	if err != nil {
+		return fmt.Errorf("digest task execution evidence: %w", err)
+	}
+	err = c.postJSONWithRetry(ctx, fmt.Sprintf("/api/daemon/tasks/%s/evidence", taskID), map[string]any{
+		"snapshot":     snapshot,
+		"payload_hash": digest,
+	}, nil, executionEvidenceRetrySchedule)
+	var reqErr *requestError
+	if errors.As(err, &reqErr) && reqErr.StatusCode == http.StatusNotFound &&
+		(strings.TrimSpace(reqErr.Body) == "" || strings.TrimSpace(reqErr.Body) == "404 page not found") {
+		return fmt.Errorf("server does not support immutable task execution evidence; upgrade the server before the daemon: %w", err)
+	}
+	if errors.As(err, &reqErr) && reqErr.StatusCode == http.StatusBadRequest &&
+		strings.Contains(strings.ToLower(reqErr.Body), "execution evidence schema version is not supported") {
+		return fmt.Errorf("server does not support task execution evidence schema version %d; upgrade the server before the daemon: %w", snapshot.SchemaVersion, err)
+	}
+	return err
+}
+
 // MarkTaskWaitingLocalDirectory parks a freshly-dispatched task in the
 // waiting_local_directory state on the server. The daemon calls this after
 // it has claimed a task whose project carries a local_directory resource
@@ -362,8 +391,16 @@ func (c *Client) MarkTaskWaitingLocalDirectory(ctx context.Context, taskID, reas
 // returns after executeAndDrain's drain wait), so the server can settle its
 // deferred chat finalization now instead of waiting out the sweeper grace
 // period (#5219). Idempotent server-side.
-func (c *Client) AckTaskCancelled(ctx context.Context, taskID string) error {
-	return c.postJSON(ctx, fmt.Sprintf("/api/daemon/tasks/%s/cancel-ack", taskID), map[string]any{}, nil)
+type TranscriptExpectation struct {
+	MessageCount      int
+	LastSequence      int
+	DeliveryConfirmed bool
+}
+
+func (c *Client) AckTaskCancelled(ctx context.Context, taskID string, transcriptExpectation TranscriptExpectation) error {
+	body := map[string]any{}
+	addTranscriptExpectation(body, transcriptExpectation)
+	return c.postJSON(ctx, fmt.Sprintf("/api/daemon/tasks/%s/cancel-ack", taskID), body, nil)
 }
 
 func (c *Client) ReportProgress(ctx context.Context, taskID, summary string, step, total int) error {
@@ -385,12 +422,18 @@ type TaskMessageData struct {
 }
 
 func (c *Client) ReportTaskMessages(ctx context.Context, taskID string, messages []TaskMessageData) error {
-	return c.postJSON(ctx, fmt.Sprintf("/api/daemon/tasks/%s/messages", taskID), map[string]any{
+	return c.postJSONWithRetry(ctx, fmt.Sprintf("/api/daemon/tasks/%s/messages", taskID), map[string]any{
 		"messages": messages,
-	}, nil)
+	}, nil, defaultTerminalRetrySchedule)
 }
 
-func (c *Client) CompleteTask(ctx context.Context, taskID, output, branchName, sessionID, workDir string) error {
+func addTranscriptExpectation(body map[string]any, expectation TranscriptExpectation) {
+	body["expected_message_count"] = expectation.MessageCount
+	body["expected_last_sequence"] = expectation.LastSequence
+	body["transcript_delivery_confirmed"] = expectation.DeliveryConfirmed
+}
+
+func (c *Client) CompleteTask(ctx context.Context, taskID, output, branchName, sessionID, workDir string, transcriptExpectation TranscriptExpectation) error {
 	body := map[string]any{"output": output}
 	if branchName != "" {
 		body["branch_name"] = branchName
@@ -401,6 +444,7 @@ func (c *Client) CompleteTask(ctx context.Context, taskID, output, branchName, s
 	if workDir != "" {
 		body["work_dir"] = workDir
 	}
+	addTranscriptExpectation(body, transcriptExpectation)
 	return c.postJSONWithRetry(ctx, fmt.Sprintf("/api/daemon/tasks/%s/complete", taskID), body, nil, defaultTerminalRetrySchedule)
 }
 
@@ -413,7 +457,7 @@ func (c *Client) ReportTaskUsage(ctx context.Context, taskID string, usage []Tas
 	}, nil)
 }
 
-func (c *Client) FailTask(ctx context.Context, taskID, errMsg, sessionID, workDir, failureReason string) error {
+func (c *Client) FailTask(ctx context.Context, taskID, errMsg, sessionID, workDir, failureReason string, transcriptExpectation TranscriptExpectation) error {
 	body := map[string]any{"error": errMsg}
 	if sessionID != "" {
 		body["session_id"] = sessionID
@@ -424,6 +468,7 @@ func (c *Client) FailTask(ctx context.Context, taskID, errMsg, sessionID, workDi
 	if failureReason != "" {
 		body["failure_reason"] = failureReason
 	}
+	addTranscriptExpectation(body, transcriptExpectation)
 	return c.postJSONWithRetry(ctx, fmt.Sprintf("/api/daemon/tasks/%s/fail", taskID), body, nil, defaultTerminalRetrySchedule)
 }
 
@@ -612,6 +657,88 @@ type IssueGCStatus struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+// IssueGCCheckResult is one explicit issue result from the workspace batch
+// endpoint. Found=false deliberately covers both a deleted issue and an ID
+// outside the requested workspace, preserving the server's anti-enumeration
+// contract. Err is only populated by the legacy per-issue fallback.
+type IssueGCCheckResult struct {
+	ID        string    `json:"id"`
+	Found     bool      `json:"found"`
+	Status    string    `json:"status,omitempty"`
+	UpdatedAt time.Time `json:"updated_at,omitempty"`
+	Err       error     `json:"-"`
+}
+
+type issueGCBatchResponse struct {
+	Issues []IssueGCCheckResult `json:"issues"`
+}
+
+// isIssueGCBatchUnsupported distinguishes chi's unmatched-route response on an
+// older server from the JSON 404 returned by a current server when the caller
+// cannot access the requested workspace. Only the former is a compatibility
+// signal; falling back on an authorization 404 would turn one denied request
+// into hundreds of legacy probes.
+func isIssueGCBatchUnsupported(err error) bool {
+	var reqErr *requestError
+	return errors.As(err, &reqErr) &&
+		reqErr.StatusCode == http.StatusNotFound &&
+		strings.TrimSpace(reqErr.Body) == "404 page not found"
+}
+
+// GetIssueGCChecks reconciles a workspace's issue IDs in one request. When a
+// new daemon reaches an older server that does not have the batch route, the
+// first 404 permanently switches this client process to the legacy per-issue
+// endpoint. Other batch failures are returned without fan-out so a transient
+// server problem cannot amplify request volume.
+func (c *Client) GetIssueGCChecks(ctx context.Context, workspaceID string, issueIDs []string) (map[string]IssueGCCheckResult, error) {
+	c.issueGCBatchMu.Lock()
+	defer c.issueGCBatchMu.Unlock()
+
+	if c.legacyIssueGCBatchEnabled {
+		return c.getLegacyIssueGCChecks(ctx, issueIDs), nil
+	}
+
+	path := fmt.Sprintf("/api/daemon/workspaces/%s/issues/gc-check", workspaceID)
+	var resp issueGCBatchResponse
+	err := c.postJSON(ctx, path, map[string]any{"issue_ids": issueIDs}, &resp)
+	if err != nil {
+		if !isIssueGCBatchUnsupported(err) {
+			return nil, err
+		}
+		c.legacyIssueGCBatchEnabled = true
+		return c.getLegacyIssueGCChecks(ctx, issueIDs), nil
+	}
+
+	results := make(map[string]IssueGCCheckResult, len(resp.Issues))
+	for _, result := range resp.Issues {
+		results[result.ID] = result
+	}
+	return results, nil
+}
+
+func (c *Client) getLegacyIssueGCChecks(ctx context.Context, issueIDs []string) map[string]IssueGCCheckResult {
+	results := make(map[string]IssueGCCheckResult, len(issueIDs))
+	for _, issueID := range issueIDs {
+		status, err := c.GetIssueGCCheck(ctx, issueID)
+		if err != nil {
+			var reqErr *requestError
+			if errors.As(err, &reqErr) && reqErr.StatusCode == http.StatusNotFound {
+				results[issueID] = IssueGCCheckResult{ID: issueID, Found: false}
+			} else {
+				results[issueID] = IssueGCCheckResult{ID: issueID, Err: err}
+			}
+			continue
+		}
+		results[issueID] = IssueGCCheckResult{
+			ID:        issueID,
+			Found:     true,
+			Status:    status.Status,
+			UpdatedAt: status.UpdatedAt,
+		}
+	}
+	return results
+}
+
 // GetIssueGCCheck returns the status and updated_at of an issue for GC decisions.
 func (c *Client) GetIssueGCCheck(ctx context.Context, issueID string) (*IssueGCStatus, error) {
 	var resp IssueGCStatus
@@ -775,6 +902,17 @@ var defaultTerminalRetrySchedule = []time.Duration{
 var skillBundleResolveRetrySchedule = []time.Duration{
 	500 * time.Millisecond,
 	2 * time.Second,
+}
+
+// executionEvidenceRetrySchedule matches the terminal-callback recovery budget.
+// Losing this idempotent write must stop provider launch, so it receives the
+// same tolerance for a transient control-plane outage as task completion.
+var executionEvidenceRetrySchedule = []time.Duration{
+	4 * time.Second,
+	8 * time.Second,
+	16 * time.Second,
+	32 * time.Second,
+	64 * time.Second,
 }
 
 // retrySleep is the sleep used between retry attempts. Pulled into a package

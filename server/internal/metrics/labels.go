@@ -84,6 +84,7 @@ var businessMetricLabels = map[string][]string{
 	"multica_cloudruntime_request_duration_seconds":    {labelOp},
 	"multica_feedback_submitted_total":                 {labelKind, labelPlatform},
 	"multica_contact_sales_submitted_total":            {labelSource},
+	"multica_chat_output_local_path_total":             {labelKind},
 }
 
 var forbiddenMetricLabels = map[string]struct{}{
@@ -130,6 +131,7 @@ var (
 		"opencode":      "opencode",
 		"deveco":        "deveco",
 		"pi":            "pi",
+		"qwen":          "qwen",
 		"other":         "other",
 	}
 	knownTerminalStatuses = map[string]string{

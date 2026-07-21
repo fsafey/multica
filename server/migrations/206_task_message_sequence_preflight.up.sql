@@ -1,0 +1,1 @@
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM task_message GROUP BY task_id, seq HAVING COUNT(*) > 1) THEN RAISE EXCEPTION 'duplicate task_message (task_id, seq) rows must be reconciled before applying the unique constraint; see docs/task-execution-evidence-migration.md'; END IF; END $$;

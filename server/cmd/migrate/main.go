@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/multica-ai/multica/server/internal/attributionbackfill"
 	"github.com/multica-ai/multica/server/internal/logger"
 	"github.com/multica-ai/multica/server/internal/migrations"
 	"github.com/multica-ai/multica/server/internal/taskusagebackfill"
@@ -37,8 +39,23 @@ type preMigrationHook func(ctx context.Context, pool *pgxpool.Pool) error
 // can advance the watermark. The hook runs the same idempotent
 // monthly-slice backfill that
 // `cmd/backfill_task_usage_hourly` exposes to operators.
+//
+// MUL-4897 / GH #5544: migration 198 VALIDATEs the strict attribution
+// constraint installed by 197, which drops migration 190's
+// originator_source IS NULL exemption. Self-hosted databases never ran the
+// out-of-band backfill that Multica's cloud did, so their legacy rows make
+// 198 fail closed and the backend refuses to start. The hook reconciles
+// those rows (accountable_user_id := originator_user_id) idempotently BEFORE
+// VALIDATE, so a stuck-at-197 instance auto-heals on `migrate up` with no
+// manual SQL. A higher-numbered migration cannot help — the instance never
+// reaches a version above the failing 198.
 var preMigrationHooks = map[string]preMigrationHook{
-	"103_drop_legacy_daily_rollups": runTaskUsageHourlyHook,
+	"103_drop_legacy_daily_rollups":                         runTaskUsageHourlyHook,
+	"198_agent_task_attribution_strict_constraint_validate": runAttributionStrictHook,
+	"204_task_execution_evidence_unique_index":              runTaskExecutionEvidenceIndexHook,
+	"207_task_message_sequence_unique_index":                runTaskMessageSequenceIndexHook,
+	"215_task_message_arrival_order_constraint":             runTaskMessageArrivalOrderBackfillHook,
+	"219_task_message_arrival_order_index":                  runTaskMessageArrivalOrderIndexHook,
 }
 
 func runTaskUsageHourlyHook(ctx context.Context, pool *pgxpool.Pool) error {
@@ -57,6 +74,108 @@ func runTaskUsageHourlyHook(ctx context.Context, pool *pgxpool.Pool) error {
 		"rows_touched", res.RowsTouched,
 		"from", res.From.Format("2006-01-02T15:04:05Z07:00"),
 		"to", res.To.Format("2006-01-02T15:04:05Z07:00"))
+	return nil
+}
+
+// runAttributionStrictHook backfills accountable_user_id from
+// originator_user_id before migration 198 validates the strict attribution
+// constraint, so self-hosted upgrades that never ran the out-of-band
+// backfill recover automatically (GH #5544 / MUL-4897).
+func runAttributionStrictHook(ctx context.Context, pool *pgxpool.Pool) error {
+	res, err := attributionbackfill.Hook(ctx, pool, attributionbackfill.HookOptions{})
+	if err != nil {
+		return fmt.Errorf("attribution strict-constraint pre-198 hook: %w", err)
+	}
+	slog.Info("attribution backfill hook: complete",
+		"rows_backfilled", res.RowsBackfilled,
+		"batches", res.Batches,
+		"mismatch_normalized", res.MismatchNormalized)
+	return nil
+}
+
+func runTaskMessageSequenceIndexHook(ctx context.Context, pool *pgxpool.Pool) error {
+	return dropInvalidIndex(ctx, pool, pgx.Identifier{"public", "task_message_task_id_seq_unique"})
+}
+
+func runTaskExecutionEvidenceIndexHook(ctx context.Context, pool *pgxpool.Pool) error {
+	return dropInvalidIndex(ctx, pool, pgx.Identifier{"public", "task_execution_evidence_task_id_unique"})
+}
+
+func runTaskMessageArrivalOrderIndexHook(ctx context.Context, pool *pgxpool.Pool) error {
+	return dropInvalidIndex(ctx, pool, pgx.Identifier{"public", "task_message_task_id_arrival_order_idx"})
+}
+
+func runTaskMessageArrivalOrderBackfillHook(ctx context.Context, pool *pgxpool.Pool) error {
+	const batchSize = 1000
+	var total int64
+	for {
+		tag, err := pool.Exec(ctx, `
+			WITH candidates AS MATERIALIZED (
+				SELECT id, created_at, task_id, seq
+				FROM task_message
+				WHERE arrival_order IS NULL
+				ORDER BY created_at, task_id, seq, id
+				LIMIT $1
+				FOR UPDATE SKIP LOCKED
+			), numbered AS MATERIALIZED (
+				SELECT
+					id,
+					nextval('task_message_arrival_order_seq') AS arrival_order
+				FROM candidates
+				ORDER BY created_at, task_id, seq, id
+			)
+			UPDATE task_message AS message
+			SET arrival_order = numbered.arrival_order
+			FROM numbered
+			WHERE message.id = numbered.id
+		`, batchSize)
+		if err != nil {
+			return fmt.Errorf("task message arrival-order backfill: %w", err)
+		}
+		updated := tag.RowsAffected()
+		total += updated
+		if updated == 0 {
+			break
+		}
+		slog.Info("task message arrival-order backfill batch complete",
+			"rows", updated,
+			"total", total)
+	}
+	slog.Info("task message arrival-order backfill complete", "rows", total)
+	return nil
+}
+
+// dropInvalidIndex removes only a failed concurrent-build artifact. PostgreSQL
+// leaves an invalid pg_index row behind when CREATE UNIQUE INDEX CONCURRENTLY
+// loses a race with a duplicate insert; IF NOT EXISTS would otherwise skip that
+// unusable relation forever. A valid index, including one already attached to
+// a constraint after a bookkeeping interruption, is never touched.
+func dropInvalidIndex(ctx context.Context, pool *pgxpool.Pool, index pgx.Identifier) error {
+	if len(index) != 2 {
+		return fmt.Errorf("invalid qualified index identifier")
+	}
+	qualified := index.Sanitize()
+	var valid bool
+	err := pool.QueryRow(ctx, `
+		SELECT i.indisvalid
+		FROM pg_index i
+		JOIN pg_class c ON c.oid = i.indexrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1 AND c.relname = $2
+	`, index[0], index[1]).Scan(&valid)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect index %s: %w", qualified, err)
+	}
+	if valid {
+		return nil
+	}
+	if _, err := pool.Exec(ctx, "DROP INDEX CONCURRENTLY "+qualified); err != nil {
+		return fmt.Errorf("drop invalid index %s: %w", qualified, err)
+	}
+	slog.Warn("dropped invalid concurrent index before retry", "index", qualified)
 	return nil
 }
 

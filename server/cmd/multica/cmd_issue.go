@@ -327,6 +327,13 @@ var issueRunMessagesCmd = &cobra.Command{
 	RunE:  runIssueRunMessages,
 }
 
+var issueRunEvidenceCmd = &cobra.Command{
+	Use:   "run-evidence <task-id>",
+	Short: "Get immutable execution evidence for a task",
+	Args:  exactArgs(1),
+	RunE:  runIssueRunEvidence,
+}
+
 var issueUsageCmd = &cobra.Command{
 	Use:   "usage <issue-id>",
 	Short: "Show aggregated token usage for an issue",
@@ -418,6 +425,7 @@ func init() {
 	issueCmd.AddCommand(issueSubscriberCmd)
 	issueCmd.AddCommand(issueRunsCmd)
 	issueCmd.AddCommand(issueRunMessagesCmd)
+	issueCmd.AddCommand(issueRunEvidenceCmd)
 	issueCmd.AddCommand(issueUsageCmd)
 	issueCmd.AddCommand(issueRerunCmd)
 	issueCmd.AddCommand(issueCancelTaskCmd)
@@ -534,6 +542,9 @@ func init() {
 	issueRunMessagesCmd.Flags().String("output", "json", "Output format: table or json")
 	issueRunMessagesCmd.Flags().Int("since", 0, "Only return messages after this sequence number")
 	issueRunMessagesCmd.Flags().String("issue", "", "Issue ID/key to scope short task ID prefix resolution")
+	// issue run-evidence
+	issueRunEvidenceCmd.Flags().String("output", "json", "Output format: json")
+	issueRunEvidenceCmd.Flags().String("issue", "", "Issue ID/key to scope short task ID prefix resolution")
 
 	// issue comment add
 	issueCommentAddCmd.Flags().String("content", "", "Comment content (decodes \\n, \\r, \\t, \\\\; pipe via --content-stdin for multi-line bodies or to preserve literal backslashes)")
@@ -1087,6 +1098,10 @@ func runIssueCreate(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 	if hasDesc {
+		if err := guardLocalPathLinks(desc, "issue description",
+			"Deliver the file itself with `multica issue create --attachment <path>` (repeatable) and drop the link."); err != nil {
+			return err
+		}
 		body["description"] = desc
 	}
 	if statusFlag != "" {
@@ -1259,6 +1274,13 @@ func runIssueUpdate(cmd *cobra.Command, args []string) error {
 	if cmd.Flags().Changed("description") || cmd.Flags().Changed("description-stdin") || cmd.Flags().Changed("description-file") {
 		desc, _, err := resolveTextFlag(cmd, "description")
 		if err != nil {
+			return err
+		}
+		// `issue update` has no --attachment flag, so the hint must point at the
+		// command that does. Telling the agent to "pass --attachment" here would
+		// name an argument this command rejects.
+		if err := guardLocalPathLinks(desc, "issue description",
+			"`multica issue update` cannot carry files — deliver the file with `multica issue comment add <issue-id> --attachment <path>` instead, and drop the link."); err != nil {
 			return err
 		}
 		body["description"] = desc
@@ -1914,6 +1936,10 @@ func runIssueCommentAdd(cmd *cobra.Command, args []string) error {
 	if !hasContent {
 		return fmt.Errorf("--content, --content-stdin, or --content-file is required")
 	}
+	if err := guardLocalPathLinks(content, "comment body",
+		"Deliver the file itself with `multica issue comment add <issue-id> --attachment <path>` (repeatable) and drop the link."); err != nil {
+		return err
+	}
 
 	client, err := newAPIClient(cmd)
 	if err != nil {
@@ -2189,6 +2215,40 @@ func runIssueRunMessages(cmd *cobra.Command, args []string) error {
 	}
 	cli.PrintTable(os.Stdout, headers, rows)
 	return nil
+}
+
+func runIssueRunEvidence(cmd *cobra.Command, args []string) error {
+	client, err := newAPIClient(cmd)
+	if err != nil {
+		return err
+	}
+
+	output, _ := cmd.Flags().GetString("output")
+	if output != "json" {
+		return fmt.Errorf("invalid output %q; valid values: json", output)
+	}
+
+	ctx, cancel := cli.APIContext(context.Background())
+	defer cancel()
+
+	issueID := ""
+	if issueInput, _ := cmd.Flags().GetString("issue"); issueInput != "" {
+		issueRef, err := resolveIssueRef(ctx, client, issueInput)
+		if err != nil {
+			return fmt.Errorf("resolve issue: %w", err)
+		}
+		issueID = issueRef.ID
+	}
+	taskRef, err := resolveTaskRunID(ctx, client, issueID, args[0])
+	if err != nil {
+		return fmt.Errorf("resolve task run: %w", err)
+	}
+
+	var evidence map[string]any
+	if err := client.GetJSON(ctx, "/api/tasks/"+url.PathEscape(taskRef.ID)+"/evidence", &evidence); err != nil {
+		return fmt.Errorf("get run evidence: %w", err)
+	}
+	return cli.PrintJSON(os.Stdout, evidence)
 }
 
 // ---------------------------------------------------------------------------

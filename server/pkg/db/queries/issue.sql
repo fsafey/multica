@@ -65,6 +65,17 @@ LIMIT $2 OFFSET $3;
 SELECT * FROM issue
 WHERE id = $1;
 
+-- name: GetIssueGCStatus :one
+SELECT workspace_id, status, updated_at
+FROM issue
+WHERE id = $1;
+
+-- name: ListIssueGCStatuses :many
+SELECT id, status, updated_at
+FROM issue
+WHERE workspace_id = sqlc.arg('workspace_id')
+  AND id = ANY(sqlc.arg('issue_ids')::uuid[]);
+
 -- name: GetIssueInWorkspace :one
 SELECT * FROM issue
 WHERE id = $1 AND workspace_id = $2;
@@ -159,7 +170,15 @@ LIMIT 1;
 -- (loadIssueForUser / GetIssueInWorkspace) already enforce membership today,
 -- but a future loader bypass or a new caller skipping the loader would be
 -- silently catastrophic without this guard. See incident #1661.
-DELETE FROM issue WHERE id = $1 AND workspace_id = $2;
+WITH target_issues AS (
+    SELECT issue.id FROM issue WHERE issue.id = $1 AND issue.workspace_id = $2
+), cleared_task_execution_evidence AS (
+    DELETE FROM task_execution_evidence
+    WHERE task_id IN (
+        SELECT id FROM agent_task_queue WHERE issue_id IN (SELECT id FROM target_issues)
+    )
+)
+DELETE FROM issue WHERE id IN (SELECT id FROM target_issues);
 
 -- name: ListOpenIssues :many
 -- See ListIssues for the semantics of involves_user_id (mirrors the 4-branch

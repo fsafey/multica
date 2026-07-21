@@ -111,6 +111,26 @@ the PR list); `Closes MUL-2759` links **and** records close intent; a bare body
 mention with no title/branch ref and no closing keyword links as `reference_only`
 and is hidden from the PR list.
 
+## Native task execution evidence
+
+| Behavior | Source |
+|---|---|
+| CLI `multica issue run-evidence <task-id> --output json` | `server/cmd/multica/cmd_issue.go` (`issueRunEvidenceCmd`, `runIssueRunEvidence`) |
+| User-authorized route `GET /api/tasks/{taskId}/evidence` | `server/cmd/server/router.go`; `server/internal/handler/task_evidence.go` (`GetTaskEvidence`) |
+| Same workspace authorization shared with task messages | `server/internal/handler/task_evidence.go` (`requireUserTaskAccess`); `server/internal/handler/daemon.go` (`ListTaskMessagesByUser`) |
+| Immutable pre-launch write and conflict handling | `server/internal/handler/task_evidence.go` (`RecordTaskExecutionEvidence`); migrations `203_task_execution_evidence.up.sql` through `205_task_execution_evidence_primary_key.up.sql` |
+| Daemon fail-closed write immediately before provider execution | `server/internal/daemon/evidence.go` (`buildExecutionSnapshot`); `server/internal/daemon/client.go` (`RecordTaskExecutionEvidence`); call order in `server/internal/daemon/daemon.go` |
+| Provider-neutral snapshot schema and canonical SHA-256 digest | `server/pkg/executionevidence/evidence.go` (`Snapshot`, `CanonicalPayload`, `Digest`) |
+| Full terminal evidence-manifest digest | `server/internal/handler/task_evidence.go` (`taskEvidenceManifest`, `GetTaskEvidence`) |
+| Ordered transcript, arrival-order integrity, and terminal count proof | `server/pkg/db/queries/task_message.sql`; `server/internal/handler/task_evidence.go`; migrations `210_task_transcript_expectation.up.sql` through `219_task_message_arrival_order_index.up.sql`; `server/pkg/executionevidence/evidence.go` (`CheckSequenceIntegrity`) |
+| Per-task, per-model usage | `server/pkg/db/queries/task_usage.sql` (`GetTaskUsage`) |
+| Unique `(task_id, seq)` plus identical-replay behavior | `server/migrations/206_task_message_sequence_preflight.up.sql` through `209_task_message_sequence_old_index.up.sql`; `server/pkg/db/queries/task_message.sql` (`CreateTaskMessage`) |
+| Migration ordering and interrupted-index recovery | `docs/task-execution-evidence-migration.md` |
+| Recursive nested tool-input and MCP redaction; exact authorized snapshot prompt text | `server/pkg/redact/redact.go` (`InputMap`, `inputValue`); `server/pkg/executionevidence/evidence.go` (`MCPMetadata`); `server/internal/daemon/evidence.go` (`buildExecutionSnapshot`) |
+
+The read is provider-neutral and evaluation-neutral.
+Historical tasks without a native snapshot remain incomplete rather than inheriting current agent or checkout state.
+
 ## Status side effects (enqueue contracts)
 
 | Behavior | File:line | Drifted from |
