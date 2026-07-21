@@ -1,0 +1,1 @@
+DROP INDEX CONCURRENTLY IF EXISTS task_execution_evidence_task_id_unique;

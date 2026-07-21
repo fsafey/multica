@@ -70,25 +70,43 @@ var patterns = []secretPattern{
 	// Connection strings with embedded passwords
 	{regexp.MustCompile(`(?i)(?:postgres|mysql|mongodb|redis|amqp)(?:ql)?://[^:\s]+:[^@\s]+@`), "[REDACTED CONNECTION STRING]@"},
 
+	// HTTP(S) URLs with basic-auth credentials. MCP configuration and custom
+	// provider arguments commonly carry these outside database URL schemes.
+	{regexp.MustCompile(`(?i)\b(https?://)[^:/\s]+:[^@\s/]+@`), "$1[REDACTED]@"},
+
 	// Generic key=value patterns for common secret env var names
 	{regexp.MustCompile(`(?i)(?:API_KEY|API_SECRET|SECRET_KEY|SECRET|ACCESS_TOKEN|AUTH_TOKEN|PRIVATE_KEY|DATABASE_URL|DB_PASSWORD|DB_URL|REDIS_URL|PASSWORD|TOKEN)\s*[=:]\s*\S+`), "[REDACTED CREDENTIAL]"},
 }
 
-// InputMap returns a copy of m with all string values passed through Text.
-// Non-string values are preserved as-is.
+// InputMap returns a deep copy of m with every nested string value passed
+// through Text. JSON-shaped maps and arrays are copied recursively so callers
+// never mutate the decoded provider payload while redacting it.
 func InputMap(m map[string]any) map[string]any {
 	if m == nil {
 		return nil
 	}
 	out := make(map[string]any, len(m))
 	for k, v := range m {
-		if s, ok := v.(string); ok {
-			out[k] = Text(s)
-		} else {
-			out[k] = v
-		}
+		out[k] = inputValue(v)
 	}
 	return out
+}
+
+func inputValue(v any) any {
+	switch value := v.(type) {
+	case string:
+		return Text(value)
+	case map[string]any:
+		return InputMap(value)
+	case []any:
+		out := make([]any, len(value))
+		for i, item := range value {
+			out[i] = inputValue(item)
+		}
+		return out
+	default:
+		return value
+	}
 }
 
 // homeDir is resolved once at init for path redaction.

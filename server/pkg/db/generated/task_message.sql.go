@@ -12,9 +12,26 @@ import (
 )
 
 const createTaskMessage = `-- name: CreateTaskMessage :one
-INSERT INTO task_message (task_id, seq, type, tool, content, input, output)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
-RETURNING id, task_id, seq, type, tool, content, input, output, created_at
+WITH inserted AS (
+    INSERT INTO task_message (task_id, seq, type, tool, content, input, output)
+    VALUES ($1, $2, $3, $4, $5, $6, $7)
+    ON CONFLICT (task_id, seq) DO NOTHING
+    RETURNING id, task_id, seq, type, tool, content, input, output, created_at, arrival_order, TRUE AS inserted
+), identical AS (
+    SELECT id, task_id, seq, type, tool, content, input, output, created_at, arrival_order, FALSE AS inserted
+    FROM task_message
+    WHERE task_id = $1
+      AND seq = $2
+      AND type = $3
+      AND tool IS NOT DISTINCT FROM $4
+      AND content IS NOT DISTINCT FROM $5
+      AND input IS NOT DISTINCT FROM $6
+      AND output IS NOT DISTINCT FROM $7
+)
+SELECT id, task_id, seq, type, tool, content, input, output, created_at, arrival_order, inserted FROM inserted
+UNION ALL
+SELECT id, task_id, seq, type, tool, content, input, output, created_at, arrival_order, inserted FROM identical
+LIMIT 1
 `
 
 type CreateTaskMessageParams struct {
@@ -27,7 +44,24 @@ type CreateTaskMessageParams struct {
 	Output  pgtype.Text `json:"output"`
 }
 
-func (q *Queries) CreateTaskMessage(ctx context.Context, arg CreateTaskMessageParams) (TaskMessage, error) {
+type CreateTaskMessageRow struct {
+	ID           pgtype.UUID        `json:"id"`
+	TaskID       pgtype.UUID        `json:"task_id"`
+	Seq          int32              `json:"seq"`
+	Type         string             `json:"type"`
+	Tool         pgtype.Text        `json:"tool"`
+	Content      pgtype.Text        `json:"content"`
+	Input        []byte             `json:"input"`
+	Output       pgtype.Text        `json:"output"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	ArrivalOrder pgtype.Int8        `json:"arrival_order"`
+	Inserted     bool               `json:"inserted"`
+}
+
+// An identical retransmission returns the existing row with inserted=false.
+// A sequence collision with different content returns no row so the handler
+// can fail loudly without changing or rebroadcasting the original message.
+func (q *Queries) CreateTaskMessage(ctx context.Context, arg CreateTaskMessageParams) (CreateTaskMessageRow, error) {
 	row := q.db.QueryRow(ctx, createTaskMessage,
 		arg.TaskID,
 		arg.Seq,
@@ -37,7 +71,7 @@ func (q *Queries) CreateTaskMessage(ctx context.Context, arg CreateTaskMessagePa
 		arg.Input,
 		arg.Output,
 	)
-	var i TaskMessage
+	var i CreateTaskMessageRow
 	err := row.Scan(
 		&i.ID,
 		&i.TaskID,
@@ -48,6 +82,8 @@ func (q *Queries) CreateTaskMessage(ctx context.Context, arg CreateTaskMessagePa
 		&i.Input,
 		&i.Output,
 		&i.CreatedAt,
+		&i.ArrivalOrder,
+		&i.Inserted,
 	)
 	return i, err
 }
@@ -62,8 +98,62 @@ func (q *Queries) DeleteTaskMessages(ctx context.Context, taskID pgtype.UUID) er
 	return err
 }
 
+const getTaskMessageBySequence = `-- name: GetTaskMessageBySequence :one
+SELECT id, task_id, seq, type, tool, content, input, output, created_at, arrival_order FROM task_message
+WHERE task_id = $1 AND seq = $2
+`
+
+type GetTaskMessageBySequenceParams struct {
+	TaskID pgtype.UUID `json:"task_id"`
+	Seq    int32       `json:"seq"`
+}
+
+func (q *Queries) GetTaskMessageBySequence(ctx context.Context, arg GetTaskMessageBySequenceParams) (TaskMessage, error) {
+	row := q.db.QueryRow(ctx, getTaskMessageBySequence, arg.TaskID, arg.Seq)
+	var i TaskMessage
+	err := row.Scan(
+		&i.ID,
+		&i.TaskID,
+		&i.Seq,
+		&i.Type,
+		&i.Tool,
+		&i.Content,
+		&i.Input,
+		&i.Output,
+		&i.CreatedAt,
+		&i.ArrivalOrder,
+	)
+	return i, err
+}
+
+const listTaskMessageSequencesByArrival = `-- name: ListTaskMessageSequencesByArrival :many
+SELECT seq FROM task_message
+WHERE task_id = $1
+ORDER BY arrival_order ASC
+`
+
+func (q *Queries) ListTaskMessageSequencesByArrival(ctx context.Context, taskID pgtype.UUID) ([]int32, error) {
+	rows, err := q.db.Query(ctx, listTaskMessageSequencesByArrival, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []int32{}
+	for rows.Next() {
+		var seq int32
+		if err := rows.Scan(&seq); err != nil {
+			return nil, err
+		}
+		items = append(items, seq)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listTaskMessages = `-- name: ListTaskMessages :many
-SELECT id, task_id, seq, type, tool, content, input, output, created_at FROM task_message
+SELECT id, task_id, seq, type, tool, content, input, output, created_at, arrival_order FROM task_message
 WHERE task_id = $1
 ORDER BY seq ASC
 `
@@ -87,6 +177,7 @@ func (q *Queries) ListTaskMessages(ctx context.Context, taskID pgtype.UUID) ([]T
 			&i.Input,
 			&i.Output,
 			&i.CreatedAt,
+			&i.ArrivalOrder,
 		); err != nil {
 			return nil, err
 		}
@@ -99,7 +190,7 @@ func (q *Queries) ListTaskMessages(ctx context.Context, taskID pgtype.UUID) ([]T
 }
 
 const listTaskMessagesSince = `-- name: ListTaskMessagesSince :many
-SELECT id, task_id, seq, type, tool, content, input, output, created_at FROM task_message
+SELECT id, task_id, seq, type, tool, content, input, output, created_at, arrival_order FROM task_message
 WHERE task_id = $1 AND seq > $2
 ORDER BY seq ASC
 `
@@ -128,6 +219,7 @@ func (q *Queries) ListTaskMessagesSince(ctx context.Context, arg ListTaskMessage
 			&i.Input,
 			&i.Output,
 			&i.CreatedAt,
+			&i.ArrivalOrder,
 		); err != nil {
 			return nil, err
 		}

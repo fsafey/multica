@@ -55,10 +55,11 @@ var ErrNoRuntimesToRegister = errors.New("no agent runtimes could be registered"
 var errTaskPrepareTimeout = errors.New("task preparation timed out")
 
 const (
-	taskSlotWaitTimeout      = 2 * time.Second
-	taskSlotCapacityBackoff  = 5 * time.Second
-	repoCheckoutModeEnv      = "MULTICA_REPO_CHECKOUT_MODE"
-	repoCheckoutModeIsolated = "isolated"
+	taskSlotWaitTimeout         = 2 * time.Second
+	taskSlotCapacityBackoff     = 5 * time.Second
+	maxRetainedTaskMessageBytes = 16 << 20
+	repoCheckoutModeEnv         = "MULTICA_REPO_CHECKOUT_MODE"
+	repoCheckoutModeIsolated    = "isolated"
 	// defaultTaskPrepareTimeout is a hard liveness bound for everything after
 	// claim and before StartTask succeeds: runtime resolution, skill bundles,
 	// execution-environment setup, and the StartTask request itself. It is
@@ -124,14 +125,15 @@ const (
 // reportTerminalTask gives the durable outbox one insertion point without
 // revisiting every task exit when it is added.
 type terminalTaskReport struct {
-	kind          terminalTaskReportKind
-	taskID        string
-	output        string
-	branchName    string
-	errorMessage  string
-	sessionID     string
-	workDir       string
-	failureReason string
+	kind                  terminalTaskReportKind
+	taskID                string
+	output                string
+	branchName            string
+	errorMessage          string
+	sessionID             string
+	workDir               string
+	failureReason         string
+	transcriptExpectation TranscriptExpectation
 }
 
 type executionEnvironmentCommand func() ([]string, error)
@@ -222,6 +224,11 @@ type Daemon struct {
 	repoCache  repoCacheBackend
 	skillCache *SkillBundleCache
 	logger     *slog.Logger
+
+	// taskMessageDeliveryTimeout bounds one transcript delivery attempt and
+	// the terminal drain window. Tests may shorten it; zero uses the production
+	// default so a control-plane outage cannot hold an execution slot forever.
+	taskMessageDeliveryTimeout time.Duration
 
 	mu           sync.Mutex
 	workspaces   map[string]*workspaceState
@@ -3251,7 +3258,7 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 		// runner.run has returned, so the transcript flush is complete —
 		// tell the server it can settle its deferred chat finalization
 		// (#5219). Best-effort: the sweeper grace period covers a lost ack.
-		if ackErr := d.client.AckTaskCancelled(ctx, task.ID); ackErr != nil {
+		if ackErr := d.client.AckTaskCancelled(ctx, task.ID, transcriptExpectation(result)); ackErr != nil {
 			taskLog.Warn("cancel ack failed; server sweeper will finalize", "error", ackErr)
 		}
 		return
@@ -3267,10 +3274,11 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 		// shape of the failure (provider 5xx, network, process crash,
 		// …) rather than the coarse legacy "agent_error" bucket.
 		if failErr := d.reportTerminalTask(ctx, terminalTaskReport{
-			kind:          terminalTaskReportFail,
-			taskID:        task.ID,
-			errorMessage:  err.Error(),
-			failureReason: taskRunFailureReason(err),
+			kind:                  terminalTaskReportFail,
+			taskID:                task.ID,
+			errorMessage:          err.Error(),
+			failureReason:         taskRunFailureReason(err),
+			transcriptExpectation: transcriptExpectation(result),
 		}); failErr != nil {
 			taskLog.Error("fail task callback failed", "error", failErr)
 		}
@@ -3288,7 +3296,7 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 		taskLog.Info("task cancelled during execution, discarding result", "status", status, "error", err)
 		// Same contract as the poll-cancelled path above: the transcript is
 		// flushed, so let the server settle its deferred chat finalization.
-		if ackErr := d.client.AckTaskCancelled(ctx, task.ID); ackErr != nil {
+		if ackErr := d.client.AckTaskCancelled(ctx, task.ID, transcriptExpectation(result)); ackErr != nil {
 			taskLog.Warn("cancel ack failed; server sweeper will finalize", "error", ackErr)
 		}
 		return
@@ -3481,12 +3489,13 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 	case "completed":
 		taskLog.Info("task completed", "status", result.Status)
 		err := d.reportTerminalTask(ctx, terminalTaskReport{
-			kind:       terminalTaskReportComplete,
-			taskID:     taskID,
-			output:     result.Comment,
-			branchName: result.BranchName,
-			sessionID:  result.SessionID,
-			workDir:    result.WorkDir,
+			kind:                  terminalTaskReportComplete,
+			taskID:                taskID,
+			output:                result.Comment,
+			branchName:            result.BranchName,
+			sessionID:             result.SessionID,
+			workDir:               result.WorkDir,
+			transcriptExpectation: transcriptExpectation(result),
 		})
 		if err == nil {
 			return
@@ -3517,12 +3526,13 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 		// "agent_error" coarse bucket.
 		fallbackErrMsg := fmt.Sprintf("complete task failed: %s", err.Error())
 		if failErr := d.reportTerminalTask(ctx, terminalTaskReport{
-			kind:          terminalTaskReportFail,
-			taskID:        taskID,
-			errorMessage:  fallbackErrMsg,
-			sessionID:     result.SessionID,
-			workDir:       result.WorkDir,
-			failureReason: taskfailure.Classify(fallbackErrMsg).String(),
+			kind:                  terminalTaskReportFail,
+			taskID:                taskID,
+			errorMessage:          fallbackErrMsg,
+			sessionID:             result.SessionID,
+			workDir:               result.WorkDir,
+			failureReason:         taskfailure.Classify(fallbackErrMsg).String(),
+			transcriptExpectation: transcriptExpectation(result),
 		}); failErr != nil {
 			taskLog.Error("fail task fallback also failed", "error", failErr)
 		}
@@ -3547,12 +3557,13 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 		}
 		taskLog.Info("task did not complete, reporting failure", "status", result.Status, "failure_reason", failureReason)
 		if err := d.reportTerminalTask(ctx, terminalTaskReport{
-			kind:          terminalTaskReportFail,
-			taskID:        taskID,
-			errorMessage:  result.Comment,
-			sessionID:     result.SessionID,
-			workDir:       result.WorkDir,
-			failureReason: failureReason,
+			kind:                  terminalTaskReportFail,
+			taskID:                taskID,
+			errorMessage:          result.Comment,
+			sessionID:             result.SessionID,
+			workDir:               result.WorkDir,
+			failureReason:         failureReason,
+			transcriptExpectation: transcriptExpectation(result),
 		}); err != nil {
 			taskLog.Error("report failed task failed", "error", err)
 		}
@@ -3570,11 +3581,19 @@ func (d *Daemon) reportTerminalTask(parentCtx context.Context, report terminalTa
 
 	switch report.kind {
 	case terminalTaskReportComplete:
-		return d.client.CompleteTask(ctx, report.taskID, report.output, report.branchName, report.sessionID, report.workDir)
+		return d.client.CompleteTask(ctx, report.taskID, report.output, report.branchName, report.sessionID, report.workDir, report.transcriptExpectation)
 	case terminalTaskReportFail:
-		return d.client.FailTask(ctx, report.taskID, report.errorMessage, report.sessionID, report.workDir, report.failureReason)
+		return d.client.FailTask(ctx, report.taskID, report.errorMessage, report.sessionID, report.workDir, report.failureReason, report.transcriptExpectation)
 	default:
 		return fmt.Errorf("unsupported terminal task report kind %d", report.kind)
+	}
+}
+
+func transcriptExpectation(result TaskResult) TranscriptExpectation {
+	return TranscriptExpectation{
+		MessageCount:      result.ExpectedMessageCount,
+		LastSequence:      result.ExpectedLastSequence,
+		DeliveryConfirmed: result.TranscriptDelivered,
 	}
 }
 
@@ -3985,6 +4004,9 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	if task.WorkspaceID == "" {
 		return TaskResult{}, fmt.Errorf("refusing to spawn agent: task has no workspace_id (task_id=%s)", task.ID)
 	}
+	sessionResumeRequested := task.PriorSessionID != ""
+	requestedSessionID := task.PriorSessionID
+	workdirReuseRequested := task.PriorWorkDir != ""
 
 	prepareTimeout := d.effectiveTaskPrepareTimeout()
 	prepareCtx, cancelPrepare := context.WithTimeoutCause(ctx, prepareTimeout, errTaskPrepareTimeout)
@@ -4526,11 +4548,16 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// cursor regression happened — static guesses drift from
 	// whatever the upstream CLI actually accepts.
 	model := ""
+	modelSource := "provider_default"
 	if task.Agent != nil && task.Agent.Model != "" {
 		model = task.Agent.Model
+		modelSource = "agent"
 	}
 	if model == "" {
 		model = entry.Model
+		if model != "" {
+			modelSource = "runtime"
+		}
 	}
 	thinkingLevel := ""
 	if task.Agent != nil {
@@ -4628,26 +4655,81 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		"timeout", execOpts.Timeout,
 		"idle_watchdog", execOpts.IdleWatchdogTimeout,
 	)
+	invocationModel, invocationModelSource := resolveInvocationModel(
+		provider, model, modelSource, extraArgs, customArgs,
+	)
+
+	snapshot, err := buildExecutionSnapshot(executionSnapshotParams{
+		Task:                  task,
+		Provider:              provider,
+		InvocationModel:       invocationModel,
+		InvocationModelSource: invocationModelSource,
+		ProviderCLIVersion:    resolvedVersion,
+		MulticaCLIVersion:     d.cfg.CLIVersion,
+		MulticaGitCommit:      d.cfg.CLICommit,
+		Instructions:          instructions,
+		Skills:                skills,
+		ThinkingLevel:         thinkingLevel,
+		CustomArguments:       customArgs,
+		CustomEnvironment:     agentCustomEnv,
+		MCPConfiguration:      mcpConfig,
+		SessionRequested:      sessionResumeRequested,
+		RequestedSessionID:    requestedSessionID,
+		WorkdirRequested:      workdirReuseRequested,
+		WorkdirReused:         reused,
+	})
+	if err != nil {
+		return TaskResult{}, fmt.Errorf("build task execution evidence: %w", err)
+	}
+	if err := d.client.RecordTaskExecutionEvidence(ctx, task.ID, snapshot); err != nil {
+		return TaskResult{}, fmt.Errorf("record task execution evidence: %w", err)
+	}
 
 	// Shared across the resume-retry below so the retry's transcript rows
 	// keep ascending seq values for the same task.
 	var msgSeq atomic.Int32
-	result, tools, err := d.executeAndDrain(ctx, backend, prompt, execOpts, taskLog, task.ID, &msgSeq)
+	var transcriptDelivered atomic.Bool
+	transcriptDelivered.Store(true)
+	result, tools, err := d.executeAndDrain(ctx, backend, prompt, execOpts, taskLog, task.ID, &msgSeq, &transcriptDelivered)
 	if err != nil {
-		return TaskResult{}, err
+		expected := int(msgSeq.Load())
+		return TaskResult{
+			ExpectedMessageCount: expected,
+			ExpectedLastSequence: expected,
+			TranscriptDelivered:  transcriptDelivered.Load(),
+		}, err
 	}
 
 	if shouldRetryWithFreshSession(result, task.PriorSessionID, tools, provider) {
 		firstUsage := result.Usage
-		taskLog.Warn("session resume failed, retrying with fresh session", "error", result.Error)
-		execOpts.ResumeSessionID = ""
-		retryResult, retryTools, retryErr := d.executeAndDrain(ctx, backend, prompt, execOpts, taskLog, task.ID, &msgSeq)
-		if retryErr != nil {
-			taskLog.Error("fresh session also failed to start", "error", retryErr)
+		retrySequence := msgSeq.Add(1)
+		retryEvidence := []TaskMessageData{{
+			Seq:     int(retrySequence),
+			Type:    "execution_event",
+			Content: "provider_launch",
+			Input: map[string]any{
+				"launch_ordinal":          2,
+				"session_resume_selected": false,
+				"trigger":                 "fresh_session_fallback",
+			},
+		}}
+		retryEvidenceCtx, cancelRetryEvidence := context.WithTimeout(ctx, d.taskMessageDeliveryBudget())
+		retryEvidenceErr := d.client.ReportTaskMessages(retryEvidenceCtx, task.ID, retryEvidence)
+		cancelRetryEvidence()
+		if retryEvidenceErr != nil {
+			transcriptDelivered.Store(false)
+			taskLog.Error("fresh-session retry evidence failed; provider retry suppressed", "error", retryEvidenceErr)
 		} else {
-			result = retryResult
-			result.Usage = mergeUsage(firstUsage, result.Usage)
-			tools = retryTools
+			taskLog.Warn("session resume failed, retrying with fresh session", "error", result.Error)
+			execOpts.ResumeSessionID = ""
+			retryResult, retryTools, retryErr := d.executeAndDrain(ctx, backend, prompt, execOpts, taskLog, task.ID, &msgSeq, &transcriptDelivered)
+			if retryErr != nil {
+				taskLog.Error("fresh session also failed to start", "error", retryErr)
+			} else {
+				result = retryResult
+				result.Usage = mergeUsage(firstUsage, result.Usage)
+				tools = retryTools
+			}
 		}
 	}
 
@@ -4680,6 +4762,13 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			CacheWriteTokens: u.CacheWriteTokens,
 		})
 	}
+	withTranscriptExpectation := func(taskResult TaskResult) TaskResult {
+		expected := int(msgSeq.Load())
+		taskResult.ExpectedMessageCount = expected
+		taskResult.ExpectedLastSequence = expected
+		taskResult.TranscriptDelivered = transcriptDelivered.Load()
+		return taskResult
+	}
 
 	switch result.Status {
 	case "completed":
@@ -4689,14 +4778,14 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			// calls (e.g. posting comments via CLI, pushing code). Treat as
 			// a normal completion so the task is not incorrectly marked as
 			// blocked.
-			return TaskResult{
+			return withTranscriptExpectation(TaskResult{
 				Status:    "completed",
 				Comment:   "",
 				SessionID: result.SessionID,
 				WorkDir:   env.WorkDir,
 				EnvRoot:   env.RootDir,
 				Usage:     usageEntries,
-			}, nil
+			}), nil
 		}
 		// Detect "poisoned" terminal output: the agent didn't reach a real
 		// conclusion but emitted a known fallback marker (iteration limit,
@@ -4709,7 +4798,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			taskLog.Warn("agent finished with poisoned fallback output, classifying as blocked",
 				"failure_reason", reason,
 			)
-			return TaskResult{
+			return withTranscriptExpectation(TaskResult{
 				Status:        "blocked",
 				Comment:       result.Output,
 				SessionID:     result.SessionID,
@@ -4717,16 +4806,16 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 				EnvRoot:       env.RootDir,
 				Usage:         usageEntries,
 				FailureReason: reason,
-			}, nil
+			}), nil
 		}
-		return TaskResult{
+		return withTranscriptExpectation(TaskResult{
 			Status:    "completed",
 			Comment:   result.Output,
 			SessionID: result.SessionID,
 			WorkDir:   env.WorkDir,
 			EnvRoot:   env.RootDir,
 			Usage:     usageEntries,
-		}, nil
+		}), nil
 	case "timeout":
 		// Surface session_id/work_dir so the chat resume pointer is kept
 		// in sync even when the agent times out after building a session.
@@ -4743,7 +4832,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			)
 			failureReason = reason
 		}
-		return TaskResult{
+		return withTranscriptExpectation(TaskResult{
 			Status:        "blocked",
 			Comment:       comment,
 			SessionID:     result.SessionID,
@@ -4751,7 +4840,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			EnvRoot:       env.RootDir,
 			FailureReason: failureReason,
 			Usage:         usageEntries,
-		}, nil
+		}), nil
 	case "idle_watchdog":
 		// The idle watchdog force-stopped the run because the backend
 		// went silent (e.g. claude blocked on a tool call against a
@@ -4762,7 +4851,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		if comment == "" {
 			comment = idleWatchdogReason(d.cfg.AgentIdleWatchdog)
 		}
-		return TaskResult{
+		return withTranscriptExpectation(TaskResult{
 			Status:        "blocked",
 			Comment:       comment,
 			SessionID:     result.SessionID,
@@ -4770,21 +4859,21 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			EnvRoot:       env.RootDir,
 			FailureReason: "idle_watchdog",
 			Usage:         usageEntries,
-		}, nil
+		}), nil
 	case "cancelled":
 		// Server cancelled the task (e.g. issue reassignment, user cancel).
 		// handleTask's cancelledByPoll branch already discards this result,
 		// so this case is mainly defensive — and preserves the "cancelled"
 		// status string for the "agent finished" log line so operators can
 		// distinguish "task cancelled by server" from a real timeout.
-		return TaskResult{
+		return withTranscriptExpectation(TaskResult{
 			Status:    "cancelled",
 			Comment:   "task cancelled by server",
 			SessionID: result.SessionID,
 			WorkDir:   env.WorkDir,
 			EnvRoot:   env.RootDir,
 			Usage:     usageEntries,
-		}, nil
+		}), nil
 	default:
 		errMsg := result.Error
 		if errMsg == "" {
@@ -4820,7 +4909,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			// fact.
 			failureReason = taskfailure.Classify(errMsg).String()
 		}
-		return TaskResult{
+		return withTranscriptExpectation(TaskResult{
 			Status:        "blocked",
 			Comment:       errMsg,
 			SessionID:     result.SessionID,
@@ -4828,7 +4917,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			EnvRoot:       env.RootDir,
 			Usage:         usageEntries,
 			FailureReason: failureReason,
-		}, nil
+		}), nil
 	}
 }
 
@@ -4934,7 +5023,7 @@ func freshSessionMayHelp(errText string) bool {
 // messages and is owned by the caller so a same-task retry continues the
 // sequence instead of restarting at 1 — the server orders the transcript by
 // seq alone, and duplicate seqs would interleave the two attempts' rows.
-func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, prompt string, opts agent.ExecOptions, taskLog *slog.Logger, taskID string, msgSeq *atomic.Int32) (agent.Result, int32, error) {
+func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, prompt string, opts agent.ExecOptions, taskLog *slog.Logger, taskID string, msgSeq *atomic.Int32, transcriptDelivered *atomic.Bool) (agent.Result, int32, error) {
 	// Wrap the caller's ctx so the idle watchdog (below) can interrupt both
 	// the agent subprocess (via the ctx passed to backend.Execute) AND the
 	// drain loop with a single cancel. Without this layer the backend would
@@ -4942,6 +5031,12 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 	// drain, leaving the subprocess running.
 	agentCtx, agentCancel := context.WithCancel(ctx)
 	defer agentCancel()
+	deliveryCtx, deliveryCancel := context.WithCancel(context.Background())
+	defer deliveryCancel()
+	deliveryTimeout := d.taskMessageDeliveryBudget()
+	markTranscriptUndelivered := func() {
+		transcriptDelivered.Store(false)
+	}
 
 	session, err := backend.Execute(agentCtx, prompt, opts)
 	if err != nil {
@@ -5004,12 +5099,20 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 	// tail to be persisted.
 	drainFinished := make(chan struct{})
 	go func() {
-		defer close(drainFinished)
 		var mu sync.Mutex
 		var pendingText strings.Builder
 		var pendingThinking strings.Builder
 		var batch []TaskMessageData
 		callIDToTool := map[string]string{}
+		defer func() {
+			mu.Lock()
+			pending := len(batch) > 0 || pendingText.Len() > 0 || pendingThinking.Len() > 0
+			mu.Unlock()
+			if pending {
+				transcriptDelivered.Store(false)
+			}
+			close(drainFinished)
+		}()
 
 		flush := func() {
 			mu.Lock()
@@ -5036,13 +5139,40 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 			mu.Unlock()
 
 			if len(toSend) > 0 {
-				sendCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				if err := d.client.ReportTaskMessages(sendCtx, taskID, toSend); err != nil {
-					taskLog.Debug("failed to report task messages", "error", err)
+				sendCtx, cancelSend := context.WithTimeout(deliveryCtx, deliveryTimeout)
+				err := d.client.ReportTaskMessages(sendCtx, taskID, toSend)
+				cancelSend()
+				if err != nil {
+					if isTaskMessageSequenceConflict(err) {
+						// The handler processes the entire batch before returning 409:
+						// non-conflicting rows landed and the conflicting row can never
+						// succeed. Do not replay the batch forever, but retain the
+						// failed acknowledgement in terminal evidence.
+						markTranscriptUndelivered()
+						taskLog.Error("task message sequence conflict; dropping acknowledged batch", "error", err)
+						return
+					}
+					// Keep the batch in memory for the next tick or final flush.
+					// ReportTaskMessages already exhausted its bounded retry
+					// schedule, so a terminal count mismatch will remain visible
+					// if the control plane never recovers.
+					mu.Lock()
+					retained, dropped := retainTaskMessagesWithinBudget(
+						append(append([]TaskMessageData{}, toSend...), batch...),
+						maxRetainedTaskMessageBytes,
+					)
+					batch = retained
+					mu.Unlock()
+					if dropped {
+						markTranscriptUndelivered()
+						taskLog.Error("task message retry buffer exceeded its byte budget; dropped oldest messages",
+							"retained", len(retained),
+							"byte_budget", maxRetainedTaskMessageBytes)
+					}
+					taskLog.Warn("failed to report task messages after retries", "error", err)
 				} else {
 					taskLog.Debug("reported task messages", "count", len(toSend), "last_seq", toSend[len(toSend)-1].Seq)
 				}
-				cancel()
 			}
 		}
 
@@ -5189,19 +5319,26 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 	// terminal transition would otherwise see a transcript that is non-empty
 	// but truncated, indistinguishable from a complete one. Bounded so a
 	// backend that never closes its message channel cannot stall the terminal
-	// transition: after 10s the drain loop is cancelled and given a window
-	// wide enough for its worst-case exit — an in-flight tick flush plus the
-	// final one, each capped by the 5s ReportTaskMessages timeout and neither
-	// interruptible by the cancel (they post on context.Background()).
+	// transition. After 10s the provider drain is cancelled, but terminal
+	// handoff still waits for the bounded transcript-delivery retry schedule.
+	// That makes the terminal expected count an acknowledgement of every
+	// batch that could be delivered, rather than racing a still-running flush.
 	waitForDrain := func() {
+		initialWait := min(10*time.Second, deliveryTimeout)
 		select {
 		case <-drainFinished:
-		case <-time.After(10 * time.Second):
+		case <-time.After(initialWait):
 			drainCancel()
 			select {
 			case <-drainFinished:
-			case <-time.After(12 * time.Second):
-				taskLog.Warn("transcript drain did not stop after cancel; completing anyway")
+			case <-time.After(deliveryTimeout):
+				markTranscriptUndelivered()
+				deliveryCancel()
+				select {
+				case <-drainFinished:
+				case <-time.After(min(2*time.Second, deliveryTimeout)):
+					taskLog.Warn("transcript drain exceeded its delivery budget; terminal evidence will be incomplete")
+				}
 			}
 		}
 	}
@@ -5253,6 +5390,38 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 			Error:  "agent did not produce result within drain timeout",
 		}, toolCount.Load(), nil
 	}
+}
+
+func (d *Daemon) taskMessageDeliveryBudget() time.Duration {
+	if d.taskMessageDeliveryTimeout > 0 {
+		return d.taskMessageDeliveryTimeout
+	}
+	return 30 * time.Second
+}
+
+func retainTaskMessagesWithinBudget(messages []TaskMessageData, byteBudget int) ([]TaskMessageData, bool) {
+	retained := make([]TaskMessageData, 0, len(messages))
+	sizes := make([]int, 0, len(messages))
+	total := 2 // JSON array brackets.
+	dropped := false
+	for _, message := range messages {
+		encoded, err := json.Marshal(message)
+		if err != nil {
+			dropped = true
+			continue
+		}
+		size := len(encoded) + 1 // Include the separating comma.
+		retained = append(retained, message)
+		sizes = append(sizes, size)
+		total += size
+	}
+	for total > byteBudget && len(retained) > 0 {
+		total -= sizes[0]
+		retained = retained[1:]
+		sizes = sizes[1:]
+		dropped = true
+	}
+	return retained, dropped
 }
 
 // idleWatchdogReason formats the human-facing explanation surfaced on

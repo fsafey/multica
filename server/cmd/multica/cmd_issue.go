@@ -327,6 +327,13 @@ var issueRunMessagesCmd = &cobra.Command{
 	RunE:  runIssueRunMessages,
 }
 
+var issueRunEvidenceCmd = &cobra.Command{
+	Use:   "run-evidence <task-id>",
+	Short: "Get immutable execution evidence for a task",
+	Args:  exactArgs(1),
+	RunE:  runIssueRunEvidence,
+}
+
 var issueUsageCmd = &cobra.Command{
 	Use:   "usage <issue-id>",
 	Short: "Show aggregated token usage for an issue",
@@ -418,6 +425,7 @@ func init() {
 	issueCmd.AddCommand(issueSubscriberCmd)
 	issueCmd.AddCommand(issueRunsCmd)
 	issueCmd.AddCommand(issueRunMessagesCmd)
+	issueCmd.AddCommand(issueRunEvidenceCmd)
 	issueCmd.AddCommand(issueUsageCmd)
 	issueCmd.AddCommand(issueRerunCmd)
 	issueCmd.AddCommand(issueCancelTaskCmd)
@@ -534,6 +542,9 @@ func init() {
 	issueRunMessagesCmd.Flags().String("output", "json", "Output format: table or json")
 	issueRunMessagesCmd.Flags().Int("since", 0, "Only return messages after this sequence number")
 	issueRunMessagesCmd.Flags().String("issue", "", "Issue ID/key to scope short task ID prefix resolution")
+	// issue run-evidence
+	issueRunEvidenceCmd.Flags().String("output", "json", "Output format: json")
+	issueRunEvidenceCmd.Flags().String("issue", "", "Issue ID/key to scope short task ID prefix resolution")
 
 	// issue comment add
 	issueCommentAddCmd.Flags().String("content", "", "Comment content (decodes \\n, \\r, \\t, \\\\; pipe via --content-stdin for multi-line bodies or to preserve literal backslashes)")
@@ -2204,6 +2215,40 @@ func runIssueRunMessages(cmd *cobra.Command, args []string) error {
 	}
 	cli.PrintTable(os.Stdout, headers, rows)
 	return nil
+}
+
+func runIssueRunEvidence(cmd *cobra.Command, args []string) error {
+	client, err := newAPIClient(cmd)
+	if err != nil {
+		return err
+	}
+
+	output, _ := cmd.Flags().GetString("output")
+	if output != "json" {
+		return fmt.Errorf("invalid output %q; valid values: json", output)
+	}
+
+	ctx, cancel := cli.APIContext(context.Background())
+	defer cancel()
+
+	issueID := ""
+	if issueInput, _ := cmd.Flags().GetString("issue"); issueInput != "" {
+		issueRef, err := resolveIssueRef(ctx, client, issueInput)
+		if err != nil {
+			return fmt.Errorf("resolve issue: %w", err)
+		}
+		issueID = issueRef.ID
+	}
+	taskRef, err := resolveTaskRunID(ctx, client, issueID, args[0])
+	if err != nil {
+		return fmt.Errorf("resolve task run: %w", err)
+	}
+
+	var evidence map[string]any
+	if err := client.GetJSON(ctx, "/api/tasks/"+url.PathEscape(taskRef.ID)+"/evidence", &evidence); err != nil {
+		return fmt.Errorf("get run evidence: %w", err)
+	}
+	return cli.PrintJSON(os.Stdout, evidence)
 }
 
 // ---------------------------------------------------------------------------

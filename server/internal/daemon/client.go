@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/multica-ai/multica/server/pkg/executionevidence"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
@@ -54,6 +55,11 @@ func isTaskNotFoundError(err error) bool {
 		return false
 	}
 	return strings.Contains(strings.ToLower(reqErr.Body), "task not found")
+}
+
+func isTaskMessageSequenceConflict(err error) bool {
+	var reqErr *requestError
+	return errors.As(err, &reqErr) && reqErr.StatusCode == http.StatusConflict
 }
 
 // isUnauthorizedError returns true if the error is a 401 from the server.
@@ -322,6 +328,27 @@ func (c *Client) StartTask(ctx context.Context, taskID string) error {
 	return c.postJSON(ctx, fmt.Sprintf("/api/daemon/tasks/%s/start", taskID), map[string]any{}, nil)
 }
 
+func (c *Client) RecordTaskExecutionEvidence(ctx context.Context, taskID string, snapshot executionevidence.Snapshot) error {
+	digest, err := snapshot.Digest()
+	if err != nil {
+		return fmt.Errorf("digest task execution evidence: %w", err)
+	}
+	err = c.postJSONWithRetry(ctx, fmt.Sprintf("/api/daemon/tasks/%s/evidence", taskID), map[string]any{
+		"snapshot":     snapshot,
+		"payload_hash": digest,
+	}, nil, executionEvidenceRetrySchedule)
+	var reqErr *requestError
+	if errors.As(err, &reqErr) && reqErr.StatusCode == http.StatusNotFound &&
+		(strings.TrimSpace(reqErr.Body) == "" || strings.TrimSpace(reqErr.Body) == "404 page not found") {
+		return fmt.Errorf("server does not support immutable task execution evidence; upgrade the server before the daemon: %w", err)
+	}
+	if errors.As(err, &reqErr) && reqErr.StatusCode == http.StatusBadRequest &&
+		strings.Contains(strings.ToLower(reqErr.Body), "execution evidence schema version is not supported") {
+		return fmt.Errorf("server does not support task execution evidence schema version %d; upgrade the server before the daemon: %w", snapshot.SchemaVersion, err)
+	}
+	return err
+}
+
 // MarkTaskWaitingLocalDirectory parks a freshly-dispatched task in the
 // waiting_local_directory state on the server. The daemon calls this after
 // it has claimed a task whose project carries a local_directory resource
@@ -342,8 +369,16 @@ func (c *Client) MarkTaskWaitingLocalDirectory(ctx context.Context, taskID, reas
 // returns after executeAndDrain's drain wait), so the server can settle its
 // deferred chat finalization now instead of waiting out the sweeper grace
 // period (#5219). Idempotent server-side.
-func (c *Client) AckTaskCancelled(ctx context.Context, taskID string) error {
-	return c.postJSON(ctx, fmt.Sprintf("/api/daemon/tasks/%s/cancel-ack", taskID), map[string]any{}, nil)
+type TranscriptExpectation struct {
+	MessageCount      int
+	LastSequence      int
+	DeliveryConfirmed bool
+}
+
+func (c *Client) AckTaskCancelled(ctx context.Context, taskID string, transcriptExpectation TranscriptExpectation) error {
+	body := map[string]any{}
+	addTranscriptExpectation(body, transcriptExpectation)
+	return c.postJSON(ctx, fmt.Sprintf("/api/daemon/tasks/%s/cancel-ack", taskID), body, nil)
 }
 
 func (c *Client) ReportProgress(ctx context.Context, taskID, summary string, step, total int) error {
@@ -365,12 +400,18 @@ type TaskMessageData struct {
 }
 
 func (c *Client) ReportTaskMessages(ctx context.Context, taskID string, messages []TaskMessageData) error {
-	return c.postJSON(ctx, fmt.Sprintf("/api/daemon/tasks/%s/messages", taskID), map[string]any{
+	return c.postJSONWithRetry(ctx, fmt.Sprintf("/api/daemon/tasks/%s/messages", taskID), map[string]any{
 		"messages": messages,
-	}, nil)
+	}, nil, defaultTerminalRetrySchedule)
 }
 
-func (c *Client) CompleteTask(ctx context.Context, taskID, output, branchName, sessionID, workDir string) error {
+func addTranscriptExpectation(body map[string]any, expectation TranscriptExpectation) {
+	body["expected_message_count"] = expectation.MessageCount
+	body["expected_last_sequence"] = expectation.LastSequence
+	body["transcript_delivery_confirmed"] = expectation.DeliveryConfirmed
+}
+
+func (c *Client) CompleteTask(ctx context.Context, taskID, output, branchName, sessionID, workDir string, transcriptExpectation TranscriptExpectation) error {
 	body := map[string]any{"output": output}
 	if branchName != "" {
 		body["branch_name"] = branchName
@@ -381,6 +422,7 @@ func (c *Client) CompleteTask(ctx context.Context, taskID, output, branchName, s
 	if workDir != "" {
 		body["work_dir"] = workDir
 	}
+	addTranscriptExpectation(body, transcriptExpectation)
 	return c.postJSONWithRetry(ctx, fmt.Sprintf("/api/daemon/tasks/%s/complete", taskID), body, nil, defaultTerminalRetrySchedule)
 }
 
@@ -393,7 +435,7 @@ func (c *Client) ReportTaskUsage(ctx context.Context, taskID string, usage []Tas
 	}, nil)
 }
 
-func (c *Client) FailTask(ctx context.Context, taskID, errMsg, sessionID, workDir, failureReason string) error {
+func (c *Client) FailTask(ctx context.Context, taskID, errMsg, sessionID, workDir, failureReason string, transcriptExpectation TranscriptExpectation) error {
 	body := map[string]any{"error": errMsg}
 	if sessionID != "" {
 		body["session_id"] = sessionID
@@ -404,6 +446,7 @@ func (c *Client) FailTask(ctx context.Context, taskID, errMsg, sessionID, workDi
 	if failureReason != "" {
 		body["failure_reason"] = failureReason
 	}
+	addTranscriptExpectation(body, transcriptExpectation)
 	return c.postJSONWithRetry(ctx, fmt.Sprintf("/api/daemon/tasks/%s/fail", taskID), body, nil, defaultTerminalRetrySchedule)
 }
 
@@ -833,6 +876,17 @@ var defaultTerminalRetrySchedule = []time.Duration{
 var skillBundleResolveRetrySchedule = []time.Duration{
 	500 * time.Millisecond,
 	2 * time.Second,
+}
+
+// executionEvidenceRetrySchedule matches the terminal-callback recovery budget.
+// Losing this idempotent write must stop provider launch, so it receives the
+// same tolerance for a transient control-plane outage as task completion.
+var executionEvidenceRetrySchedule = []time.Duration{
+	4 * time.Second,
+	8 * time.Second,
+	16 * time.Second,
+	32 * time.Second,
+	64 * time.Second,
 }
 
 // retrySleep is the sleep used between retry attempts. Pulled into a package
