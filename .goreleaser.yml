@@ -10,7 +10,7 @@ builds:
     ldflags:
       - -s -w
       - -X main.version={{.Version}}
-      - -X main.commit={{.ShortCommit}}
+      - -X main.commit={{.FullCommit}}
       - -X main.date={{.Date}}
     env:
       - CGO_ENABLED=0

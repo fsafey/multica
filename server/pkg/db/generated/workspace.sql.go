@@ -59,6 +59,12 @@ WITH ws_installations AS (
 ws_agents AS (
     SELECT id FROM agent WHERE workspace_id = $1
 ),
+cleared_task_execution_evidence AS (
+    DELETE FROM task_execution_evidence
+    WHERE task_id IN (
+        SELECT id FROM agent_task_queue WHERE agent_id IN (SELECT id FROM ws_agents)
+    )
+),
 ws_skills AS (
     SELECT id FROM skill WHERE workspace_id = $1
 ),

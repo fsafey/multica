@@ -51,8 +51,16 @@ RETURNING *;
 -- Builder sessions own their hidden execution agent. Deleting the session
 -- removes that carrier and its task rows; the kind guard prevents this cleanup
 -- path from ever deleting a user-authored agent.
-DELETE FROM agent
-WHERE id = $1 AND kind = 'system' AND system_key LIKE 'agent_builder:%';
+WITH target_agent AS (
+    SELECT agent.id FROM agent
+    WHERE agent.id = $1 AND agent.kind = 'system' AND agent.system_key LIKE 'agent_builder:%'
+), cleared_task_execution_evidence AS (
+    DELETE FROM task_execution_evidence
+    WHERE task_id IN (
+        SELECT id FROM agent_task_queue WHERE agent_id IN (SELECT id FROM target_agent)
+    )
+)
+DELETE FROM agent WHERE id IN (SELECT id FROM target_agent);
 
 -- name: UpdateAgent :one
 -- composio_toolkit_allowlist is set wholesale: the API layer is responsible

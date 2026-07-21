@@ -1163,6 +1163,45 @@ func TestRunIssueRunMessagesResolvesShortTaskPrefix(t *testing.T) {
 	}
 }
 
+func TestRunIssueRunEvidenceResolvesShortTaskPrefix(t *testing.T) {
+	issueID := "1881a167-4bb6-4602-944b-f40ce4192fe6"
+	taskID := "abcd1234-0000-0000-0000-000000000000"
+	var evidencePath string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/issues/MUL-1852":
+			json.NewEncoder(w).Encode(map[string]any{"id": issueID, "identifier": "MUL-1852"})
+		case "/api/issues/" + issueID + "/task-runs":
+			json.NewEncoder(w).Encode([]map[string]any{{"id": taskID}})
+		case "/api/tasks/" + taskID + "/evidence":
+			evidencePath = r.URL.Path
+			json.NewEncoder(w).Encode(map[string]any{
+				"task":     map[string]any{"id": taskID, "status": "completed"},
+				"complete": true,
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	t.Setenv("MULTICA_SERVER_URL", srv.URL)
+	t.Setenv("MULTICA_WORKSPACE_ID", "ws-1")
+	t.Setenv("MULTICA_TOKEN", "test-token")
+
+	cmd := &cobra.Command{Use: "run-evidence"}
+	cmd.Flags().String("output", "json", "")
+	cmd.Flags().String("issue", "", "")
+	_ = cmd.Flags().Set("issue", "MUL-1852")
+	if err := runIssueRunEvidence(cmd, []string{"abcd"}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if evidencePath != "/api/tasks/"+taskID+"/evidence" {
+		t.Fatalf("evidence path = %q, want user-facing task evidence path", evidencePath)
+	}
+}
+
 func TestResolveAssignee(t *testing.T) {
 	membersResp := []map[string]any{
 		{"user_id": "user-1111", "name": "Alice Smith"},

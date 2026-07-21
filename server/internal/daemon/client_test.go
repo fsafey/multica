@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/multica-ai/multica/server/pkg/executionevidence"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
@@ -359,6 +360,66 @@ func TestDefaultTerminalRetrySchedule_MatchesAgreedPlan(t *testing.T) {
 		if defaultTerminalRetrySchedule[i] != d {
 			t.Errorf("schedule[%d]: got %s, want %s", i, defaultTerminalRetrySchedule[i], d)
 		}
+	}
+}
+
+func TestExecutionEvidenceRetryScheduleMatchesFailClosedBlastRadius(t *testing.T) {
+	if len(executionEvidenceRetrySchedule) != len(defaultTerminalRetrySchedule) {
+		t.Fatalf("evidence schedule length: got %d, want %d", len(executionEvidenceRetrySchedule), len(defaultTerminalRetrySchedule))
+	}
+	for i, delay := range defaultTerminalRetrySchedule {
+		if executionEvidenceRetrySchedule[i] != delay {
+			t.Errorf("evidence schedule[%d]: got %s, want %s", i, executionEvidenceRetrySchedule[i], delay)
+		}
+	}
+}
+
+func TestReportTaskMessagesRetriesTransientFailure(t *testing.T) {
+	defer noSleepRetry(t)()
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) == 1 {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+	client := NewClient(srv.URL)
+	if err := client.ReportTaskMessages(context.Background(), "task-1", []TaskMessageData{{Seq: 1, Type: "text"}}); err != nil {
+		t.Fatalf("ReportTaskMessages: %v", err)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("message report calls = %d, want 2", calls.Load())
+	}
+}
+
+func TestRecordTaskExecutionEvidenceExplainsLegacyServer(t *testing.T) {
+	srv := httptest.NewServer(http.NotFoundHandler())
+	t.Cleanup(srv.Close)
+	c := NewClient(srv.URL)
+	err := c.RecordTaskExecutionEvidence(context.Background(), "task-1", executionevidence.Snapshot{
+		SchemaVersion: executionevidence.CurrentSchemaVersion,
+	})
+	if err == nil || !strings.Contains(err.Error(), "upgrade the server before the daemon") {
+		t.Fatalf("legacy server error = %v", err)
+	}
+}
+
+func TestRecordTaskExecutionEvidencePreservesTaskNotFoundError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, `{"error":"task not found"}`, http.StatusNotFound)
+	}))
+	t.Cleanup(srv.Close)
+	c := NewClient(srv.URL)
+	err := c.RecordTaskExecutionEvidence(context.Background(), "task-1", executionevidence.Snapshot{
+		SchemaVersion: executionevidence.CurrentSchemaVersion,
+	})
+	if err == nil || !isTaskNotFoundError(err) {
+		t.Fatalf("task-not-found error = %v", err)
+	}
+	if strings.Contains(err.Error(), "upgrade the server before the daemon") {
+		t.Fatalf("task-not-found error was misclassified as a legacy server: %v", err)
 	}
 }
 

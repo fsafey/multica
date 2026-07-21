@@ -339,7 +339,15 @@ func (q *Queries) CreateIssueWithOrigin(ctx context.Context, arg CreateIssueWith
 }
 
 const deleteIssue = `-- name: DeleteIssue :exec
-DELETE FROM issue WHERE id = $1 AND workspace_id = $2
+WITH target_issues AS (
+    SELECT issue.id FROM issue WHERE issue.id = $1 AND issue.workspace_id = $2
+), cleared_task_execution_evidence AS (
+    DELETE FROM task_execution_evidence
+    WHERE task_id IN (
+        SELECT id FROM agent_task_queue WHERE issue_id IN (SELECT id FROM target_issues)
+    )
+)
+DELETE FROM issue WHERE id IN (SELECT id FROM target_issues)
 `
 
 type DeleteIssueParams struct {

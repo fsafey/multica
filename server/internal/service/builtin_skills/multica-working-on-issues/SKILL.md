@@ -118,6 +118,26 @@ not observe a routable issue key in the PR title/body/branch — or the only mat
 was a bare body mention, which links as `reference_only` and is hidden from this
 list (see the reference-only rule above).
 
+## Reading immutable task execution evidence
+
+Use the native evidence read when an audit depends on the exact claim-time configuration, ordered transcript, or per-model token usage for one task.
+
+```bash
+multica issue run-evidence <task-id> --output json
+```
+
+The response contains the task lifecycle record, the immutable pre-launch execution snapshot, ordered task messages, per-model usage, arrival-order sequence integrity, a snapshot digest, a full evidence-manifest digest, and `complete`.
+The authorized canonical snapshot records exact agent instructions and workspace context, provider and invocation model, version identifiers, mounted skill hashes, sanitized custom arguments, custom environment names without values, an MCP configuration hash without configuration content, and session/workdir reuse decisions.
+Exact prompt text is not recursively redacted in the snapshot; recursive native redaction applies to task-message tool inputs and MCP configuration, and downstream exporters must apply their own stricter redaction before disclosure.
+`complete: true` means the task is terminal, the native snapshot exists and matches its digest, required version and invocation facts are resolved, message arrival is strictly increasing without gaps, the persisted transcript matches the daemon's terminal expected count and last sequence, and the daemon confirmed every observed message batch was acknowledged.
+When `complete` is false, inspect `completeness_issues`; a provider-default model or an unstamped development build remains explicitly incomplete instead of being guessed.
+Missing terminal expectations, empty transcripts, gaps, and count or last-sequence mismatches make the trace incomplete.
+Tasks created before native execution evidence was introduced return `complete: false`; do not backfill current configuration and present it as historical evidence.
+The engine does not score, approve releases, or convert this response to an evaluator-specific trace format.
+Server migrations must land before daemons are upgraded because evidence schema mismatches deliberately fail closed before provider launch.
+Transcript batches retry idempotently before terminal handoff; if delivery still fails, the terminal expectation preserves the mismatch as incomplete evidence.
+If the sequence preflight or a concurrent index migration fails, follow `docs/task-execution-evidence-migration.md`; never discard conflicting messages automatically.
+
 ## Metadata: high-signal keys only
 
 Metadata is durable issue state. Reading metadata is safe. Writing a metadata key

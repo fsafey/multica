@@ -8,8 +8,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"math"
 	"net/http"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -2809,10 +2812,13 @@ func (h *Handler) ReportTaskProgress(w http.ResponseWriter, r *http.Request) {
 
 // CompleteTask marks a running task as completed.
 type TaskCompleteRequest struct {
-	PRURL     string `json:"pr_url"`
-	Output    string `json:"output"`
-	SessionID string `json:"session_id"` // Claude session ID for future resumption
-	WorkDir   string `json:"work_dir"`   // working directory used during execution
+	PRURL                       string `json:"pr_url"`
+	Output                      string `json:"output"`
+	SessionID                   string `json:"session_id"` // Claude session ID for future resumption
+	WorkDir                     string `json:"work_dir"`   // working directory used during execution
+	ExpectedMessageCount        *int   `json:"expected_message_count,omitempty"`
+	ExpectedLastSequence        *int   `json:"expected_last_sequence,omitempty"`
+	TranscriptDeliveryConfirmed *bool  `json:"transcript_delivery_confirmed,omitempty"`
 }
 
 func (h *Handler) CompleteTask(w http.ResponseWriter, r *http.Request) {
@@ -2829,8 +2835,18 @@ func (h *Handler) CompleteTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+	if !h.recordTaskTranscriptExpectation(w, r, taskID, req.ExpectedMessageCount, req.ExpectedLastSequence, req.TranscriptDeliveryConfirmed) {
+		return
+	}
 
-	result, _ := json.Marshal(req)
+	result, _ := json.Marshal(struct {
+		PRURL     string `json:"pr_url"`
+		Output    string `json:"output"`
+		SessionID string `json:"session_id"`
+		WorkDir   string `json:"work_dir"`
+	}{
+		PRURL: req.PRURL, Output: req.Output, SessionID: req.SessionID, WorkDir: req.WorkDir,
+	})
 	task, err := h.TaskService.CompleteTask(r.Context(), parseUUID(taskID), result, req.SessionID, req.WorkDir)
 	if err != nil {
 		// A CompleteTask error is an infrastructure failure (transaction /
@@ -3418,10 +3434,13 @@ func (h *Handler) GetTaskStatus(w http.ResponseWriter, r *http.Request) {
 
 // FailTask marks a running task as failed.
 type TaskFailRequest struct {
-	Error         string `json:"error"`
-	SessionID     string `json:"session_id,omitempty"`
-	WorkDir       string `json:"work_dir,omitempty"`
-	FailureReason string `json:"failure_reason,omitempty"`
+	Error                       string `json:"error"`
+	SessionID                   string `json:"session_id,omitempty"`
+	WorkDir                     string `json:"work_dir,omitempty"`
+	FailureReason               string `json:"failure_reason,omitempty"`
+	ExpectedMessageCount        *int   `json:"expected_message_count,omitempty"`
+	ExpectedLastSequence        *int   `json:"expected_last_sequence,omitempty"`
+	TranscriptDeliveryConfirmed *bool  `json:"transcript_delivery_confirmed,omitempty"`
 }
 
 func (h *Handler) FailTask(w http.ResponseWriter, r *http.Request) {
@@ -3436,6 +3455,9 @@ func (h *Handler) FailTask(w http.ResponseWriter, r *http.Request) {
 	var req TaskFailRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if !h.recordTaskTranscriptExpectation(w, r, taskID, req.ExpectedMessageCount, req.ExpectedLastSequence, req.TranscriptDeliveryConfirmed) {
 		return
 	}
 
@@ -3507,6 +3529,7 @@ func (h *Handler) ReportTaskMessages(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	conflictingSequences := []int{}
 	for _, msg := range req.Messages {
 		// Redact sensitive information before persisting or broadcasting.
 		msg.Content = redact.Text(msg.Content)
@@ -3527,18 +3550,68 @@ func (h *Handler) ReportTaskMessages(w http.ResponseWriter, r *http.Request) {
 			Output:  pgtype.Text{String: msg.Output, Valid: msg.Output != ""},
 		})
 		if createErr != nil {
+			if isNotFound(createErr) {
+				// PostgreSQL can observe a concurrent ON CONFLICT row without
+				// making it visible to the statement's original snapshot. Re-read
+				// in a new statement before classifying the retransmission so two
+				// simultaneous identical deliveries remain idempotent.
+				existing, getErr := h.Queries.GetTaskMessageBySequence(r.Context(), db.GetTaskMessageBySequenceParams{
+					TaskID: parseUUID(taskID),
+					Seq:    int32(msg.Seq),
+				})
+				if getErr == nil && taskMessageMatchesRequest(existing, msg) {
+					continue
+				}
+				slog.Warn("conflicting task message sequence", "task_id", taskID, "seq", msg.Seq)
+				conflictingSequences = append(conflictingSequences, msg.Seq)
+				continue
+			}
 			slog.Error("failed to create task message", "task_id", taskID, "seq", msg.Seq, "error", createErr)
 			writeError(w, http.StatusInternalServerError, "failed to persist task message")
 			return
 		}
 
-		if workspaceID != "" {
+		if workspaceID != "" && created.Inserted {
 			h.publishTask(protocol.EventTaskMessage, workspaceID, "system", "", taskID,
-				taskMessageToPayload(created, taskID, uuidToString(task.IssueID)))
+				taskMessageToPayload(taskMessageRowToMessage(created), taskID, uuidToString(task.IssueID)))
 		}
+	}
+	if len(conflictingSequences) > 0 {
+		slog.Warn("task message batch contained conflicting sequences",
+			"task_id", taskID,
+			"sequences", conflictingSequences,
+		)
+		writeError(w, http.StatusConflict, "task message sequence already contains different content")
+		return
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func taskMessageMatchesRequest(row db.TaskMessage, msg TaskMessageRequest) bool {
+	var storedInput map[string]any
+	if len(row.Input) > 0 && json.Unmarshal(row.Input, &storedInput) != nil {
+		return false
+	}
+	return row.Type == msg.Type &&
+		row.Tool == (pgtype.Text{String: msg.Tool, Valid: msg.Tool != ""}) &&
+		row.Content == (pgtype.Text{String: msg.Content, Valid: msg.Content != ""}) &&
+		reflect.DeepEqual(storedInput, msg.Input) &&
+		row.Output == (pgtype.Text{String: msg.Output, Valid: msg.Output != ""})
+}
+
+func taskMessageRowToMessage(row db.CreateTaskMessageRow) db.TaskMessage {
+	return db.TaskMessage{
+		ID:        row.ID,
+		TaskID:    row.TaskID,
+		Seq:       row.Seq,
+		Type:      row.Type,
+		Tool:      row.Tool,
+		Content:   row.Content,
+		Input:     row.Input,
+		Output:    row.Output,
+		CreatedAt: row.CreatedAt,
+	}
 }
 
 // AckTaskCancelled receives the daemon's acknowledgement that it observed a
@@ -3551,8 +3624,65 @@ func (h *Handler) AckTaskCancelled(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	var req struct {
+		ExpectedMessageCount        *int  `json:"expected_message_count,omitempty"`
+		ExpectedLastSequence        *int  `json:"expected_last_sequence,omitempty"`
+		TranscriptDeliveryConfirmed *bool `json:"transcript_delivery_confirmed,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if !h.recordTaskTranscriptExpectation(w, r, taskID, req.ExpectedMessageCount, req.ExpectedLastSequence, req.TranscriptDeliveryConfirmed) {
+		return
+	}
 	h.TaskService.FinalizeDeferredCancelledChat(r.Context(), task.ID)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (h *Handler) recordTaskTranscriptExpectation(
+	w http.ResponseWriter,
+	r *http.Request,
+	taskID string,
+	expectedCount *int,
+	expectedLastSequence *int,
+	deliveryConfirmed *bool,
+) bool {
+	if expectedCount == nil && expectedLastSequence == nil && deliveryConfirmed == nil {
+		return true
+	}
+	if expectedCount == nil || expectedLastSequence == nil || deliveryConfirmed == nil ||
+		*expectedCount < 0 || *expectedCount > math.MaxInt32 ||
+		*expectedLastSequence < 0 || *expectedLastSequence > math.MaxInt32 ||
+		*expectedCount != *expectedLastSequence {
+		writeError(w, http.StatusBadRequest, "invalid transcript expectation")
+		return false
+	}
+	_, err := h.Queries.SetTaskTranscriptExpectation(r.Context(), db.SetTaskTranscriptExpectationParams{
+		ID: parseUUID(taskID),
+		TranscriptExpectedMessageCount: pgtype.Int4{
+			Int32: int32(*expectedCount),
+			Valid: true,
+		},
+		TranscriptExpectedLastSeq: pgtype.Int4{
+			Int32: int32(*expectedLastSequence),
+			Valid: true,
+		},
+		TranscriptDeliveryConfirmed: pgtype.Bool{
+			Bool:  *deliveryConfirmed,
+			Valid: true,
+		},
+	})
+	if err == nil {
+		return true
+	}
+	if isNotFound(err) {
+		writeError(w, http.StatusConflict, "conflicting transcript expectation already exists")
+		return false
+	}
+	slog.Error("failed to persist transcript expectation", "task_id", taskID, "error", err)
+	writeError(w, http.StatusInternalServerError, "failed to persist transcript expectation")
+	return false
 }
 
 func taskMessageToPayload(m db.TaskMessage, taskID, issueID string) protocol.TaskMessagePayload {
@@ -3709,23 +3839,11 @@ func (h *Handler) ListTasksByIssue(w http.ResponseWriter, r *http.Request) {
 // Verifies the task belongs to the caller's workspace.
 func (h *Handler) ListTaskMessagesByUser(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskId")
-	taskUUID, ok := parseUUIDOrBadRequest(w, taskID, "task_id")
+	task, _, ok := h.requireUserTaskAccess(w, r, taskID)
 	if !ok {
 		return
 	}
-
-	task, err := h.Queries.GetAgentTask(r.Context(), taskUUID)
-	if err != nil {
-		writeError(w, http.StatusNotFound, "task not found")
-		return
-	}
-
-	// Verify the task belongs to the caller's workspace.
-	wsID := h.TaskService.ResolveTaskWorkspaceID(r.Context(), task)
-	if wsID == "" || wsID != middleware.WorkspaceIDFromContext(r.Context()) {
-		writeError(w, http.StatusNotFound, "task not found")
-		return
-	}
+	taskUUID := task.ID
 
 	var (
 		messages []db.TaskMessage

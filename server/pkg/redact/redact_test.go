@@ -1,6 +1,7 @@
 package redact
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -226,6 +227,43 @@ func TestNoFalsePositivesOnNormalText(t *testing.T) {
 	}
 }
 
+func TestInputMapRedactsNestedMapsAndArraysWithoutMutatingInput(t *testing.T) {
+	t.Parallel()
+	secret := asm("sk-", "proj-nested0123456789abcdefghijklmnop")
+	input := map[string]any{
+		"top": "safe",
+		"nested": map[string]any{
+			"token": secret,
+			"items": []any{
+				map[string]any{"authorization": "Bearer " + secret},
+				"PASSWORD=hunter2",
+				float64(7),
+			},
+		},
+	}
+
+	got := InputMap(input)
+	raw, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal redacted input: %v", err)
+	}
+	if strings.Contains(string(raw), secret) || strings.Contains(string(raw), "hunter2") {
+		t.Fatalf("nested credential survived redaction: %s", raw)
+	}
+	if !strings.Contains(string(raw), "[REDACTED") {
+		t.Fatalf("expected redaction markers in nested value: %s", raw)
+	}
+
+	originalNested := input["nested"].(map[string]any)
+	if originalNested["token"] != secret {
+		t.Fatal("InputMap mutated the source map")
+	}
+	originalItems := originalNested["items"].([]any)
+	if originalItems[1] != "PASSWORD=hunter2" {
+		t.Fatal("InputMap mutated the source slice")
+	}
+}
+
 func TestRedactGitLabToken(t *testing.T) {
 	t.Parallel()
 	input := "GITLAB_TOKEN=glpat-AbCdEfGhIjKlMnOpQrStUvWx"
@@ -250,6 +288,18 @@ func TestRedactConnectionString(t *testing.T) {
 	got := Text(input)
 	if strings.Contains(got, "s3cret") {
 		t.Fatalf("connection string password not redacted: %s", got)
+	}
+}
+
+func TestRedactHTTPBasicAuthURL(t *testing.T) {
+	t.Parallel()
+	input := "connecting to https://operator:private-password@example.test/mcp"
+	got := Text(input)
+	if strings.Contains(got, "operator:private-password") {
+		t.Fatalf("HTTP basic-auth credentials not redacted: %s", got)
+	}
+	if !strings.Contains(got, "https://[REDACTED]@example.test/mcp") {
+		t.Fatalf("expected redacted HTTP URL, got: %s", got)
 	}
 }
 

@@ -240,6 +240,72 @@ func (f *fixture) tableExists(t *testing.T, name string) bool {
 	return exists
 }
 
+func TestDropInvalidIndexRemovesFailedConcurrentBuild(t *testing.T) {
+	f := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	table := pgx.Identifier{f.schema, "duplicate_rows"}
+	index := pgx.Identifier{f.schema, "invalid_sequence_idx"}
+	if _, err := f.pool.Exec(ctx, fmt.Sprintf(
+		"CREATE TABLE %s (task_id INTEGER NOT NULL, seq INTEGER NOT NULL)",
+		table.Sanitize(),
+	)); err != nil {
+		t.Fatalf("create duplicate fixture table: %v", err)
+	}
+	if _, err := f.pool.Exec(ctx, fmt.Sprintf(
+		"INSERT INTO %s (task_id, seq) VALUES (1, 1), (1, 1)",
+		table.Sanitize(),
+	)); err != nil {
+		t.Fatalf("insert duplicate fixture rows: %v", err)
+	}
+	_, buildErr := f.pool.Exec(ctx, fmt.Sprintf(
+		"CREATE UNIQUE INDEX CONCURRENTLY %s ON %s (task_id, seq)",
+		pgx.Identifier{index[1]}.Sanitize(), table.Sanitize(),
+	))
+	if buildErr == nil {
+		t.Fatal("concurrent unique index unexpectedly accepted duplicate rows")
+	}
+	var valid bool
+	if err := f.pool.QueryRow(ctx, `
+		SELECT i.indisvalid
+		FROM pg_index i
+		JOIN pg_class c ON c.oid = i.indexrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1 AND c.relname = $2
+	`, index[0], index[1]).Scan(&valid); err != nil {
+		t.Fatalf("read failed concurrent index after build error %v: %v", buildErr, err)
+	}
+	if valid {
+		t.Fatal("failed concurrent unique index was marked valid")
+	}
+	if _, err := f.pool.Exec(ctx, fmt.Sprintf(
+		"DELETE FROM %s WHERE ctid IN (SELECT ctid FROM %s LIMIT 1)",
+		table.Sanitize(), table.Sanitize(),
+	)); err != nil {
+		t.Fatalf("reconcile duplicate fixture row: %v", err)
+	}
+	if err := dropInvalidIndex(ctx, f.pool, index); err != nil {
+		t.Fatalf("dropInvalidIndex: %v", err)
+	}
+	var exists bool
+	if err := f.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM pg_class c
+			JOIN pg_namespace n ON n.oid = c.relnamespace
+			WHERE n.nspname = $1 AND c.relname = $2
+		)
+	`, index[0], index[1]).Scan(&exists); err != nil {
+		t.Fatalf("check invalid index removal: %v", err)
+	}
+	if exists {
+		t.Fatal("invalid concurrent index still exists after recovery hook")
+	}
+	if err := dropInvalidIndex(ctx, f.pool, index); err != nil {
+		t.Fatalf("idempotent dropInvalidIndex: %v", err)
+	}
+}
+
 // TestRunMigrationsConcurrentPending fires N goroutines at runMigrations
 // against a fresh schema where none of the migrations have been applied
 // yet. The advisory lock must serialize them so that exactly one of

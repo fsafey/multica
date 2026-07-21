@@ -232,13 +232,16 @@ type TaskUsageEntry struct {
 
 // TaskResult is the outcome of executing a task.
 type TaskResult struct {
-	Status        string           `json:"status"`
-	Comment       string           `json:"comment"`
-	BranchName    string           `json:"branch_name,omitempty"`
-	EnvType       string           `json:"env_type,omitempty"`
-	SessionID     string           `json:"session_id,omitempty"` // Claude session ID for future resumption
-	WorkDir       string           `json:"work_dir,omitempty"`   // working directory used during execution
-	EnvRoot       string           `json:"-"`                    // env root dir for writing GC metadata (not sent to server)
-	FailureReason string           `json:"-"`                    // classifier forwarded to FailTask on the blocked path; empty falls back to 'agent_error'
-	Usage         []TaskUsageEntry `json:"usage,omitempty"`      // per-model token usage
+	Status               string           `json:"status"`
+	Comment              string           `json:"comment"`
+	BranchName           string           `json:"branch_name,omitempty"`
+	EnvType              string           `json:"env_type,omitempty"`
+	SessionID            string           `json:"session_id,omitempty"` // Claude session ID for future resumption
+	WorkDir              string           `json:"work_dir,omitempty"`   // working directory used during execution
+	EnvRoot              string           `json:"-"`                    // env root dir for writing GC metadata (not sent to server)
+	FailureReason        string           `json:"-"`                    // classifier forwarded to FailTask on the blocked path; empty falls back to 'agent_error'
+	Usage                []TaskUsageEntry `json:"usage,omitempty"`      // per-model token usage
+	ExpectedMessageCount int              `json:"-"`                    // daemon-observed transcript messages at terminal handoff
+	ExpectedLastSequence int              `json:"-"`                    // final daemon-assigned transcript sequence at terminal handoff
+	TranscriptDelivered  bool             `json:"-"`                    // every daemon-observed message batch was acknowledged by the server
 }
