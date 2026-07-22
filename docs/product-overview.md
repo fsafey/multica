@@ -418,7 +418,6 @@ autopilot
   ├─ assignee:        <agent_id>          # 指定哪个 agent 跑
   ├─ execution_mode:  create_issue | run_only
   ├─ issue_title_template:  "Daily triage - {{date}}"
-  ├─ concurrency_policy:    skip | queue | replace
   └─ triggers (多个):
        ├─ kind:  schedule | webhook | api
        ├─ cron_expression
@@ -430,6 +429,8 @@ autopilot
 
 - **`create_issue`（默认）**：触发时先创建一个新 issue（标题用 `issue_title_template` 渲染），再把 issue 分配给 agent，走正常 agent 任务流程
 - **`run_only`**：直接创建 task，不关联 issue（适合"只执行不留下 ticket"的场景，比如每小时检查某状态）
+
+同一个 Autopilot 的定时 `run_only` 不会重叠。如果上一次仍在运行，新的定时触发会留下 `skipped` 记录，但不会再创建 task。超过五分钟且没有关联 task/issue 的半成品 run 会在准入时标记为失败，已终止的关联任务也不会永久阻塞后续计划。手动和 webhook 触发仍是显式操作，不会被此规则拒绝；但它们的活动 run 会阻止定时触发，直到该工作结束。
 
 #### 三种触发方式
 
@@ -957,7 +958,7 @@ Web 有 URL 栏——错误状态（比如"你没有访问这个 workspace 的�
 
 ### 自动化
 
-- `autopilot` — 规则（assignee_id, execution_mode: create_issue/run_only, issue_title_template, concurrency_policy）
+- `autopilot` — 规则（assignee_id, execution_mode: create_issue/run_only, issue_title_template）
 - `autopilot_trigger` — 触发器（kind: schedule/webhook/api, cron_expression, timezone, next_run_at, webhook_token）
 - `autopilot_run` — 执行记录（status: pending/issue_created/running/skipped/completed/failed）
 
