@@ -16,7 +16,8 @@ import (
 // user's live checkout so the agent edits that tree in place (execenv.Prepare,
 // LocalWorkDir). To keep two tasks from corrupting each other's sidecars and git
 // index in that one shared tree, the daemon serialises every local_directory
-// task on a whole-task path mutex (LocalPathLocker, keyed on the checkout path).
+// task on a whole-task path mutex (LocalPathLocker, keyed on the canonical git
+// repository root for git-backed directories).
 // For a fleet whose agents all target one checkout that mutex collapses their
 // designed concurrency to strictly one task at a time.
 //
@@ -25,29 +26,32 @@ import (
 // its own working tree and its own git index under the task's envRoot, sharing
 // only the repository's object store and refs. Two tasks on the same checkout no
 // longer share a working tree, an index, or a sidecar directory, so the
-// whole-task mutex is unnecessary — only the brief `git worktree add`/`remove`
-// critical sections (which mutate shared .git metadata) need serialising, done
-// here with a per-source-repo in-process lock (cross-process add/remove races
-// are handled by git's own lockfiles; two-daemon safety is VWO-365's single
-// owner lock).
+// whole-task mutex is unnecessary when the worktree is disposable — only the
+// brief `git worktree add`/`remove` critical sections (which mutate shared .git
+// metadata) need serialising, done here with a per-source-repo in-process lock.
+// publish_back=serial_ff deliberately retains the whole-task path mutex because
+// it advances the source checkout at the end of a completed run. Cross-process
+// add/remove races are handled by git's lockfiles; two-daemon safety is
+// VWO-365's single-owner lock.
 //
 // Ownership of the git lifecycle:
 //   - create   : PrepareIsolatedLocalWorktree — `git worktree add -b
 //     multica/worktree/<shortTaskID> <envRoot/workdir> HEAD`, off the checkout's
 //     current HEAD. Sidecars are excluded per-worktree so `git add -A` can't
 //     stage them.
-//   - commit/rebase/push: the AGENT owns, in its worktree, on its per-task
-//     branch. The daemon never commits; it provides the isolated tree. Same-
-//     passage serialisation and the shared book/glossary flock are the
-//     pub-workstream reducer's job (tools/passage-lock.py, tools/shared_lock.rb),
-//     not the worktree's — distinct worktrees deliberately do not serialise.
+//   - commit: the AGENT owns commits on its per-task branch. The daemon never
+//     commits. Disposable isolation requires the agent to push durable work.
+//     serial_ff publish-back accepts only a clean descendant of BaseCommit and
+//     advances the source by exact fast-forward without rebasing.
 //   - conflict : surfaced to the agent as an ordinary non-fast-forward / rebase
 //     conflict in its own worktree; isolation turns a silent lost-update into a
 //     visible conflict.
-//   - cleanup  : Remove — `git worktree remove --force` + branch delete + prune.
-//     Idempotent. On daemon crash (no deferred cleanup) the worktree dir is
-//     GC'd with its envRoot and PruneOrphanLocalWorktrees reclaims the dangling
-//     registry entry + branch.
+//   - cleanup  : disposable isolation calls Remove directly. serial_ff first
+//     publishes or records refs/multica/quarantine/<task-id>, then removes the
+//     worktree and branch. On daemon crash (no deferred cleanup) the worktree
+//     dir is GC'd with its envRoot and PruneOrphanLocalWorktrees moves any
+//     unique publish-back branch tip to its quarantine ref before reclaiming
+//     the dangling registry entry and branch.
 //
 // Sidecar containment. The daemon writes provider sidecars (.claude/skills/,
 // .agent_context/, .multica/, the runtime brief) into WorkDir because providers
@@ -64,6 +68,7 @@ import (
 // worktreeBranchPrefix namespaces per-task isolation branches so
 // PruneOrphanLocalWorktrees and operators can identify daemon-created worktrees.
 const worktreeBranchPrefix = "multica/worktree/"
+const publishBackBranchPrefix = "multica/publish-back/"
 
 // repoLocks serialises worktree add/remove/prune per source repository within
 // this process. The critical section is brief (a single git call), never the
@@ -91,6 +96,13 @@ type IsolatedLocalWorktree struct {
 	SourceRepo string // git toplevel of the user's checkout (the worktree's parent)
 	WorkDir    string // envRoot/workdir — the isolated working tree
 	Branch     string // multica/worktree/<shortTaskID>
+	TaskID     string // full task UUID, used for the durable quarantine ref
+	BaseCommit string // immutable source HEAD recorded before worktree creation
+
+	// managedPaths is the in-memory authority for daemon-owned files written
+	// inside WorkDir. It deliberately does not rely on the on-disk sidecar
+	// manifest, which the task process can edit or delete before finalization.
+	managedPaths map[string]struct{}
 }
 
 // PrepareIsolatedLocalWorktree cuts an isolated worktree for taskID at workDir,
@@ -100,11 +112,22 @@ type IsolatedLocalWorktree struct {
 // fall back to the in-place local_directory flow or fail the task with a clear
 // message rather than silently running unisolated.
 func PrepareIsolatedLocalWorktree(sourceDir, workDir, taskID string, logger *slog.Logger) (*IsolatedLocalWorktree, error) {
+	return prepareIsolatedLocalWorktree(sourceDir, workDir, taskID, logger, false)
+}
+
+func prepareIsolatedLocalWorktree(sourceDir, workDir, taskID string, logger *slog.Logger, publishBack bool) (*IsolatedLocalWorktree, error) {
 	gitRoot, ok := detectGitRepo(sourceDir)
 	if !ok {
 		return nil, fmt.Errorf("execenv: local_directory isolation requires a git repository, but %q is not inside one", sourceDir)
 	}
 	branch := worktreeBranchPrefix + shortID(taskID)
+	if publishBack {
+		candidate := publishBackBranchPrefix + taskID
+		if ok, _ := gitSuccess(gitRoot, "check-ref-format", "refs/heads/"+candidate); !ok {
+			return nil, fmt.Errorf("execenv: task ID %q cannot form a crash-recovery branch", taskID)
+		}
+		branch = candidate
+	}
 
 	lock := lockForRepo(gitRoot)
 	lock.Lock()
@@ -116,16 +139,47 @@ func PrepareIsolatedLocalWorktree(sourceDir, workDir, taskID string, logger *slo
 	// It can never touch a live sibling: prune only drops entries whose dir is
 	// missing, and reap skips branches still checked out in a worktree.
 	reapOrphansLocked(gitRoot, logger)
-	err := setupGitWorktree(gitRoot, workDir, branch, "HEAD")
+	baseCommit, baseErr := gitOutput(gitRoot, "rev-parse", "--verify", "HEAD^{commit}")
+	if baseErr != nil {
+		lock.Unlock()
+		return nil, fmt.Errorf("execenv: resolve local_directory base commit: %w", baseErr)
+	}
+	// A publish-back branch name carries the full task ID for crash recovery.
+	// It must fail closed on collision rather than taking setupGitWorktree's
+	// disposable-worktree timestamp suffix.
+	actualBranch, err := setupGitWorktree(gitRoot, workDir, branch, baseCommit, !publishBack)
 	lock.Unlock()
 	if err != nil {
 		return nil, fmt.Errorf("execenv: create isolated worktree: %w", err)
 	}
 
 	if logger != nil {
-		logger.Info("execenv: prepared isolated local worktree", "source", gitRoot, "workdir", workDir, "branch", branch)
+		logger.Info("execenv: prepared isolated local worktree", "source", gitRoot, "workdir", workDir, "branch", actualBranch, "base_commit", baseCommit)
 	}
-	return &IsolatedLocalWorktree{SourceRepo: gitRoot, WorkDir: workDir, Branch: branch}, nil
+	return &IsolatedLocalWorktree{
+		SourceRepo:   gitRoot,
+		WorkDir:      workDir,
+		Branch:       actualBranch,
+		TaskID:       taskID,
+		BaseCommit:   baseCommit,
+		managedPaths: make(map[string]struct{}),
+	}, nil
+}
+
+func (w *IsolatedLocalWorktree) recordManagedPaths(paths ...string) {
+	if w == nil {
+		return
+	}
+	if w.managedPaths == nil {
+		w.managedPaths = make(map[string]struct{})
+	}
+	for _, path := range paths {
+		rel, err := filepath.Rel(w.WorkDir, path)
+		if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			continue
+		}
+		w.managedPaths[filepath.ToSlash(rel)] = struct{}{}
+	}
 }
 
 // Remove tears the worktree down: `git worktree remove --force`, delete the
@@ -147,10 +201,11 @@ func (w *IsolatedLocalWorktree) Remove(logger *slog.Logger) {
 // directory has already been removed (the daemon-crash path: the envRoot — and
 // with it envRoot/workdir — is GC'd, but no `git worktree remove` ran, leaving a
 // dangling entry in <sourceRepo>/.git/worktrees and a multica/worktree/* branch).
-// `git worktree prune` drops the dangling registry entries; then any
-// multica/worktree/* branch no longer backing a live worktree is deleted. Safe
-// to run repeatedly and safe against live worktrees (prune only removes entries
-// whose directory is missing; branches still checked out cannot be deleted).
+// `git worktree prune` drops the dangling registry entries; then disposable
+// branches are deleted while publish-back branches are first copied to their
+// durable quarantine refs. Safe to run repeatedly and safe against live
+// worktrees (prune only removes entries whose directory is missing; branches
+// still checked out cannot be deleted).
 func PruneOrphanLocalWorktrees(sourceRepo string, logger *slog.Logger) error {
 	if sourceRepo == "" {
 		return nil
@@ -166,14 +221,18 @@ func PruneOrphanLocalWorktrees(sourceRepo string, logger *slog.Logger) error {
 	return nil
 }
 
-// reapOrphansLocked prunes dangling worktree registry entries and deletes any
-// multica/worktree/* branch no longer backing a live worktree. Caller MUST hold
+// reapOrphansLocked prunes dangling worktree registry entries and reclaims any
+// Multica isolation branch no longer backing a live worktree. Disposable
+// multica/worktree/* branches are deleted. Crash-durable
+// multica/publish-back/* branches are first copied to the task quarantine ref;
+// the branch is deleted only after that ref exists. Caller MUST hold
 // lockForRepo(gitRoot). Safe against live worktrees: `git worktree prune` only
 // drops entries whose directory is missing, and a branch still checked out in a
 // worktree is skipped (and git refuses to delete it anyway).
 func reapOrphansLocked(gitRoot string, logger *slog.Logger) {
 	pruneWorktrees(gitRoot)
 	live := liveWorktreeBranches(gitRoot)
+	livePaths := liveWorktreePaths(gitRoot)
 	for _, br := range listBranchesWithPrefix(gitRoot, worktreeBranchPrefix) {
 		if live[br] {
 			continue
@@ -183,6 +242,84 @@ func reapOrphansLocked(gitRoot string, logger *slog.Logger) {
 			logger.Warn("execenv: prune orphan worktree branch failed", "branch", br, "output", strings.TrimSpace(string(out)), "error", err)
 		}
 	}
+	for _, br := range listBranchesWithPrefix(gitRoot, publishBackBranchPrefix) {
+		taskID := strings.TrimPrefix(br, publishBackBranchPrefix)
+		if live[br] || publishBackWorktreePathLive(livePaths, taskID) {
+			continue
+		}
+		ref := QuarantineRefPrefix + taskID
+		taskSHA, err := gitOutput(gitRoot, "rev-parse", "--verify", br+"^{commit}")
+		if err != nil {
+			if logger != nil {
+				logger.Warn("execenv: resolve orphan publish-back branch failed; preserving branch", "branch", br, "error", err)
+			}
+			continue
+		}
+		reachable, reachErr := gitSuccess(gitRoot, "merge-base", "--is-ancestor", taskSHA, "HEAD")
+		if reachErr != nil {
+			if logger != nil {
+				logger.Warn("execenv: inspect orphan publish-back reachability failed; preserving branch", "branch", br, "error", reachErr)
+			}
+			continue
+		}
+		if reachable {
+			cmd := exec.Command("git", "-C", gitRoot, "branch", "-D", br)
+			if out, err := cmd.CombinedOutput(); err != nil && logger != nil {
+				logger.Warn("execenv: prune reachable orphan publish-back branch failed", "branch", br, "output", strings.TrimSpace(string(out)), "error", err)
+			}
+			continue
+		}
+		if ok, err := gitSuccess(gitRoot, "check-ref-format", ref); err != nil || !ok {
+			if logger != nil {
+				logger.Warn("execenv: invalid orphan publish-back quarantine ref; preserving branch", "branch", br, "ref", ref, "error", err)
+			}
+			continue
+		}
+		if out, err := exec.Command("git", "-C", gitRoot, "update-ref", ref, taskSHA).CombinedOutput(); err != nil {
+			if logger != nil {
+				logger.Warn("execenv: quarantine orphan publish-back branch failed; preserving branch", "branch", br, "ref", ref, "output", strings.TrimSpace(string(out)), "error", err)
+			}
+			continue
+		}
+		cmd := exec.Command("git", "-C", gitRoot, "branch", "-D", br)
+		if out, err := cmd.CombinedOutput(); err != nil && logger != nil {
+			logger.Warn("execenv: prune quarantined publish-back branch failed", "branch", br, "ref", ref, "output", strings.TrimSpace(string(out)), "error", err)
+		}
+	}
+}
+
+// liveWorktreePaths returns registered worktree directories that still exist.
+// Publish-back tasks may detach HEAD or check out a different branch, so branch
+// lines alone cannot prove that their worktree has gone away.
+func liveWorktreePaths(repoRoot string) []string {
+	out, err := exec.Command("git", "-C", repoRoot, "worktree", "list", "--porcelain").Output()
+	if err != nil {
+		return nil
+	}
+	var paths []string
+	for _, line := range strings.Split(string(out), "\n") {
+		path, ok := strings.CutPrefix(line, "worktree ")
+		if !ok {
+			continue
+		}
+		path = strings.TrimSpace(path)
+		if info, statErr := os.Stat(path); statErr == nil && info.IsDir() {
+			paths = append(paths, filepath.Clean(path))
+		}
+	}
+	return paths
+}
+
+func publishBackWorktreePathLive(paths []string, taskID string) bool {
+	taskRootName := shortID(taskID)
+	for _, path := range paths {
+		// Prepare's stable layout is <workspacesRoot>/<workspace>/<shortTaskID>/workdir.
+		// A short-ID collision only delays cleanup, which is the safe direction.
+		if filepath.Base(path) == "workdir" && filepath.Base(filepath.Dir(path)) == taskRootName {
+			return true
+		}
+	}
+	return false
 }
 
 // pruneWorktrees runs `git worktree prune` on repoRoot. Best-effort.

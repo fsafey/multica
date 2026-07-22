@@ -265,6 +265,124 @@ func TestIsolated_NextTaskReapsCrashOrphanBranchAndEntry(t *testing.T) {
 	}
 }
 
+func TestIsolated_PublishBackCrashOrphanQuarantinesBeforeBranchDeletion(t *testing.T) {
+	src := newSourceRepo(t)
+	env := t.TempDir()
+	const taskID = "task-publish-back-crash"
+	wt, err := prepareIsolatedLocalWorktree(src, isolatedWorkDir(env), taskID, nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wt.WorkDir, "durable.txt"), []byte("durable\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git(t, wt.WorkDir, "add", "durable.txt")
+	git(t, wt.WorkDir, "commit", "-qm", "durable task work")
+	taskSHA := git(t, wt.WorkDir, "rev-parse", "HEAD")
+
+	// Simulate SIGKILL followed by envRoot GC: no finalizer ran and the linked
+	// worktree directory disappeared before the orphan reaper observed it.
+	if err := os.RemoveAll(env); err != nil {
+		t.Fatal(err)
+	}
+	if err := PruneOrphanLocalWorktrees(src, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := git(t, src, "rev-parse", QuarantineRefPrefix+taskID); got != taskSHA {
+		t.Fatalf("quarantine ref = %s, want orphan tip %s", got, taskSHA)
+	}
+	if branches := listBranchesWithPrefix(src, publishBackBranchPrefix); len(branches) != 0 {
+		t.Fatalf("quarantined publish-back branch survived recovery: %v", branches)
+	}
+	if list := worktreeList(t, src); strings.Contains(list, wt.WorkDir) {
+		t.Fatalf("dangling publish-back worktree survived recovery:\n%s", list)
+	}
+}
+
+func TestIsolated_PublishBackCrashWithoutTaskCommitSkipsEmptyQuarantine(t *testing.T) {
+	src := newSourceRepo(t)
+	env := t.TempDir()
+	const taskID = "task-publish-back-no-commit"
+	wt, err := prepareIsolatedLocalWorktree(src, isolatedWorkDir(env), taskID, nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(env); err != nil {
+		t.Fatal(err)
+	}
+	if err := PruneOrphanLocalWorktrees(src, nil); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("git", "-C", src, "rev-parse", "--verify", QuarantineRefPrefix+taskID)
+	if err := cmd.Run(); err == nil {
+		t.Fatalf("empty quarantine ref %s unexpectedly exists", QuarantineRefPrefix+taskID)
+	}
+	if branches := listBranchesWithPrefix(src, publishBackBranchPrefix); len(branches) != 0 {
+		t.Fatalf("reachable publish-back branch survived recovery: %v", branches)
+	}
+	if list := worktreeList(t, src); strings.Contains(list, wt.WorkDir) {
+		t.Fatalf("dangling publish-back worktree survived recovery:\n%s", list)
+	}
+}
+
+func TestIsolated_PublishBackDetachedLiveWorktreeIsNeverReaped(t *testing.T) {
+	src := newSourceRepo(t)
+	const taskID = "a1b2c3d4-1111-2222-3333-444455556666"
+	envRoot := filepath.Join(t.TempDir(), shortID(taskID))
+	if err := os.MkdirAll(envRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wt, err := prepareIsolatedLocalWorktree(src, isolatedWorkDir(envRoot), taskID, nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { wt.Remove(nil) })
+	if err := os.WriteFile(filepath.Join(wt.WorkDir, "durable.txt"), []byte("durable\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git(t, wt.WorkDir, "add", "durable.txt")
+	git(t, wt.WorkDir, "commit", "-qm", "durable task work")
+	git(t, wt.WorkDir, "checkout", "--detach", "-q")
+
+	if err := PruneOrphanLocalWorktrees(src, nil); err != nil {
+		t.Fatal(err)
+	}
+	branches := listBranchesWithPrefix(src, publishBackBranchPrefix)
+	if len(branches) != 1 || branches[0] != wt.Branch {
+		t.Fatalf("detached live publish-back branch was reaped: %v", branches)
+	}
+	cmd := exec.Command("git", "-C", src, "rev-parse", "--verify", QuarantineRefPrefix+taskID)
+	if err := cmd.Run(); err == nil {
+		t.Fatalf("live task was prematurely quarantined at %s", QuarantineRefPrefix+taskID)
+	}
+}
+
+func TestIsolated_PublishBackBranchCollisionFailsWithoutSuffix(t *testing.T) {
+	src := newSourceRepo(t)
+	const taskID = "b1c2d3e4-1111-2222-3333-444455556666"
+	firstRoot := filepath.Join(t.TempDir(), shortID(taskID))
+	if err := os.MkdirAll(firstRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	first, err := prepareIsolatedLocalWorktree(src, isolatedWorkDir(firstRoot), taskID, nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { first.Remove(nil) })
+
+	secondRoot := filepath.Join(t.TempDir(), shortID(taskID))
+	if err := os.MkdirAll(secondRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := prepareIsolatedLocalWorktree(src, isolatedWorkDir(secondRoot), taskID, nil, true); err == nil {
+		t.Fatal("expected publish-back branch collision to fail closed")
+	}
+	branches := listBranchesWithPrefix(src, publishBackBranchPrefix)
+	if len(branches) != 1 || branches[0] != publishBackBranchPrefix+taskID {
+		t.Fatalf("publish-back collision created a suffixed branch: %v", branches)
+	}
+}
+
 func TestPruneOrphan_PreservesLiveWorktree(t *testing.T) {
 	src := newSourceRepo(t)
 	env := t.TempDir()

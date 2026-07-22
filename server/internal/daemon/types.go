@@ -3,6 +3,7 @@ package daemon
 import (
 	"encoding/json"
 
+	"github.com/multica-ai/multica/server/internal/daemon/execenv"
 	"github.com/multica-ai/multica/server/internal/runtimeapps"
 )
 
@@ -232,16 +233,18 @@ type TaskUsageEntry struct {
 
 // TaskResult is the outcome of executing a task.
 type TaskResult struct {
-	Status               string           `json:"status"`
-	Comment              string           `json:"comment"`
-	BranchName           string           `json:"branch_name,omitempty"`
-	EnvType              string           `json:"env_type,omitempty"`
-	SessionID            string           `json:"session_id,omitempty"` // Claude session ID for future resumption
-	WorkDir              string           `json:"work_dir,omitempty"`   // working directory used during execution
-	EnvRoot              string           `json:"-"`                    // env root dir for writing GC metadata (not sent to server)
-	FailureReason        string           `json:"-"`                    // classifier forwarded to FailTask on the blocked path; empty falls back to 'agent_error'
-	Usage                []TaskUsageEntry `json:"usage,omitempty"`      // per-model token usage
-	ExpectedMessageCount int              `json:"-"`                    // daemon-observed transcript messages at terminal handoff
-	ExpectedLastSequence int              `json:"-"`                    // final daemon-assigned transcript sequence at terminal handoff
-	TranscriptDelivered  bool             `json:"-"`                    // every daemon-observed message batch was acknowledged by the server
+	Status               string                         `json:"status"`
+	Comment              string                         `json:"comment"`
+	BranchName           string                         `json:"branch_name,omitempty"`
+	EnvType              string                         `json:"env_type,omitempty"`
+	SessionID            string                         `json:"session_id,omitempty"` // Claude session ID for future resumption
+	WorkDir              string                         `json:"work_dir,omitempty"`   // working directory used during execution
+	EnvRoot              string                         `json:"-"`                    // env root dir for writing GC metadata (not sent to server)
+	FailureReason        string                         `json:"-"`                    // classifier forwarded to FailTask on the blocked path; empty falls back to 'agent_error'
+	Usage                []TaskUsageEntry               `json:"usage,omitempty"`      // per-model token usage
+	ExpectedMessageCount int                            `json:"-"`                    // daemon-observed transcript messages at terminal handoff
+	ExpectedLastSequence int                            `json:"-"`                    // final daemon-assigned transcript sequence at terminal handoff
+	TranscriptDelivered  bool                           `json:"-"`                    // every daemon-observed message batch was acknowledged by the server
+	PublishBackWorktree  *execenv.IsolatedLocalWorktree `json:"-"`                    // isolated local_directory lifecycle handle, finalized by handleTask while its path mutex is held
+	PublishBackProvider  string                         `json:"-"`                    // provider whose injected runtime config must be removed before publish validation
 }

@@ -75,6 +75,10 @@ type PrepareParams struct {
 	// sidecar dir. Default false preserves the in-place local_directory contract
 	// general operators rely on (ADR-0019).
 	Isolate bool
+	// PublishBack marks an isolated local_directory worktree as requiring
+	// crash-durable recovery. Its branch carries the full task ID so orphan
+	// reaping can create refs/multica/quarantine/<task-id> before deletion.
+	PublishBack bool
 	// HermesSourceHome is the shared Hermes home the per-task overlay is seeded
 	// from — resolved by the daemon via execenv.ResolveHermesProfile so it honors
 	// the agent's custom_env HERMES_HOME and any -p/--profile or sticky selection.
@@ -332,7 +336,7 @@ func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
 	// Cut the per-task worktree before any sidecar/context files are written, so
 	// writeContextFiles lands them inside the isolated worktree.
 	if isolate {
-		wt, err := PrepareIsolatedLocalWorktree(params.LocalWorkDir, workDir, params.TaskID, logger)
+		wt, err := prepareIsolatedLocalWorktree(params.LocalWorkDir, workDir, params.TaskID, logger, params.PublishBack)
 		if err != nil {
 			return nil, fmt.Errorf("execenv: isolate local_directory: %w", err)
 		}
@@ -419,6 +423,10 @@ func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
 
 	if err := writeSidecarManifest(envRoot, manifest); err != nil {
 		logger.Warn("execenv: write sidecar manifest failed (non-fatal)", "error", err)
+	}
+	if env.IsolatedWorktree != nil {
+		env.IsolatedWorktree.recordManagedPaths(manifest.Files...)
+		env.IsolatedWorktree.recordManagedPaths(manifest.Dirs...)
 	}
 
 	// For OpenClaw, synthesize a per-task config that pins workspace to

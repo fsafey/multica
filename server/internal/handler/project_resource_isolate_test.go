@@ -48,4 +48,32 @@ func TestValidateLocalDirectoryRefIsolateRoundTrip(t *testing.T) {
 			t.Fatal("isolate=false should be omitted from the stored payload")
 		}
 	})
+
+	t.Run("serial fast-forward publish mode survives validation", func(t *testing.T) {
+		out, err := validateLocalDirectoryRef(json.RawMessage(`{"local_path":"/Users/u/proj","daemon_id":"d1","isolate":true,"publish_back":"serial_ff"}`))
+		if err != nil {
+			t.Fatalf("validate: %v", err)
+		}
+		var ref localDirectoryRef
+		if err := json.Unmarshal(out, &ref); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if ref.PublishBack != "serial_ff" {
+			t.Fatalf("publish_back = %q, want serial_ff", ref.PublishBack)
+		}
+	})
+
+	t.Run("publish mode requires isolation", func(t *testing.T) {
+		_, err := validateLocalDirectoryRef(json.RawMessage(`{"local_path":"/Users/u/proj","daemon_id":"d1","publish_back":"serial_ff"}`))
+		if err == nil {
+			t.Fatal("expected publish_back without isolate to fail")
+		}
+	})
+
+	t.Run("unknown publish mode is rejected", func(t *testing.T) {
+		_, err := validateLocalDirectoryRef(json.RawMessage(`{"local_path":"/Users/u/proj","daemon_id":"d1","isolate":true,"publish_back":"merge"}`))
+		if err == nil {
+			t.Fatal("expected unsupported publish_back mode to fail")
+		}
+	})
 }
