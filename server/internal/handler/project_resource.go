@@ -122,17 +122,24 @@ func validateGithubRepoRef(ref json.RawMessage) (json.RawMessage, error) {
 //     checkout, ADR-0019), so it stays the default.
 //   - true: each task runs in its OWN per-task git worktree cut from the
 //     directory's repository (own working tree + index), so tasks run
-//     concurrently without sharing an index or sidecar dir and without the
-//     whole-task path mutex. Opt in for a fleet that targets one checkout.
+//     without sharing an index or sidecar dir. Without publish_back the
+//     worktree is disposable and can skip the whole-task path mutex.
+//
+// PublishBack is optional and valid only with Isolate=true:
+//   - serial_ff: retain the whole-task path mutex, record source HEAD as the
+//     immutable base, and publish only a clean completed task by exact
+//     fast-forward. Every other disposition keeps commits under the task's
+//     quarantine ref before cleanup.
 //
 // resource_ref is polymorphic JSONB, so this field needs no migration — but it
 // MUST stay on this struct (and the daemon mirror), or validateLocalDirectoryRef
 // re-marshals the payload and silently drops it.
 type localDirectoryRef struct {
-	LocalPath string `json:"local_path"`
-	DaemonID  string `json:"daemon_id"`
-	Label     string `json:"label,omitempty"`
-	Isolate   bool   `json:"isolate,omitempty"`
+	LocalPath   string `json:"local_path"`
+	DaemonID    string `json:"daemon_id"`
+	Label       string `json:"label,omitempty"`
+	Isolate     bool   `json:"isolate,omitempty"`
+	PublishBack string `json:"publish_back,omitempty"`
 }
 
 func validateLocalDirectoryRef(ref json.RawMessage) (json.RawMessage, error) {
@@ -152,6 +159,16 @@ func validateLocalDirectoryRef(ref json.RawMessage) (json.RawMessage, error) {
 		return nil, errors.New("local_directory: daemon_id is required")
 	}
 	payload.Label = strings.TrimSpace(payload.Label)
+	payload.PublishBack = strings.TrimSpace(payload.PublishBack)
+	switch payload.PublishBack {
+	case "":
+	case "serial_ff":
+		if !payload.Isolate {
+			return nil, errors.New("local_directory: publish_back=serial_ff requires isolate=true")
+		}
+	default:
+		return nil, fmt.Errorf("local_directory: unsupported publish_back mode %q", payload.PublishBack)
+	}
 	out, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err

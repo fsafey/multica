@@ -9,7 +9,6 @@ import (
 	"regexp"
 	"strings"
 	"time"
-
 )
 
 // detectGitRepo checks if dir is inside a git repository (regular or bare).
@@ -75,19 +74,22 @@ func getRemoteDefaultBranch(gitRoot string) string {
 }
 
 // setupGitWorktree creates a git worktree at worktreePath with a new branch.
-func setupGitWorktree(gitRoot, worktreePath, branchName, baseRef string) error {
+func setupGitWorktree(gitRoot, worktreePath, branchName, baseRef string, allowBranchRename bool) (string, error) {
 	// Remove the workdir created by caller — git worktree add needs to create it.
 	if err := os.Remove(worktreePath); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("remove placeholder workdir: %w", err)
+		return "", fmt.Errorf("remove placeholder workdir: %w", err)
 	}
 
 	err := runGitWorktreeAdd(gitRoot, worktreePath, branchName, baseRef)
-	if err != nil && strings.Contains(err.Error(), "already exists") {
+	if err != nil && allowBranchRename && strings.Contains(err.Error(), "already exists") {
 		// Branch name collision: append timestamp and retry once.
 		branchName = fmt.Sprintf("%s-%d", branchName, time.Now().Unix())
 		err = runGitWorktreeAdd(gitRoot, worktreePath, branchName, baseRef)
 	}
-	return err
+	if err != nil {
+		return "", err
+	}
+	return branchName, nil
 }
 
 func runGitWorktreeAdd(gitRoot, worktreePath, branchName, baseRef string) error {
@@ -111,7 +113,7 @@ func removeGitWorktree(gitRoot, worktreePath, branchName string, logger *slog.Lo
 	// Delete the branch (best-effort).
 	if branchName != "" {
 		cmd = exec.Command("git", "-C", gitRoot, "branch", "-D", branchName)
-	
+
 		if out, err := cmd.CombinedOutput(); err != nil {
 			logger.Warn("execenv: git branch delete failed", "branch", branchName, "output", strings.TrimSpace(string(out)), "error", err)
 		}

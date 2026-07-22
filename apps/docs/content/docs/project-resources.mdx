@@ -42,7 +42,7 @@ The default resource type — checked out per task into an isolated worktree:
 
 ## Resource type: `local_directory`
 
-For repos that can't reasonably be re-cloned per task — multi-gigabyte game checkouts, large monorepos, or any project where the worktree-per-task model is painful — a project can instead point at an **existing directory on a specific [daemon](/daemon-runtimes)'s machine**. The agent runs **directly inside that folder**, with no clone, no copy, and no worktree.
+For repos that can't reasonably be re-cloned per task — multi-gigabyte game checkouts, large monorepos, or any project where the worktree-per-task model is painful — a project can instead point at an **existing directory on a specific [daemon](/daemon-runtimes)'s machine**. By default the agent runs directly inside that folder. Git repositories can opt into the isolated publish-back mode described below.
 
 <Callout type="warning">
 **This is an escape hatch, not a more convenient default.** `local_directory` exists for people who have no other option — the canonical case is a game project whose checkout is tens of gigabytes, where re-cloning per task is simply not viable.
@@ -56,19 +56,40 @@ If your directory is an ordinary git repo you can clone, **use `github_repo` ins
   "resource_ref": {
     "local_path": "/Users/me/code/big-game",
     "daemon_id": "0001234e-…",
-    "label": "main checkout"
+    "label": "main checkout",
+    "isolate": true,
+    "publish_back": "serial_ff"
   }
 }
 ```
 
-The trade-off vs. `github_repo` is intentional: only the bound daemon can pick up tasks against the directory, and tasks on the same directory run **serially** instead of in parallel. In exchange you keep your existing checkout, your existing branch, your existing dirty state — Multica never re-clones it.
+The trade-off vs. `github_repo` is intentional: only the bound daemon can pick up tasks against the directory. In-place tasks and isolated tasks that publish back run **serially**. Git-backed paths use the canonical repository root as the lock key, so an in-place task bound to one subdirectory cannot race a publish-back task bound to another. In exchange you keep your existing checkout, branch, and unrelated dirty state without a fresh clone.
+
+### Isolated serial fast-forward publish-back
+
+Set both `"isolate": true` and `"publish_back": "serial_ff"` when a task must not write sidecars or intermediate edits into the source checkout, but successful local commits must become durable there.
+
+The daemon records the source `HEAD` as `BaseCommit`, cuts one per-task worktree at that exact commit, and keeps the canonical repository lock for the entire task. It publishes only an explicit completed result and only when all of these remain true:
+
+- the task tip is a descendant of `BaseCommit` and the task worktree is clean after daemon sidecars are removed;
+- the source `HEAD` still equals `BaseCommit` and the source index has no staged changes;
+- task paths do not overlap unstaged or untracked source paths;
+- `git merge --ff-only <task-sha>` reaches the exact task SHA without rebasing.
+
+Unrelated unstaged and untracked source files are fingerprinted across the fast-forward and must stay byte-for-byte unchanged. The daemon never stashes, resets, cleans, rebases, or auto-commits the source checkout.
+
+Failed, cancelled, timed-out, poisoned, dirty, or conflicting runs never publish. When the task created a commit not already reachable from the source checkout, its last commit is retained at `refs/multica/quarantine/<task-id>` before the temporary worktree and branch are removed. A run with no task commit needs no recovery ref because its tip is still `BaseCommit`. A quarantine-ref failure leaves the worktree intact for manual recovery.
+
+Quarantine refs are intentionally durable and are not expired automatically. Inspect them with `git for-each-ref refs/multica/quarantine/`, recover or archive any work you need, then delete an obsolete ref with `git update-ref -d refs/multica/quarantine/<task-id>`.
+
+`isolate: true` without `publish_back` remains disposable isolation: it may run without the whole-task directory lock, and all local-only commits disappear when the task worktree is removed. Use that form only when the agent pushes durable work elsewhere before completing.
 
 ### When to pick `local_directory` over `github_repo`
 
 | Concern | `github_repo` (worktree) | `local_directory` |
 | --- | --- | --- |
 | Checkout cost per task | Fresh clone + worktree | None — agent runs in place |
-| Concurrency on the same repo | Many tasks in parallel | One at a time per directory |
+| Concurrency on the same repo | Many tasks in parallel | One at a time per canonical repository |
 | Branch / dirty state | Each task gets a fresh branch from the default | Whatever the directory currently has |
 | Where it can run | Any daemon | Exactly one daemon (the one bound) |
 | Disk footprint | One worktree per task | Zero overhead — your existing folder |

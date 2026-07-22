@@ -275,9 +275,11 @@ func TestBuildResourceRefFromFlagsLocalDirectoryMerges(t *testing.T) {
 		cmd := newProjectResourceUpdateTestCmd()
 		_ = cmd.Flags().Set("ref-label", "renamed")
 		existing := map[string]any{
-			"local_path": "/Users/foo/work/a",
-			"daemon_id":  "d1",
-			"label":      "old",
+			"local_path":   "/Users/foo/work/a",
+			"daemon_id":    "d1",
+			"label":        "old",
+			"isolate":      true,
+			"publish_back": "serial_ff",
 		}
 		ref, has, err := buildResourceRefFromFlags(cmd, "local_directory", existing)
 		if err != nil {
@@ -294,6 +296,12 @@ func TestBuildResourceRefFromFlagsLocalDirectoryMerges(t *testing.T) {
 		}
 		if ref["label"] != "renamed" {
 			t.Errorf("label not overridden: %v", ref["label"])
+		}
+		if ref["isolate"] != true {
+			t.Errorf("isolate not preserved: %v", ref["isolate"])
+		}
+		if ref["publish_back"] != "serial_ff" {
+			t.Errorf("publish_back not preserved: %v", ref["publish_back"])
 		}
 	})
 

@@ -859,6 +859,12 @@ func buildResourceRefFromFlags(cmd *cobra.Command, resourceType string, existing
 			if l, ok := existingRef["label"].(string); ok && strings.TrimSpace(l) != "" {
 				ref["label"] = strings.TrimSpace(l)
 			}
+			if isolate, ok := existingRef["isolate"].(bool); ok && isolate {
+				ref["isolate"] = true
+			}
+			if publishBack, ok := existingRef["publish_back"].(string); ok && strings.TrimSpace(publishBack) != "" {
+				ref["publish_back"] = strings.TrimSpace(publishBack)
+			}
 		}
 		if pathSet {
 			pathVal := strings.TrimSpace(mustString(cmd, "local-path"))

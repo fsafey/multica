@@ -29,7 +29,14 @@ A project's `description` is also durable context: when an issue (or a quick-cre
 Common resource types:
 
 - `github_repo` — durable GitHub repo context, with `resource_ref.url`, optional checkout `ref`, and optional prompt-only `default_branch_hint`;
-- `local_directory` — daemon-local path context, with `resource_ref.local_path`, `daemon_id`, and optional label.
+- `local_directory` — daemon-local path context, with `resource_ref.local_path`, `daemon_id`, optional label, optional `isolate`, and optional `publish_back`.
+
+For crash-durable isolated local work, set `isolate: true` and `publish_back: serial_ff` through the generic JSON `--ref` form.
+The daemon publishes only a clean, explicitly completed task by exact fast-forward while source `HEAD` still equals the recorded base.
+Failed, cancelled, timed-out, poisoned, dirty, conflicting, and crash-orphaned task commits not already reachable from the source checkout are retained under `refs/multica/quarantine/<task-id>` before cleanup.
+A run with no task commit does not create an empty quarantine ref.
+Quarantine refs are durable; after recovery or archival, remove an obsolete ref with `git update-ref -d refs/multica/quarantine/<task-id>`.
+`publish_back` without `isolate: true`, or any publish-back value other than `serial_ff`, is rejected.
 
 ## CLI
 
@@ -46,6 +53,7 @@ multica project resource list <project-id> --output json
 multica project resource add <project-id> --type github_repo --url <github-url> --output json
 multica project resource add <project-id> --type github_repo --url <github-url> --ref <branch-or-sha> --output json
 multica project resource add <project-id> --type local_directory --local-path <abs-path> --daemon-id <daemon-id> --output json
+multica project resource add <project-id> --type local_directory --ref '{"local_path":"/abs/path","daemon_id":"<daemon-id>","isolate":true,"publish_back":"serial_ff"}' --output json
 multica project resource update <project-id> <resource-id> --url <new-github-url> --output json
 multica project resource update <project-id> <resource-id> --ref <branch-or-sha> --output json
 multica project resource remove <project-id> <resource-id> --output json
@@ -66,7 +74,7 @@ is task-local checkout state.
 
 1. `multica project get <project-id> --output json`.
 2. `multica project resource list <project-id> --output json`.
-3. Check `github_repo.resource_ref.url`, optional `ref`, `default_branch_hint`, and `local_directory.resource_ref.daemon_id`.
+3. Check `github_repo.resource_ref.url`, optional `ref`, `default_branch_hint`, and `local_directory.resource_ref.daemon_id`, `isolate`, and `publish_back`.
 4. Updating resources is a durable mutation. After an update, listing the
    resource is the verification path.
 5. If resources match the expected task context, inspect runtime/repo checkout

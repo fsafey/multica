@@ -664,7 +664,9 @@ func TestExpireStaleQueuedTasks(t *testing.T) {
 		t.Fatalf("failed to find test agent: %v", err)
 	}
 
-	// One ancient queued task (should expire) and one fresh queued task (should not).
+	// One sentinel-ancient queued task (should expire) and one fresh queued task
+	// (should not). Use a 50-year TTL so stale queued rows left by other
+	// integration-test processes cannot contaminate this global sweeper result.
 	// Constraint: idx_one_pending_task_per_issue_agent → use distinct issues.
 	mkIssue := func(label string) string {
 		var issueID string
@@ -692,7 +694,7 @@ func TestExpireStaleQueuedTasks(t *testing.T) {
 	var oldTaskID, freshTaskID string
 	if err := testPool.QueryRow(ctx, `
 		INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, status, priority, created_at)
-		VALUES ($1, $2, $3, 'queued', 0, now() - interval '5 hours')
+		VALUES ($1, $2, $3, 'queued', 0, now() - interval '100 years')
 		RETURNING id
 	`, agentID, runtimeID, oldIssueID).Scan(&oldTaskID); err != nil {
 		t.Fatalf("failed to insert old queued task: %v", err)
@@ -707,7 +709,7 @@ func TestExpireStaleQueuedTasks(t *testing.T) {
 
 	queries := db.New(testPool)
 	failed, err := queries.ExpireStaleQueuedTasks(ctx, db.ExpireStaleQueuedTasksParams{
-		TtlSecs:    3600.0, // 1h TTL — old task is 5h, fresh task is 0s
+		TtlSecs:    50 * 365.25 * 24 * 60 * 60, // 50y TTL; sentinel is 100y old
 		MaxPerTick: 100,
 	})
 	if err != nil {

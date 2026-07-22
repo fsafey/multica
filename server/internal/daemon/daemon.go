@@ -3445,6 +3445,18 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 	}()
 
 	result, err := d.runner.run(runCtx, task, provider, slot, taskLog)
+	finalizePublishBack := func(publish bool) error {
+		if result.PublishBackWorktree == nil {
+			return nil
+		}
+		finalizeErr := result.PublishBackWorktree.FinalizeSerialPublishBack(
+			publish,
+			result.PublishBackProvider,
+			taskLog,
+		)
+		result.PublishBackWorktree = nil
+		return finalizeErr
+	}
 
 	// Report usage before any early return — the agent accumulates tokens
 	// whether the task completes, errors, or is cancelled mid-run by the poll
@@ -3461,6 +3473,9 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 	select {
 	case <-cancelledByPoll:
 		taskLog.Info("task cancelled during execution, discarding result")
+		if finalizeErr := finalizePublishBack(false); finalizeErr != nil {
+			taskLog.Error("local_directory publish-back quarantine failed", "error", finalizeErr)
+		}
 		// runner.run has returned, so the transcript flush is complete —
 		// tell the server it can settle its deferred chat finalization
 		// (#5219). Best-effort: the sweeper grace period covers a lost ack.
@@ -3473,6 +3488,9 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 
 	if err != nil {
 		taskLog.Error("task failed", "error", err)
+		if finalizeErr := finalizePublishBack(false); finalizeErr != nil {
+			taskLog.Error("local_directory publish-back quarantine failed", "error", finalizeErr)
+		}
 		// runTask returned without a TaskResult, so we don't have a SessionID
 		// to forward — best we can do is record the failure.
 		// MUL-2946: route the bare error string through the canonical
@@ -3498,14 +3516,59 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 	// outright, skip reporting — the complete/fail callbacks would fail
 	// anyway. Reuse shouldInterruptAgent so this guard honors the same
 	// signals as the in-flight watcher.
-	if status, err := d.client.GetTaskStatus(ctx, task.ID); shouldInterruptAgent(status, err) {
-		taskLog.Info("task cancelled during execution, discarding result", "status", status, "error", err)
+	finalStatus, finalStatusErr := d.client.GetTaskStatus(ctx, task.ID)
+	if shouldInterruptAgent(finalStatus, finalStatusErr) {
+		taskLog.Info("task cancelled during execution, discarding result", "status", finalStatus, "error", finalStatusErr)
+		if finalizeErr := finalizePublishBack(false); finalizeErr != nil {
+			taskLog.Error("local_directory publish-back quarantine failed", "error", finalizeErr)
+		}
 		// Same contract as the poll-cancelled path above: the transcript is
 		// flushed, so let the server settle its deferred chat finalization.
 		if ackErr := d.client.AckTaskCancelled(ctx, task.ID, transcriptExpectation(result)); ackErr != nil {
 			taskLog.Warn("cancel ack failed; server sweeper will finalize", "error", ackErr)
 		}
 		return
+	}
+	if result.PublishBackWorktree != nil && result.Status == "completed" && (finalStatusErr != nil || finalStatus != "running") {
+		note := fmt.Sprintf(
+			"Publish-back did not advance the source because the daemon could not confirm that the task was still running (status=%q, error=%v). Recovery ref target: %s%s.",
+			finalStatus,
+			finalStatusErr,
+			execenv.QuarantineRefPrefix,
+			task.ID,
+		)
+		if finalizeErr := finalizePublishBack(false); finalizeErr != nil {
+			taskLog.Error("local_directory publish-back quarantine failed after unconfirmed task status", "error", finalizeErr)
+			note += " Finalizer error: " + finalizeErr.Error()
+		}
+		result.Status = "blocked"
+		result.FailureReason = "local_directory_publish_status_unconfirmed"
+		result.Comment = appendTaskResultComment(result.Comment, note)
+	}
+
+	if result.PublishBackWorktree != nil {
+		publish := result.Status == "completed"
+		quarantineRef := execenv.QuarantineRefPrefix + task.ID
+		if finalizeErr := finalizePublishBack(publish); finalizeErr != nil {
+			taskLog.Error("local_directory publish-back finalization failed", "publish_requested", publish, "error", finalizeErr)
+			if publish {
+				result.Status = "blocked"
+				if execenv.PublishBackApplied(finalizeErr) {
+					result.FailureReason = "local_directory_publish_postcondition"
+					result.Comment = appendTaskResultComment(result.Comment, fmt.Sprintf(
+						"Publish-back advanced the source to the task commit, but post-publish verification failed. No quarantine ref was needed because the commit is reachable from source HEAD. Finalizer error: %v",
+						finalizeErr,
+					))
+				} else {
+					result.FailureReason = "local_directory_publish_conflict"
+					result.Comment = appendTaskResultComment(result.Comment, fmt.Sprintf(
+						"Publish-back did not advance the source. Recovery ref target: %s. Finalizer error: %v",
+						quarantineRef,
+						finalizeErr,
+					))
+				}
+			}
+		}
 	}
 
 	d.reportTaskResult(ctx, task.ID, result, taskLog)
@@ -3537,6 +3600,13 @@ func taskRunFailureReason(err error) string {
 		return taskfailure.ReasonTimeout.String()
 	}
 	return taskfailure.Classify(err.Error()).String()
+}
+
+func appendTaskResultComment(comment, note string) string {
+	if strings.TrimSpace(comment) == "" {
+		return note
+	}
+	return comment + "\n\n" + note
 }
 
 // acquireLocalDirectoryLockIfNeeded inspects the task's project resources for
@@ -3590,16 +3660,26 @@ func (d *Daemon) acquireLocalDirectoryLockIfNeeded(ctx context.Context, task Tas
 		return nil, true
 	}
 
-	// VWO-367: when the resource opts into per-task worktree isolation, do NOT
-	// take the whole-task path mutex. execenv.Prepare gives each task its own
-	// git worktree + index cut from this checkout, so concurrent tasks no longer
-	// share a working tree, an index, or a sidecar directory. The only shared
-	// .git mutations (worktree add/remove) are serialised briefly inside the
-	// execenv worktree module, never for the whole task lifetime — which is the
-	// serialization this opt-in removes.
-	if assignment.Ref.Isolate {
+	// Disposable isolation can skip the whole-task path mutex because it never
+	// writes back to the source checkout. publish_back=serial_ff is different:
+	// it retains this mutex for the full task so BaseCommit, agent execution,
+	// publication or quarantine, and cleanup form one serialized lifecycle.
+	if assignment.Ref.Isolate && assignment.Ref.PublishBack == "" {
 		taskLog.Info("local_directory: worktree isolation enabled; skipping whole-task path mutex")
 		return nil, false
+	}
+	mutexKey, err := assignment.mutexKey()
+	if err != nil {
+		taskLog.Error("local_directory: resolve mutex key failed", "error", err)
+		if failErr := d.reportTerminalTask(ctx, terminalTaskReport{
+			kind:          terminalTaskReportFail,
+			taskID:        task.ID,
+			errorMessage:  err.Error(),
+			failureReason: "local_directory_error",
+		}); failErr != nil {
+			taskLog.Error("fail task after local_directory mutex-key error", "error", failErr)
+		}
+		return nil, true
 	}
 
 	// While the lock is contended the daemon would otherwise sit blocked on
@@ -3658,7 +3738,7 @@ func (d *Daemon) acquireLocalDirectoryLockIfNeeded(ctx context.Context, task Tas
 			}()
 		})
 	}
-	release, err = d.localPathLocks.Acquire(waitCtx, assignment.RealPath, task.ID, onWait)
+	release, err = d.localPathLocks.Acquire(waitCtx, mutexKey, task.ID, onWait)
 	if err != nil {
 		// If the wait was cut short because the server finalized the task
 		// (terminal state) or deleted the row, the row is already in a
@@ -4225,6 +4305,13 @@ func skillRefFromBundle(bundle SkillData) SkillRefData {
 	}
 }
 
+func taskPrepareTimeoutResult(result TaskResult) TaskResult {
+	return TaskResult{
+		PublishBackWorktree: result.PublishBackWorktree,
+		PublishBackProvider: result.PublishBackProvider,
+	}
+}
+
 func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot int, taskLog *slog.Logger) (taskResult TaskResult, returnErr error) {
 	// Refuse to spawn an agent without a workspace. An empty workspace_id
 	// here would make MULTICA_WORKSPACE_ID empty in the agent env, and the
@@ -4249,7 +4336,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		// Collapse every deadline shape (context deadline, HTTP cancellation,
 		// or the explicit waitForExecutionEnvironment cause) into one sentinel
 		// that handleTask can classify as a retryable platform timeout.
-		taskResult = TaskResult{}
+		taskResult = taskPrepareTimeoutResult(taskResult)
 		returnErr = fmt.Errorf("%w after %s", errTaskPrepareTimeout, prepareTimeout)
 	}()
 
@@ -4527,10 +4614,26 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		if localAssignment != nil {
 			prepParams.LocalWorkDir = localAssignment.AbsPath
 			prepParams.Isolate = localAssignment.Ref.Isolate
+			prepParams.PublishBack = localAssignment.Ref.PublishBack == localDirectoryPublishBackSerialFF
 		}
 		env, err = d.prepareExecutionEnvironment(prepareCtx, prepParams)
 		if err != nil {
 			return TaskResult{}, fmt.Errorf("prepare execution environment: %w", err)
+		}
+	}
+	// Isolated local_directory worktrees need a disposition on every exit.
+	// Disposable isolation keeps its historical deferred remove. serial_ff
+	// publish-back instead hands the worktree to handleTask, which still owns
+	// the whole-task path mutex and can decide between publish and quarantine
+	// only after cancellation and poisoned-result gates have run.
+	if env.IsolatedWorktree != nil {
+		if localAssignment != nil && localAssignment.Ref.PublishBack == localDirectoryPublishBackSerialFF {
+			defer func() {
+				taskResult.PublishBackWorktree = env.IsolatedWorktree
+				taskResult.PublishBackProvider = provider
+			}()
+		} else {
+			defer env.IsolatedWorktree.Remove(d.logger)
 		}
 	}
 	// Belt-and-suspenders: also mark whatever root we ended up with, in case
@@ -4613,18 +4716,6 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 				d.logger.Warn("execenv: cleanup sidecars failed (non-fatal)", "error", cerr)
 			}
 		}()
-	}
-
-	// VWO-367: an isolated local_directory task ran in a per-task worktree the
-	// daemon owns (env.LocalDirectory is false for these, so the in-place excise
-	// above is correctly skipped — the sidecars live in the disposable worktree,
-	// not the user's checkout). Tear the worktree down on the way out to reclaim
-	// its registry entry and per-task branch. The agent must have pushed any work
-	// worth keeping before the task ends (the fleet pushes at each gate-park);
-	// the local branch is scratch. Idempotent; the crash path (no defer) is
-	// reclaimed by GC plus the next task's opportunistic `git worktree prune`.
-	if env.IsolatedWorktree != nil {
-		defer env.IsolatedWorktree.Remove(d.logger)
 	}
 
 	prompt := BuildPrompt(task, provider)

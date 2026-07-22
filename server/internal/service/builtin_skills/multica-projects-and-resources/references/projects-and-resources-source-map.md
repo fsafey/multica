@@ -5,7 +5,10 @@
 - `project create --repo` attaches `github_repo` resources during project creation.
 - `project create` / `project update` accept `--start-date` / `--due-date` (calendar days, `YYYY-MM-DD`), mapping to the project `start_date` / `due_date` columns (migration `166_project_dates`); an empty `--start-date ""`/`--due-date ""` on update clears the date, mirroring the issue date flags in `cmd_issue.go`.
 - `project resource add` supports shortcuts for `github_repo` (`--url`, non-JSON `--ref` for checkout ref, `--default-branch-hint`) and `local_directory` (`--local-path`, `--daemon-id`, `--ref-label`), or generic JSON `--ref '<json>'`.
-- `project resource update` merges shortcut edits with existing `resource_ref` so a partial edit does not clobber required fields; non-JSON `--ref` updates `github_repo.resource_ref.ref`.
+- A `local_directory` ref may opt into per-task git worktree isolation with `isolate: true`; adding `publish_back: serial_ff` retains the repository mutex, records the source base commit, publishes only an exact completed fast-forward, and quarantines each non-published or crash-orphaned task tip not already reachable from the source checkout under `refs/multica/quarantine/<task-id>`.
+- Quarantine refs are durable recovery pointers and require explicit cleanup with `git update-ref -d` after the work is recovered or archived; no ref is created when the task has no unique commit.
+- `server/internal/handler/project_resource.go` validates and preserves `isolate` and `publish_back`; `publish_back` requires `isolate: true` and accepts only `serial_ff`.
+- `project resource update` merges shortcut edits with existing `resource_ref` so a partial edit does not clobber required fields, including `local_directory.isolate` and `local_directory.publish_back`; non-JSON `--ref` updates `github_repo.resource_ref.ref`.
 - `server/cmd/server/router.go` exposes `/api/projects` plus `/api/projects/{projectId}/resources` routes.
 - `server/pkg/db/queries/project_resource.sql` is the CRUD query surface for `project_resource` rows.
 - Project resources are written into `.multica/project/resources.json` for agent workdirs.

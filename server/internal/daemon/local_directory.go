@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -17,7 +18,10 @@ import (
 // looks for when deciding whether a task should run against an existing
 // user directory rather than a fresh git worktree. Mirrors the server-side
 // constant — keep in sync if the type string is ever renamed.
-const localDirectoryResourceType = "local_directory"
+const (
+	localDirectoryResourceType        = "local_directory"
+	localDirectoryPublishBackSerialFF = "serial_ff"
+)
 
 // localDirectoryRef mirrors the server-side ref shape for local_directory
 // project resources. Defined locally so the daemon does not have to import
@@ -32,6 +36,11 @@ type localDirectoryRef struct {
 	// handler.localDirectoryRef; keep both in sync or the server's re-marshal
 	// drops the field. See execenv.PrepareIsolatedLocalWorktree.
 	Isolate bool `json:"isolate,omitempty"`
+	// PublishBack selects the isolated worktree completion policy. serial_ff
+	// keeps the whole-task local path mutex and publishes only an exact
+	// fast-forward from the recorded source HEAD. Empty retains the disposable
+	// isolated-worktree behavior.
+	PublishBack string `json:"publish_back,omitempty"`
 }
 
 // localDirectoryAssignment is the resolved view of a task's local_directory
@@ -44,6 +53,36 @@ type localDirectoryAssignment struct {
 	Ref      localDirectoryRef
 	AbsPath  string // user-provided path, cleaned but not symlink-resolved
 	RealPath string // canonical key for the path mutex
+}
+
+// mutexKey returns the filesystem identity serialized for this assignment.
+// Every path inside a git repository locks the canonical toplevel, including
+// in-place work. Otherwise an in-place task bound to /repo/sub could edit while
+// serial_ff publishes through /repo under a different mutex key. Non-repository
+// in-place paths retain their canonical directory key; serial_ff requires git.
+func (a *localDirectoryAssignment) mutexKey() (string, error) {
+	if a == nil {
+		return "", errors.New("local_directory: assignment is nil")
+	}
+	cmd := exec.Command("git", "-C", a.AbsPath, "rev-parse", "--show-toplevel")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		if a.Ref.PublishBack == localDirectoryPublishBackSerialFF {
+			return "", fmt.Errorf("local_directory: publish_back=serial_ff requires a git repository: %s: %w", strings.TrimSpace(stderr.String()), err)
+		}
+		return a.RealPath, nil
+	}
+	root := strings.TrimSpace(string(out))
+	if root == "" {
+		return "", errors.New("local_directory: publish_back=serial_ff resolved an empty git toplevel")
+	}
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", fmt.Errorf("local_directory: resolve publish-back git toplevel %q: %w", root, err)
+	}
+	return filepath.Clean(realRoot), nil
 }
 
 // localDirectoryAssignmentForTask returns the local_directory assignment a task
@@ -81,6 +120,7 @@ func findLocalDirectoryAssignment(resources []ProjectResourceData, daemonID stri
 			return nil, fmt.Errorf("local_directory: parse resource_ref: %w", err)
 		}
 		ref.DaemonID = strings.TrimSpace(ref.DaemonID)
+		ref.PublishBack = strings.TrimSpace(ref.PublishBack)
 		if ref.DaemonID == "" {
 			return nil, errors.New("local_directory: resource_ref missing daemon_id")
 		}
@@ -89,6 +129,15 @@ func findLocalDirectoryAssignment(resources []ProjectResourceData, daemonID stri
 			// project may have multiple local_directory resources, one
 			// per daemon, and other daemons will resolve their own row.
 			continue
+		}
+		switch ref.PublishBack {
+		case "":
+		case localDirectoryPublishBackSerialFF:
+			if !ref.Isolate {
+				return nil, errors.New("local_directory: publish_back=serial_ff requires isolate=true")
+			}
+		default:
+			return nil, fmt.Errorf("local_directory: unsupported publish_back mode %q", ref.PublishBack)
 		}
 		if match != nil {
 			// Server-side invariant: at most one local_directory per

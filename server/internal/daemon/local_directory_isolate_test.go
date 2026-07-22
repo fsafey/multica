@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"testing"
 )
 
@@ -73,4 +76,75 @@ func TestAcquireLocalDirectoryLock_IsolateSkipsPathMutex(t *testing.T) {
 		t.Fatalf("holder after isolated acquire = %q, want %q", got, inPlace.ID)
 	}
 	release()
+}
+
+func TestAcquireLocalDirectoryLock_SerialPublishBackKeepsPathMutex(t *testing.T) {
+	t.Parallel()
+
+	const daemonID = "d-publish"
+	tmp := t.TempDir()
+	if out, err := exec.Command("git", "-C", tmp, "init", "-q").CombinedOutput(); err != nil {
+		t.Fatalf("git init: %s: %v", out, err)
+	}
+	raw, err := json.Marshal(localDirectoryRef{
+		LocalPath:   tmp,
+		DaemonID:    daemonID,
+		Isolate:     true,
+		PublishBack: localDirectoryPublishBackSerialFF,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := &Daemon{
+		cfg:            Config{DaemonID: daemonID},
+		localPathLocks: NewLocalPathLocker(),
+		logger:         slog.Default(),
+	}
+	task := Task{
+		ID:               "publish-task",
+		ProjectResources: []ProjectResourceData{{ID: "r1", ResourceType: localDirectoryResourceType, ResourceRef: raw}},
+	}
+	assignment, err := localDirectoryAssignmentForTask(task, daemonID)
+	if err != nil || assignment == nil {
+		t.Fatalf("assignment: %v %+v", err, assignment)
+	}
+	release, abort := d.acquireLocalDirectoryLockIfNeeded(context.Background(), task, slog.Default())
+	if abort || release == nil {
+		t.Fatalf("serial publish-back must hold the path mutex (abort=%v release_nil=%v)", abort, release == nil)
+	}
+	if got := d.localPathLocks.Holder(assignment.RealPath); got != task.ID {
+		t.Fatalf("holder = %q, want %q", got, task.ID)
+	}
+	release()
+}
+
+func TestLocalDirectoryMutexKey_CollapsesRepoSubdirectoriesAcrossModes(t *testing.T) {
+	t.Parallel()
+
+	repo := t.TempDir()
+	if out, err := exec.Command("git", "-C", repo, "init", "-q").CombinedOutput(); err != nil {
+		t.Fatalf("git init: %s: %v", out, err)
+	}
+	subA := filepath.Join(repo, "a")
+	subB := filepath.Join(repo, "b")
+	if err := os.MkdirAll(subA, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(subB, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	publishRef := localDirectoryRef{Isolate: true, PublishBack: localDirectoryPublishBackSerialFF}
+	a := &localDirectoryAssignment{Ref: publishRef, AbsPath: subA, RealPath: subA}
+	b := &localDirectoryAssignment{Ref: localDirectoryRef{}, AbsPath: subB, RealPath: subB}
+	keyA, err := a.mutexKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyB, err := b.mutexKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if keyA != keyB {
+		t.Fatalf("same repository produced distinct mutex keys: %q != %q", keyA, keyB)
+	}
 }
