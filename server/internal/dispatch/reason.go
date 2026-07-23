@@ -43,6 +43,10 @@ const (
 	// success: nothing new runs. (Named to avoid implying the NEW comment was
 	// already processed.)
 	ReasonSelfTriggerSuppressed ReasonCode = "self_trigger_suppressed"
+	// ReasonWorkflowManaged: this issue and production agent are controlled by
+	// a durable workflow graph, so comment mentions are evidence only and cannot
+	// launch a second production task.
+	ReasonWorkflowManaged ReasonCode = "workflow_managed"
 	// ReasonInternalError: an unexpected server error prevented a clean decision.
 	ReasonInternalError ReasonCode = "internal_error"
 )

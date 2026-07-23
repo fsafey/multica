@@ -130,6 +130,9 @@ func validateGithubRepoRef(ref json.RawMessage) (json.RawMessage, error) {
 //     immutable base, and publish only a clean completed task by exact
 //     fast-forward. Every other disposition keeps commits under the task's
 //     quarantine ref before cleanup.
+//   - submit_bundle: skip the whole-task path mutex, validate a clean result
+//     commit against the workflow node write set, and upload an immutable Git
+//     bundle for deterministic integration.
 //
 // resource_ref is polymorphic JSONB, so this field needs no migration — but it
 // MUST stay on this struct (and the daemon mirror), or validateLocalDirectoryRef
@@ -162,9 +165,9 @@ func validateLocalDirectoryRef(ref json.RawMessage) (json.RawMessage, error) {
 	payload.PublishBack = strings.TrimSpace(payload.PublishBack)
 	switch payload.PublishBack {
 	case "":
-	case "serial_ff":
+	case "serial_ff", "submit_bundle":
 		if !payload.Isolate {
-			return nil, errors.New("local_directory: publish_back=serial_ff requires isolate=true")
+			return nil, fmt.Errorf("local_directory: publish_back=%s requires isolate=true", payload.PublishBack)
 		}
 	default:
 		return nil, fmt.Errorf("local_directory: unsupported publish_back mode %q", payload.PublishBack)

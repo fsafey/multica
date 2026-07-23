@@ -1494,13 +1494,104 @@ func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	claimed, err := h.TaskService.ClaimTasksForRuntimes(r.Context(), authorized, maxTasks)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to claim tasks: "+err.Error())
+	// Reconcile durable workflow state before selecting work. These operations
+	// are idempotent: a crashed controller can lose this poll without losing a
+	// successor release or leaving an expired lease permanently claimed.
+	if _, err := h.WorkflowService.ProcessOutbox(r.Context(), 50); err != nil {
+		slog.Warn("workflow outbox reconciliation failed", "daemon_id", req.DaemonID, "error", err)
+	}
+	if _, err := h.WorkflowService.ExpireLeases(r.Context(), 50); err != nil {
+		slog.Warn("workflow lease reconciliation failed", "daemon_id", req.DaemonID, "error", err)
+	}
+	if _, err := h.WorkflowService.MaterializeReadyDeterministicNodes(
+		r.Context(),
+		req.DaemonID,
+		authorized,
+		maxTasks,
+	); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to materialize deterministic workflow nodes: "+err.Error())
 		return
 	}
 
-	out := make([]AgentTaskResponse, 0, len(claimed))
+	integrationJobs, err := h.WorkflowService.ClaimIntegrationJobs(
+		r.Context(),
+		req.DaemonID,
+		authorized,
+		maxTasks,
+	)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to claim workflow integration jobs: "+err.Error())
+		return
+	}
+	integrationResponses := make([]AgentTaskResponse, 0, len(integrationJobs))
+	for _, job := range integrationJobs {
+		resources, resourceErr := h.Queries.ListProjectResources(r.Context(), job.ProjectID)
+		if resourceErr != nil {
+			slog.Warn("load integration project resources failed", "event_id", uuidToString(job.ID), "error", resourceErr)
+			continue
+		}
+		projectResources := make([]ProjectResourceData, 0, len(resources))
+		for _, resource := range resources {
+			projectResources = append(projectResources, ProjectResourceData{
+				ID:           uuidToString(resource.ID),
+				ResourceType: resource.ResourceType,
+				ResourceRef:  json.RawMessage(resource.ResourceRef),
+				Label:        resource.Label.String,
+			})
+		}
+		integrationResponses = append(integrationResponses, AgentTaskResponse{
+			ID:               uuidToString(job.ID),
+			RuntimeID:        uuidToString(job.RuntimeID),
+			IssueID:          uuidToString(job.IssueID),
+			WorkspaceID:      uuidToString(job.WorkspaceID),
+			ProjectID:        uuidToString(job.ProjectID),
+			Status:           "dispatched",
+			ProjectResources: projectResources,
+			CreatedAt:        timestampToString(job.CreatedAt),
+			Kind:             "workflow_integration",
+			Integration: &WorkflowIntegrationJobData{
+				EventID:        uuidToString(job.ID),
+				EventType:      job.EventType,
+				RunID:          uuidToString(job.RunID),
+				NodeID:         uuidToString(job.NodeID),
+				AttemptID:      uuidToString(job.AttemptID),
+				PassageKey:     job.PassageKey,
+				NodeKey:        job.NodeKey,
+				Generation:     job.Generation,
+				ClaimEpoch:     job.ClaimEpoch,
+				BaseCommit:     job.BaseCommit.String,
+				ResultCommit:   job.ResultCommit.String,
+				ArtifactDigest: job.ArtifactDigest.String,
+				ArtifactSize:   job.ArtifactSize.Int64,
+				Manifest:       json.RawMessage(job.Manifest),
+				OutputContract: json.RawMessage(job.OutputContract),
+			},
+		})
+	}
+	remainingForTasks := maxTasks - len(integrationResponses)
+	workflowClaimed, err := h.WorkflowService.MaterializeReadyAgentTasks(
+		r.Context(),
+		req.DaemonID,
+		authorized,
+		remainingForTasks,
+	)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to claim workflow tasks: "+err.Error())
+		return
+	}
+	remaining := remainingForTasks - len(workflowClaimed)
+	claimed := workflowClaimed
+	if remaining > 0 {
+		ordinary, claimErr := h.TaskService.ClaimTasksForRuntimes(r.Context(), authorized, remaining)
+		if claimErr != nil {
+			writeError(w, http.StatusInternalServerError, "failed to claim tasks: "+claimErr.Error())
+			return
+		}
+		claimed = append(claimed, ordinary...)
+	}
+
+	out := make([]AgentTaskResponse, 0, len(integrationResponses)+len(claimed))
+	out = append(out, integrationResponses...)
 	for i := range claimed {
 		task := claimed[i]
 		rt, ok := runtimeByID[uuidToString(task.RuntimeID)]
@@ -1603,6 +1694,29 @@ type claimBuildFailure struct {
 func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQueue, runtime db.AgentRuntime, runtimeID, runtimeWorkspaceID string) (resp AgentTaskResponse, deliveredCommentIDs []pgtype.UUID, agentSkillCount, builtinSkillCount int, failure *claimBuildFailure) {
 	// Build response with fresh agent data (name + skills + custom_env + custom_args).
 	resp = taskToResponse(*task, runtimeWorkspaceID)
+	if task.WorkflowNodeID.Valid {
+		node, err := h.Queries.GetWorkflowNodeForTask(r.Context(), task.ID)
+		if err != nil {
+			slog.Warn("load workflow task context failed", "task_id", uuidToString(task.ID), "error", err)
+			return resp, nil, 0, 0, &claimBuildFailure{
+				outcome: "workflow_context_error",
+				status:  http.StatusInternalServerError,
+				message: "failed to load workflow task context",
+			}
+		}
+		resp.Workflow = &WorkflowTaskData{
+			RunID:          uuidToString(node.RunID),
+			NodeID:         uuidToString(node.ID),
+			AttemptID:      uuidToString(task.WorkflowAttemptID),
+			PassageKey:     node.PassageKey,
+			NodeKey:        node.NodeKey,
+			Generation:     node.Generation,
+			ClaimEpoch:     task.WorkflowClaimEpoch.Int64,
+			InputDigest:    task.WorkflowInputDigest.String,
+			LawDigest:      task.WorkflowLawDigest.String,
+			OutputContract: json.RawMessage(node.OutputContract),
+		}
+	}
 	supportsCoalescedComments := requestHasClientCapability(r, protocol.DaemonCapabilityCoalescedCommentsV1)
 	// Empty-but-non-nil so pgx persists '{}' rather than NULL for tasks without
 	// comment input. Comment tasks replace this with the ids actually embedded
@@ -2018,7 +2132,20 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 			// context across turns. The "Focus on THIS comment" guard in
 			// prompt.go defends against inheriting the prior turn's "Done."
 			// marker, and GetLastTaskSession already excludes poisoned sessions.
-			if prior, err := h.Queries.GetLastTaskSession(r.Context(), db.GetLastTaskSessionParams{
+			if task.WorkflowNodeID.Valid {
+				if prior, err := h.Queries.GetLastCompatibleWorkflowTaskSession(r.Context(), db.GetLastCompatibleWorkflowTaskSessionParams{
+					AgentID:     task.AgentID,
+					IssueID:     task.IssueID,
+					RuntimeID:   task.RuntimeID,
+					InputDigest: task.WorkflowInputDigest,
+					LawDigest:   task.WorkflowLawDigest,
+				}); err == nil && prior.SessionID.Valid {
+					resp.PriorSessionID = prior.SessionID.String
+					if prior.WorkDir.Valid {
+						resp.PriorWorkDir = prior.WorkDir.String
+					}
+				}
+			} else if prior, err := h.Queries.GetLastTaskSession(r.Context(), db.GetLastTaskSessionParams{
 				AgentID: task.AgentID,
 				IssueID: task.IssueID,
 			}); err == nil && prior.SessionID.Valid {
@@ -2724,6 +2851,288 @@ func (h *Handler) ExtendTaskPrepareLease(w http.ResponseWriter, r *http.Request)
 	}
 
 	writeJSON(w, http.StatusOK, taskToResponse(*updated, taskWorkspaceID))
+}
+
+func (h *Handler) RenewWorkflowTaskLease(w http.ResponseWriter, r *http.Request) {
+	runtimeID := chi.URLParam(r, "runtimeId")
+	taskID := chi.URLParam(r, "taskId")
+
+	runtime, ok := h.requireDaemonRuntimeAccess(w, r, runtimeID)
+	if !ok {
+		return
+	}
+	task, taskWorkspaceID, ok := h.requireDaemonTaskAccessWithWorkspace(w, r, taskID)
+	if !ok {
+		return
+	}
+	if taskWorkspaceID != uuidToString(runtime.WorkspaceID) || uuidToString(task.RuntimeID) != runtimeID {
+		writeError(w, http.StatusNotFound, "task not found")
+		return
+	}
+	attempt, err := h.TaskService.RenewWorkflowTaskLease(r.Context(), parseUUID(taskID), parseUUID(runtimeID))
+	if err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, attempt)
+}
+
+type workflowBundleManifest struct {
+	RunID        string   `json:"run_id"`
+	PassageKey   string   `json:"passage_key"`
+	NodeID       string   `json:"node_id"`
+	NodeKey      string   `json:"node_key"`
+	Generation   int32    `json:"generation"`
+	AttemptID    string   `json:"attempt_id"`
+	ClaimEpoch   int64    `json:"claim_epoch"`
+	BaseCommit   string   `json:"base_commit"`
+	ResultCommit string   `json:"result_commit"`
+	InputDigest  string   `json:"input_digest,omitempty"`
+	LawDigest    string   `json:"law_digest,omitempty"`
+	AgentID      string   `json:"agent_id"`
+	RuntimeID    string   `json:"runtime_id"`
+	ChangedPaths []string `json:"changed_paths"`
+	BundleSHA256 string   `json:"bundle_sha256"`
+}
+
+func (h *Handler) SubmitWorkflowBundle(w http.ResponseWriter, r *http.Request) {
+	taskID := chi.URLParam(r, "taskId")
+	task, workspaceID, ok := h.requireDaemonTaskAccessWithWorkspace(w, r, taskID)
+	if !ok {
+		return
+	}
+	if !task.WorkflowAttemptID.Valid || !task.WorkflowNodeID.Valid || !task.WorkflowClaimEpoch.Valid {
+		writeError(w, http.StatusNotFound, "workflow task not found")
+		return
+	}
+	attempt, err := h.Queries.GetWorkflowAttemptByTask(r.Context(), task.ID)
+	if err != nil {
+		writeError(w, http.StatusConflict, "workflow attempt not found")
+		return
+	}
+	if daemonID := middleware.DaemonIDFromContext(r.Context()); daemonID != "" && daemonID != attempt.DaemonID {
+		writeError(w, http.StatusNotFound, "workflow task not found")
+		return
+	}
+	if attempt.Status == "submitted" || attempt.Status == "integrated" {
+		writeJSON(w, http.StatusOK, attempt)
+		return
+	}
+	if h.Storage == nil {
+		writeError(w, http.StatusServiceUnavailable, "workflow artifact storage is not configured")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, service.MaxWorkflowBundleSize+(2<<20))
+	if err := r.ParseMultipartForm(service.MaxWorkflowBundleSize + (2 << 20)); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid workflow bundle form")
+		return
+	}
+	file, _, err := r.FormFile("bundle")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bundle file is required")
+		return
+	}
+	defer file.Close()
+	bundle, err := io.ReadAll(io.LimitReader(file, service.MaxWorkflowBundleSize+1))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "failed to read workflow bundle")
+		return
+	}
+	if len(bundle) == 0 || len(bundle) > service.MaxWorkflowBundleSize {
+		writeError(w, http.StatusRequestEntityTooLarge, "workflow bundle exceeds the 100 MB limit")
+		return
+	}
+	digestBytes := sha256.Sum256(bundle)
+	digest := hex.EncodeToString(digestBytes[:])
+	if claimedDigest := strings.ToLower(strings.TrimSpace(r.FormValue("sha256"))); claimedDigest == "" || claimedDigest != digest {
+		writeError(w, http.StatusBadRequest, "workflow bundle SHA-256 mismatch")
+		return
+	}
+	var manifest workflowBundleManifest
+	manifestRaw := []byte(r.FormValue("manifest"))
+	if err := json.Unmarshal(manifestRaw, &manifest); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid workflow bundle manifest")
+		return
+	}
+	node, err := h.Queries.GetWorkflowNodeForTask(r.Context(), task.ID)
+	if err != nil {
+		writeError(w, http.StatusConflict, "workflow node not found")
+		return
+	}
+	if manifest.RunID != uuidToString(node.RunID) ||
+		manifest.NodeID != uuidToString(node.ID) ||
+		manifest.AttemptID != uuidToString(attempt.ID) ||
+		manifest.PassageKey != node.PassageKey ||
+		manifest.NodeKey != node.NodeKey ||
+		manifest.Generation != node.Generation ||
+		manifest.ClaimEpoch != attempt.ClaimEpoch ||
+		manifest.AgentID != uuidToString(task.AgentID) ||
+		manifest.RuntimeID != uuidToString(task.RuntimeID) ||
+		manifest.InputDigest != node.InputDigest.String ||
+		manifest.LawDigest != node.LawDigest.String ||
+		manifest.BundleSHA256 != digest ||
+		strings.TrimSpace(manifest.BaseCommit) == "" ||
+		strings.TrimSpace(manifest.ResultCommit) == "" {
+		writeError(w, http.StatusConflict, "workflow bundle manifest does not match the active claim")
+		return
+	}
+	artifactKey := fmt.Sprintf(
+		"workflows/%s/%s/%s/%s-%s.bundle",
+		workspaceID,
+		manifest.RunID,
+		manifest.NodeID,
+		manifest.AttemptID,
+		digest,
+	)
+	if _, err := h.Storage.Upload(r.Context(), artifactKey, bundle, "application/x-git-bundle", manifest.AttemptID+".bundle"); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to store workflow bundle")
+		return
+	}
+	submitted, err := h.WorkflowService.SubmitArtifact(r.Context(), service.WorkflowArtifactSubmission{
+		TaskID:         task.ID,
+		AttemptID:      attempt.ID,
+		ClaimEpoch:     attempt.ClaimEpoch,
+		BaseCommit:     manifest.BaseCommit,
+		ResultCommit:   manifest.ResultCommit,
+		ArtifactKey:    artifactKey,
+		ArtifactDigest: digest,
+		ArtifactSize:   int64(len(bundle)),
+		Manifest:       manifestRaw,
+	})
+	if err != nil {
+		h.Storage.Delete(r.Context(), artifactKey)
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, submitted)
+}
+
+func (h *Handler) requireWorkflowIntegrationJob(
+	w http.ResponseWriter,
+	r *http.Request,
+	eventID string,
+) (db.GetWorkflowIntegrationJobRow, bool) {
+	parsed, ok := parseUUIDOrBadRequest(w, eventID, "event_id")
+	if !ok {
+		return db.GetWorkflowIntegrationJobRow{}, false
+	}
+	job, err := h.Queries.GetWorkflowIntegrationJob(r.Context(), parsed)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "workflow integration job not found")
+		return db.GetWorkflowIntegrationJobRow{}, false
+	}
+	if !h.requireDaemonWorkspaceAccess(w, r, uuidToString(job.WorkspaceID)) {
+		return db.GetWorkflowIntegrationJobRow{}, false
+	}
+	daemonID := middleware.DaemonIDFromContext(r.Context())
+	if job.Status != "processing" ||
+		(job.ClaimedDaemonID.Valid && daemonID != "" && job.ClaimedDaemonID.String != daemonID) {
+		writeError(w, http.StatusConflict, "workflow integration lease is not active")
+		return db.GetWorkflowIntegrationJobRow{}, false
+	}
+	return job, true
+}
+
+func (h *Handler) DownloadWorkflowIntegrationBundle(w http.ResponseWriter, r *http.Request) {
+	job, ok := h.requireWorkflowIntegrationJob(w, r, chi.URLParam(r, "eventId"))
+	if !ok {
+		return
+	}
+	if h.Storage == nil || !job.ArtifactKey.Valid {
+		writeError(w, http.StatusServiceUnavailable, "workflow artifact storage is unavailable")
+		return
+	}
+	reader, err := h.Storage.GetReader(r.Context(), job.ArtifactKey.String)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "workflow bundle not found")
+		return
+	}
+	defer reader.Close()
+	w.Header().Set("Content-Type", "application/x-git-bundle")
+	w.Header().Set("X-Content-SHA256", job.ArtifactDigest.String)
+	if job.ArtifactSize.Valid {
+		w.Header().Set("Content-Length", strconv.FormatInt(job.ArtifactSize.Int64, 10))
+	}
+	w.WriteHeader(http.StatusOK)
+	if _, err := io.Copy(w, reader); err != nil {
+		slog.Warn("stream workflow integration bundle failed", "event_id", uuidToString(job.ID), "error", err)
+	}
+}
+
+func (h *Handler) RenewWorkflowIntegrationLease(w http.ResponseWriter, r *http.Request) {
+	job, ok := h.requireWorkflowIntegrationJob(w, r, chi.URLParam(r, "eventId"))
+	if !ok {
+		return
+	}
+	renewed, err := h.Queries.RenewWorkflowIntegrationLease(r.Context(), db.RenewWorkflowIntegrationLeaseParams{
+		ID:        job.ID,
+		RuntimeID: job.ClaimedRuntimeID,
+		DaemonID:  job.ClaimedDaemonID,
+	})
+	if err != nil {
+		writeError(w, http.StatusConflict, "workflow integration lease is stale")
+		return
+	}
+	writeJSON(w, http.StatusOK, renewed)
+}
+
+type workflowIntegrationCompleteRequest struct {
+	CanonicalCommit string `json:"canonical_commit"`
+}
+
+func (h *Handler) CompleteWorkflowIntegration(w http.ResponseWriter, r *http.Request) {
+	job, ok := h.requireWorkflowIntegrationJob(w, r, chi.URLParam(r, "eventId"))
+	if !ok {
+		return
+	}
+	var req workflowIntegrationCompleteRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.CanonicalCommit) == "" {
+		writeError(w, http.StatusBadRequest, "canonical_commit is required")
+		return
+	}
+	result, err := h.WorkflowService.AcceptIntegratedResult(
+		r.Context(),
+		job.ID,
+		job.NodeID,
+		job.AttemptID,
+		job.ClaimEpoch,
+		req.CanonicalCommit,
+	)
+	if err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+type workflowIntegrationFailRequest struct {
+	Error     string `json:"error"`
+	Retryable bool   `json:"retryable"`
+}
+
+func (h *Handler) FailWorkflowIntegration(w http.ResponseWriter, r *http.Request) {
+	job, ok := h.requireWorkflowIntegrationJob(w, r, chi.URLParam(r, "eventId"))
+	if !ok {
+		return
+	}
+	var req workflowIntegrationFailRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid integration failure payload")
+		return
+	}
+	if err := h.WorkflowService.FailIntegration(
+		r.Context(),
+		job.ID,
+		job.NodeID,
+		job.AttemptID,
+		job.ClaimEpoch,
+		req.Error,
+		req.Retryable,
+	); err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // StartTask marks a dispatched task as running.

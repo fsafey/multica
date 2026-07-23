@@ -553,6 +553,22 @@ func triggerOwnerAttribution(ctx context.Context, q *db.Queries, triggerID, work
 // owner_fallback has no agent owner to fall back to. Enqueue paths surface it so the
 // run never starts.
 var ErrAttributionFailClosed = errors.New("attribution: no precise accountable human and enqueue refused (fail-closed policy, policy read failed, or no agent owner)")
+var ErrWorkflowManagedDispatch = errors.New("workflow-managed production agent must be dispatched by the workflow controller")
+
+func (s *TaskService) refuseWorkflowManagedDispatch(ctx context.Context, issue db.Issue, agentID pgtype.UUID) error {
+	managed, err := s.Queries.IsWorkflowManagedProductionAgent(ctx, db.IsWorkflowManagedProductionAgentParams{
+		IssueID:     issue.ID,
+		AgentID:     agentID,
+		WorkspaceID: issue.WorkspaceID,
+	})
+	if err != nil {
+		return fmt.Errorf("%w: policy read failed: %v", ErrWorkflowManagedDispatch, err)
+	}
+	if managed {
+		return ErrWorkflowManagedDispatch
+	}
+	return nil
+}
 
 // applyAttributionFallback applies the workspace's degraded-attribution policy to a
 // resolved attribution whose source came back unattributed (no precise human). A
@@ -977,6 +993,9 @@ func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue
 		slog.Error("task enqueue failed", "issue_id", util.UUIDToString(issue.ID), "error", "issue has no assignee")
 		return db.AgentTaskQueue{}, fmt.Errorf("issue has no assignee")
 	}
+	if err := s.refuseWorkflowManagedDispatch(ctx, issue, issue.AssigneeID); err != nil {
+		return db.AgentTaskQueue{}, err
+	}
 
 	agent, err := s.Queries.GetAgent(ctx, issue.AssigneeID)
 	if err != nil {
@@ -1096,6 +1115,9 @@ func (s *TaskService) enqueueMentionTask(ctx context.Context, issue db.Issue, ag
 }
 
 func (s *TaskService) enqueueMentionTaskWithCommentPlan(ctx context.Context, issue db.Issue, agentID pgtype.UUID, triggerCommentID pgtype.UUID, coalescedCommentIDs []pgtype.UUID, isLeader bool, squadID pgtype.UUID, forceFreshSession bool, handoffNote string, actorUserID pgtype.UUID, rerunOfTaskID pgtype.UUID) (db.AgentTaskQueue, error) {
+	if err := s.refuseWorkflowManagedDispatch(ctx, issue, agentID); err != nil {
+		return db.AgentTaskQueue{}, err
+	}
 	agent, err := s.Queries.GetAgent(ctx, agentID)
 	if err != nil {
 		slog.Error("mention task enqueue failed: agent not found", "issue_id", util.UUIDToString(issue.ID), "agent_id", util.UUIDToString(agentID), "error", err)
@@ -1985,6 +2007,21 @@ func (s *TaskService) broadcastChatCancelFinalized(ctx context.Context, task db.
 // ClaimTask atomically claims the next queued task for an agent,
 // respecting max_concurrent_tasks.
 func (s *TaskService) ClaimTask(ctx context.Context, agentID pgtype.UUID) (*db.AgentTaskQueue, error) {
+	return s.claimTask(ctx, agentID, pgtype.UUID{})
+}
+
+// ClaimTaskOnRuntime atomically claims the next queued task for an agent on
+// exactly runtimeID. Runtime polling must use this form: choosing a candidate
+// by runtime and then claiming by agent alone can dispatch a higher-priority
+// task pinned to another daemon.
+func (s *TaskService) ClaimTaskOnRuntime(ctx context.Context, agentID, runtimeID pgtype.UUID) (*db.AgentTaskQueue, error) {
+	if !runtimeID.Valid {
+		return nil, errors.New("claim task on runtime: runtime id is required")
+	}
+	return s.claimTask(ctx, agentID, runtimeID)
+}
+
+func (s *TaskService) claimTask(ctx context.Context, agentID, runtimeID pgtype.UUID) (*db.AgentTaskQueue, error) {
 	start := time.Now()
 	var (
 		outcome                                                              = "unknown"
@@ -2020,6 +2057,7 @@ func (s *TaskService) ClaimTask(ctx context.Context, agentID pgtype.UUID) (*db.A
 		t0 = time.Now()
 		task, err := qtx.ClaimAgentTask(ctx, db.ClaimAgentTaskParams{
 			AgentID:          agentID,
+			RuntimeID:        runtimeID,
 			PrepareLeaseSecs: prepareLeaseDuration.Seconds(),
 		})
 		claimAgentMs = time.Since(t0).Milliseconds()
@@ -2167,13 +2205,13 @@ func (s *TaskService) ClaimTaskForRuntime(ctx context.Context, runtimeID pgtype.
 		triedAgents[agentKey] = struct{}{}
 		tried++
 
-		task, err := s.ClaimTask(ctx, candidate.AgentID)
+		task, err := s.ClaimTaskOnRuntime(ctx, candidate.AgentID, runtimeID)
 		if err != nil {
 			loopMs = time.Since(loopStart).Milliseconds()
 			outcome = "error_claim"
 			return nil, err
 		}
-		if task != nil && task.RuntimeID == runtimeID {
+		if task != nil {
 			claimed = task
 			break
 		}
@@ -2401,7 +2439,7 @@ func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pg
 		}
 		triedAgents[agentKey] = struct{}{}
 
-		task, err := s.ClaimTask(ctx, candidates[i].AgentID)
+		task, err := s.ClaimTaskOnRuntime(ctx, candidates[i].AgentID, candidates[i].RuntimeID)
 		if err != nil {
 			// Each ClaimTask commits in its own transaction, so earlier
 			// iterations (and step-2 reclaims) are already dispatched
@@ -2418,12 +2456,8 @@ func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pg
 		if task == nil {
 			continue
 		}
-		// ClaimAgentTask selects by agent only; guard that the claimed task
-		// belongs to a runtime this daemon hosts. An agent with a
-		// higher-priority queued task on ANOTHER daemon's runtime could
-		// otherwise be dispatched here and dropped — matching the singular
-		// path's runtime_id guard. Such a stray dispatch is recovered by the
-		// reclaim path on the owning daemon's next poll.
+		// ClaimTaskOnRuntime fences the UPDATE to the candidate runtime. Keep
+		// this set check as a defense against a future query regression.
 		if _, ok := runtimeInSet[util.UUIDToString(task.RuntimeID)]; !ok {
 			continue
 		}
@@ -2475,8 +2509,30 @@ func (s *TaskService) maybeLogClaimSlow(agentID pgtype.UUID, outcome string, sta
 // StartTask transitions a dispatched task to running.
 // Issue status is NOT changed here — the agent manages it via the CLI.
 func (s *TaskService) StartTask(ctx context.Context, taskID pgtype.UUID) (*db.AgentTaskQueue, error) {
-	task, err := s.Queries.StartAgentTask(ctx, taskID)
-	if err != nil {
+	var task db.AgentTaskQueue
+	if err := s.runInTx(ctx, func(qtx *db.Queries) error {
+		started, err := qtx.StartAgentTask(ctx, taskID)
+		if err != nil {
+			return err
+		}
+		if started.WorkflowAttemptID.Valid {
+			lease, err := qtx.GetWorkflowTaskLeaseContext(ctx, taskID)
+			if err != nil {
+				return fmt.Errorf("load workflow lease context: %w", err)
+			}
+			if _, err := qtx.StartWorkflowAttemptByTask(ctx, db.StartWorkflowAttemptByTaskParams{
+				LeaseSeconds: float64(lease.LeaseSeconds),
+				TaskID:       taskID,
+			}); err != nil {
+				return fmt.Errorf("start workflow attempt: %w", err)
+			}
+			if _, err := qtx.MarkWorkflowNodeRunning(ctx, taskID); err != nil {
+				return fmt.Errorf("mark workflow node running: %w", err)
+			}
+		}
+		task = started
+		return nil
+	}); err != nil {
 		return nil, fmt.Errorf("start task: %w", err)
 	}
 	s.cancelDeferredEscalationsForTask(ctx, task.ID)
@@ -2533,15 +2589,56 @@ func (s *TaskService) CancelDeferredEscalationsForIssueAgent(ctx context.Context
 // ExtendTaskPrepareLease keeps a claimed-but-not-started task protected while
 // the daemon resolves cached inputs and prepares the execution environment.
 func (s *TaskService) ExtendTaskPrepareLease(ctx context.Context, taskID, runtimeID pgtype.UUID) (*db.AgentTaskQueue, error) {
-	task, err := s.Queries.ExtendAgentTaskPrepareLease(ctx, db.ExtendAgentTaskPrepareLeaseParams{
-		ID:        taskID,
-		RuntimeID: runtimeID,
-		LeaseSecs: prepareLeaseDuration.Seconds(),
-	})
-	if err != nil {
+	var task db.AgentTaskQueue
+	if err := s.runInTx(ctx, func(qtx *db.Queries) error {
+		updated, err := qtx.ExtendAgentTaskPrepareLease(ctx, db.ExtendAgentTaskPrepareLeaseParams{
+			ID:        taskID,
+			RuntimeID: runtimeID,
+			LeaseSecs: prepareLeaseDuration.Seconds(),
+		})
+		if err != nil {
+			return err
+		}
+		if updated.WorkflowAttemptID.Valid {
+			lease, err := qtx.GetWorkflowTaskLeaseContext(ctx, taskID)
+			if err != nil {
+				return fmt.Errorf("load workflow lease context: %w", err)
+			}
+			if _, err := qtx.RenewWorkflowAttemptLease(ctx, db.RenewWorkflowAttemptLeaseParams{
+				LeaseSeconds: float64(lease.LeaseSeconds),
+				TaskID:       taskID,
+			}); err != nil {
+				return fmt.Errorf("renew workflow attempt lease: %w", err)
+			}
+		}
+		task = updated
+		return nil
+	}); err != nil {
 		return nil, fmt.Errorf("extend task prepare lease: %w", err)
 	}
 	return &task, nil
+}
+
+func (s *TaskService) RenewWorkflowTaskLease(ctx context.Context, taskID, runtimeID pgtype.UUID) (*db.WorkflowNodeAttempt, error) {
+	task, err := s.Queries.GetAgentTask(ctx, taskID)
+	if err != nil {
+		return nil, fmt.Errorf("load workflow task: %w", err)
+	}
+	if !task.WorkflowAttemptID.Valid || task.RuntimeID != runtimeID {
+		return nil, errors.New("workflow task not found on runtime")
+	}
+	lease, err := s.Queries.GetWorkflowTaskLeaseContext(ctx, taskID)
+	if err != nil {
+		return nil, fmt.Errorf("load workflow lease context: %w", err)
+	}
+	attempt, err := s.Queries.RenewWorkflowAttemptLease(ctx, db.RenewWorkflowAttemptLeaseParams{
+		LeaseSeconds: float64(lease.LeaseSeconds),
+		TaskID:       taskID,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("renew workflow task lease: %w", err)
+	}
+	return &attempt, nil
 }
 
 // MarkTaskWaitingLocalDirectory parks a dispatched task in the
@@ -2585,6 +2682,19 @@ func (s *TaskService) CompleteTask(ctx context.Context, taskID pgtype.UUID, resu
 	// only after the transaction commits.
 	var chatAssistantMsg *db.ChatMessage
 	if err := s.runInTx(ctx, func(qtx *db.Queries) error {
+		existing, err := qtx.GetAgentTask(ctx, taskID)
+		if err != nil {
+			return err
+		}
+		if existing.WorkflowAttemptID.Valid {
+			attempt, err := qtx.GetWorkflowAttemptByTask(ctx, taskID)
+			if err != nil {
+				return fmt.Errorf("load workflow attempt before task completion: %w", err)
+			}
+			if attempt.Status != "submitted" && attempt.Status != "integrated" {
+				return fmt.Errorf("workflow task result must be submitted before completion, current attempt status is %q", attempt.Status)
+			}
+		}
 		t, err := qtx.CompleteAgentTask(ctx, db.CompleteAgentTaskParams{
 			ID:        taskID,
 			Result:    result,
@@ -2933,6 +3043,11 @@ func (s *TaskService) FailTask(ctx context.Context, taskID pgtype.UUID, errMsg, 
 		if parent, perr := s.Queries.GetAgentTask(ctx, taskID); perr != nil {
 			slog.Warn("fail task auto-retry: load parent failed",
 				"task_id", util.UUIDToString(taskID), "error", perr)
+		} else if parent.WorkflowAttemptID.Valid {
+			// Workflow retries are owned by the fenced node state machine.
+			// Creating an ordinary retry task here would bypass its epoch and
+			// resource-claim checks.
+			wantRetry = false
 		} else if retryEligible(failureReason, parent) {
 			wantRetry = true
 			// Persist the reason-aware effective budget into the child so the
@@ -2971,6 +3086,33 @@ func (s *TaskService) FailTask(ctx context.Context, taskID pgtype.UUID, errMsg, 
 			return err
 		}
 		task = t
+
+		if t.WorkflowAttemptID.Valid {
+			attempt, err := qtx.GetWorkflowAttemptByTask(ctx, taskID)
+			if err != nil {
+				return fmt.Errorf("load failed workflow attempt: %w", err)
+			}
+			if attempt.Status == "claimed" || attempt.Status == "running" {
+				if _, err := qtx.FailWorkflowAttempt(ctx, db.FailWorkflowAttemptParams{
+					Status:     "failed",
+					Error:      pgtype.Text{String: errMsg, Valid: errMsg != ""},
+					AttemptID:  attempt.ID,
+					ClaimEpoch: attempt.ClaimEpoch,
+				}); err != nil {
+					return fmt.Errorf("fail workflow attempt: %w", err)
+				}
+				if _, err := qtx.RequeueWorkflowNodeAfterAttempt(ctx, db.RequeueWorkflowNodeAfterAttemptParams{
+					NodeID:     attempt.NodeID,
+					AttemptID:  attempt.ID,
+					ClaimEpoch: attempt.ClaimEpoch,
+				}); err != nil {
+					return fmt.Errorf("requeue failed workflow node: %w", err)
+				}
+				if _, err := qtx.ReleaseWorkflowAttemptResources(ctx, attempt.ID); err != nil {
+					return fmt.Errorf("release failed workflow resources: %w", err)
+				}
+			}
+		}
 
 		// Keep resume-unsafe sessions on the task row for observability, but
 		// do not promote them to the chat-level resume pointer.

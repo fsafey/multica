@@ -152,6 +152,16 @@ type TaskContextForEnv struct {
 	QuickCreatePrompt       string // non-empty for quick-create tasks
 	HandoffNote             string // assignment handoff instruction; rendered into issue_context.md (MUL-3375)
 	IsSquadLeader           bool   // true when the agent is acting as a squad leader (may exit silently on no_action)
+	WorkflowRunID           string
+	WorkflowNodeID          string
+	WorkflowAttemptID       string
+	WorkflowPassageKey      string
+	WorkflowNodeKey         string
+	WorkflowGeneration      int32
+	WorkflowClaimEpoch      int64
+	WorkflowInputDigest     string
+	WorkflowLawDigest       string
+	WorkflowOutputContract  json.RawMessage
 	// WorkspaceContext is the workspace-level system prompt (workspace.context
 	// in the DB). Rendered into the brief as `## Workspace Context` when
 	// non-empty so every agent in the workspace sees the same shared context,

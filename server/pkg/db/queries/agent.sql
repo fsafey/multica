@@ -466,7 +466,9 @@ SET status = 'dispatched',
     prepare_lease_expires_at = now() + make_interval(secs => @prepare_lease_secs::double precision)
 WHERE id = (
     SELECT atq.id FROM agent_task_queue atq
-    WHERE atq.agent_id = $1 AND atq.status = 'queued'
+    WHERE atq.agent_id = @agent_id
+      AND atq.status = 'queued'
+      AND (sqlc.narg(runtime_id)::uuid IS NULL OR atq.runtime_id = sqlc.narg(runtime_id)::uuid)
       AND NOT EXISTS (
           SELECT 1 FROM agent_task_queue active
           WHERE active.agent_id = atq.agent_id

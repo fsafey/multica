@@ -21,6 +21,7 @@ import (
 const (
 	localDirectoryResourceType        = "local_directory"
 	localDirectoryPublishBackSerialFF = "serial_ff"
+	localDirectoryPublishSubmitBundle = "submit_bundle"
 )
 
 // localDirectoryRef mirrors the server-side ref shape for local_directory
@@ -69,8 +70,8 @@ func (a *localDirectoryAssignment) mutexKey() (string, error) {
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
-		if a.Ref.PublishBack == localDirectoryPublishBackSerialFF {
-			return "", fmt.Errorf("local_directory: publish_back=serial_ff requires a git repository: %s: %w", strings.TrimSpace(stderr.String()), err)
+		if a.Ref.PublishBack == localDirectoryPublishBackSerialFF || a.Ref.PublishBack == localDirectoryPublishSubmitBundle {
+			return "", fmt.Errorf("local_directory: publish_back=%s requires a git repository: %s: %w", a.Ref.PublishBack, strings.TrimSpace(stderr.String()), err)
 		}
 		return a.RealPath, nil
 	}
@@ -132,9 +133,9 @@ func findLocalDirectoryAssignment(resources []ProjectResourceData, daemonID stri
 		}
 		switch ref.PublishBack {
 		case "":
-		case localDirectoryPublishBackSerialFF:
+		case localDirectoryPublishBackSerialFF, localDirectoryPublishSubmitBundle:
 			if !ref.Isolate {
-				return nil, errors.New("local_directory: publish_back=serial_ff requires isolate=true")
+				return nil, fmt.Errorf("local_directory: publish_back=%s requires isolate=true", ref.PublishBack)
 			}
 		default:
 			return nil, fmt.Errorf("local_directory: unsupported publish_back mode %q", ref.PublishBack)
