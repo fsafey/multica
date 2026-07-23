@@ -35,7 +35,9 @@ func TestSubmitWorkflowBundleRetriesTransientFailureWithSameArtifact(t *testing.
 			t.Errorf("path = %q, want workflow bundle endpoint", got)
 		}
 		if err := r.ParseMultipartForm(1 << 20); err != nil {
-			t.Fatalf("parse multipart form: %v", err)
+			t.Errorf("parse multipart form: %v", err)
+			http.Error(w, "invalid test multipart form", http.StatusBadRequest)
+			return
 		}
 		if got := r.FormValue("sha256"); got != "digest-1" {
 			t.Errorf("sha256 = %q, want digest-1", got)
@@ -45,12 +47,16 @@ func TestSubmitWorkflowBundleRetriesTransientFailureWithSameArtifact(t *testing.
 		}
 		file, _, err := r.FormFile("bundle")
 		if err != nil {
-			t.Fatalf("read bundle form file: %v", err)
+			t.Errorf("read bundle form file: %v", err)
+			http.Error(w, "missing test bundle", http.StatusBadRequest)
+			return
 		}
 		defer file.Close()
 		gotBundle, err := io.ReadAll(file)
 		if err != nil {
-			t.Fatalf("read bundle body: %v", err)
+			t.Errorf("read bundle body: %v", err)
+			http.Error(w, "unreadable test bundle", http.StatusBadRequest)
+			return
 		}
 		if string(gotBundle) != string(bundle) {
 			t.Errorf("bundle = %q, want %q", gotBundle, bundle)

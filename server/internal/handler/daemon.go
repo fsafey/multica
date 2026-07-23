@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/analytics"
 	"github.com/multica-ai/multica/server/internal/auth"
@@ -2913,6 +2914,42 @@ type workflowBundleManifest struct {
 	BundleSHA256 string   `json:"bundle_sha256"`
 }
 
+func workflowBundleArtifactKey(
+	workspaceID string,
+	manifest workflowBundleManifest,
+	digest string,
+) string {
+	return fmt.Sprintf(
+		"workflows/%s/%s/%s/%s-%s-%s.bundle",
+		workspaceID,
+		manifest.RunID,
+		manifest.NodeID,
+		manifest.AttemptID,
+		digest,
+		uuid.NewString(),
+	)
+}
+
+func workflowAttemptMatchesSubmission(
+	current db.WorkflowNodeAttempt,
+	expectedAttemptID pgtype.UUID,
+	expectedClaimEpoch int64,
+	baseCommit, resultCommit, digest string,
+	artifactSize int64,
+) bool {
+	return (current.Status == "submitted" || current.Status == "integrated") &&
+		uuidToString(current.ID) == uuidToString(expectedAttemptID) &&
+		current.ClaimEpoch == expectedClaimEpoch &&
+		current.BaseCommit.Valid &&
+		current.BaseCommit.String == baseCommit &&
+		current.ResultCommit.Valid &&
+		current.ResultCommit.String == resultCommit &&
+		current.ArtifactDigest.Valid &&
+		current.ArtifactDigest.String == digest &&
+		current.ArtifactSize.Valid &&
+		current.ArtifactSize.Int64 == artifactSize
+}
+
 func (h *Handler) SubmitWorkflowBundle(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskId")
 	task, workspaceID, ok := h.requireDaemonTaskAccessWithWorkspace(w, r, taskID)
@@ -2994,14 +3031,11 @@ func (h *Handler) SubmitWorkflowBundle(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "workflow bundle manifest does not match the active claim")
 		return
 	}
-	artifactKey := fmt.Sprintf(
-		"workflows/%s/%s/%s/%s-%s.bundle",
-		workspaceID,
-		manifest.RunID,
-		manifest.NodeID,
-		manifest.AttemptID,
-		digest,
-	)
+	// Each HTTP attempt owns a distinct object. A retry can overlap the
+	// original request after an intermediary returns a transient 5xx while the
+	// origin keeps processing. A request-unique key lets the losing request
+	// delete only its own upload.
+	artifactKey := workflowBundleArtifactKey(workspaceID, manifest, digest)
 	if _, err := h.Storage.Upload(r.Context(), artifactKey, bundle, "application/x-git-bundle", manifest.AttemptID+".bundle"); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to store workflow bundle")
 		return
@@ -3019,6 +3053,19 @@ func (h *Handler) SubmitWorkflowBundle(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		h.Storage.Delete(r.Context(), artifactKey)
+		current, currentErr := h.Queries.GetWorkflowAttemptByTask(r.Context(), task.ID)
+		if currentErr == nil && workflowAttemptMatchesSubmission(
+			current,
+			attempt.ID,
+			attempt.ClaimEpoch,
+			manifest.BaseCommit,
+			manifest.ResultCommit,
+			digest,
+			int64(len(bundle)),
+		) {
+			writeJSON(w, http.StatusOK, current)
+			return
+		}
 		writeError(w, http.StatusConflict, err.Error())
 		return
 	}
