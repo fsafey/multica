@@ -22,6 +22,8 @@ const (
 	MaxWorkflowBundleSize               = 100 << 20
 )
 
+var ErrStaleWorkflowAttempt = errors.New("stale workflow attempt or claim epoch")
+
 var (
 	ErrNoWorkflowNodeReady  = errors.New("no compatible workflow node is ready")
 	ErrWorkflowResourceBusy = errors.New("workflow node resource is already claimed")
@@ -986,7 +988,7 @@ func (s *WorkflowService) SubmitArtifact(ctx context.Context, submission Workflo
 			return fmt.Errorf("load workflow attempt: %w", err)
 		}
 		if !sameUUID(current.ID, submission.AttemptID) || current.ClaimEpoch != submission.ClaimEpoch {
-			return errors.New("stale workflow attempt or claim epoch")
+			return ErrStaleWorkflowAttempt
 		}
 		updated, err := qtx.SubmitWorkflowAttemptArtifact(ctx, db.SubmitWorkflowAttemptArtifactParams{
 			BaseCommit:     optionalText(submission.BaseCommit),

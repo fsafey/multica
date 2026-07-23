@@ -19,6 +19,17 @@ import (
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
+type countingReadCloser struct {
+	io.ReadCloser
+	bytesRead atomic.Int64
+}
+
+func (r *countingReadCloser) Read(buffer []byte) (int, error) {
+	count, err := r.ReadCloser.Read(buffer)
+	r.bytesRead.Add(int64(count))
+	return count, err
+}
+
 func TestSubmitWorkflowBundleRetriesTransientFailureWithSameArtifact(t *testing.T) {
 	defer noSleepRetry(t)()
 
@@ -84,6 +95,51 @@ func TestSubmitWorkflowBundleRetriesTransientFailureWithSameArtifact(t *testing.
 	}
 	if got := calls.Load(); got != 2 {
 		t.Fatalf("calls = %d, want 2", got)
+	}
+}
+
+func TestSubmitWorkflowBundleExpectContinueAcceptsEarlyDurableResponse(t *testing.T) {
+	bundlePath := filepath.Join(t.TempDir(), "result.bundle")
+	if err := os.WriteFile(bundlePath, make([]byte, 2<<20), 0o600); err != nil {
+		t.Fatalf("write bundle fixture: %v", err)
+	}
+
+	requestBodies := make(chan *countingReadCloser, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestBody := &countingReadCloser{ReadCloser: r.Body}
+		r.Body = requestBody
+		if got := r.Header.Get("Expect"); got != "100-continue" {
+			t.Errorf("Expect = %q, want 100-continue", got)
+		}
+		time.Sleep(50 * time.Millisecond)
+		requestBodies <- requestBody
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	client := NewClient(srv.URL)
+	transport, ok := client.bundleClient.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("bundle transport = %T, want *http.Transport", client.bundleClient.Transport)
+	}
+	if transport.ExpectContinueTimeout != 15*time.Second {
+		t.Fatalf(
+			"ExpectContinueTimeout = %s, want 15s",
+			transport.ExpectContinueTimeout,
+		)
+	}
+	if err := client.SubmitWorkflowBundle(
+		context.Background(),
+		"task-1",
+		bundlePath,
+		"digest-1",
+		[]byte(`{"attempt_id":"attempt-1"}`),
+	); err != nil {
+		t.Fatalf("SubmitWorkflowBundle: %v", err)
+	}
+	requestBody := <-requestBodies
+	if got := requestBody.bytesRead.Load(); got != 0 {
+		t.Fatalf("server read %d body bytes before early durable response", got)
 	}
 }
 

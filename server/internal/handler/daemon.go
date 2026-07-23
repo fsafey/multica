@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/analytics"
 	"github.com/multica-ai/multica/server/internal/auth"
@@ -2961,7 +2962,11 @@ func (h *Handler) SubmitWorkflowBundle(w http.ResponseWriter, r *http.Request) {
 	}
 	attempt, err := h.Queries.GetWorkflowAttemptByTask(r.Context(), task.ID)
 	if err != nil {
-		writeError(w, http.StatusConflict, "workflow attempt not found")
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusConflict, "workflow attempt not found")
+		} else {
+			writeError(w, http.StatusServiceUnavailable, "workflow attempt lookup failed")
+		}
 		return
 	}
 	if daemonID := middleware.DaemonIDFromContext(r.Context()); daemonID != "" && daemonID != attempt.DaemonID {
@@ -3082,7 +3087,14 @@ func (h *Handler) SubmitWorkflowBundle(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusOK, current)
 			return
 		}
-		writeError(w, http.StatusConflict, err.Error())
+		if currentErr != nil && !errors.Is(currentErr, pgx.ErrNoRows) {
+			writeError(w, http.StatusServiceUnavailable, "workflow submission state unavailable")
+		} else if errors.Is(err, service.ErrStaleWorkflowAttempt) ||
+			errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusConflict, err.Error())
+		} else {
+			writeError(w, http.StatusServiceUnavailable, "workflow bundle submission failed")
+		}
 		return
 	}
 	writeJSON(w, http.StatusAccepted, submitted)

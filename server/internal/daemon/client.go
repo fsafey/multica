@@ -153,10 +153,18 @@ func NewClient(baseURL string) *Client {
 	return &Client{
 		baseURL:      baseURL,
 		client:       &http.Client{Timeout: 30 * time.Second, Transport: cloneDefaultTransport()},
-		bundleClient: &http.Client{},
+		bundleClient: &http.Client{Transport: cloneBundleTransport()},
 		platform:     "daemon",
 		os:           normalizeGOOS(runtime.GOOS),
 	}
+}
+
+func cloneBundleTransport() http.RoundTripper {
+	transport := cloneDefaultTransport()
+	if httpTransport, ok := transport.(*http.Transport); ok {
+		httpTransport.ExpectContinueTimeout = 15 * time.Second
+	}
+	return transport
 }
 
 func cloneDefaultTransport() http.RoundTripper {
