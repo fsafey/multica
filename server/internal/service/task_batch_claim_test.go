@@ -165,6 +165,81 @@ func TestClaimTasksForRuntimes_MaxTasksCap(t *testing.T) {
 	}
 }
 
+// TestClaimTasksForRuntimes_DoesNotCrossRuntimeForSameAgent covers the
+// re-pinning window: queued rows retain their enqueue-time runtime even after
+// an agent moves. A runtime-specific candidate must never cause the agent's
+// higher-priority row on another runtime to be dispatched.
+func TestClaimTasksForRuntimes_DoesNotCrossRuntimeForSameAgent(t *testing.T) {
+	ctx := context.Background()
+	pool := newTaskClaimRacePool(t)
+	svc := NewTaskService(db.New(pool), pool, nil, events.New())
+
+	rt1, rt2 := batchClaimFixture(t, ctx, pool)
+
+	var workspaceID, ownerID, agentID string
+	if err := pool.QueryRow(ctx, `
+		SELECT ar.workspace_id, ar.owner_id, a.id
+		FROM agent_runtime ar
+		JOIN agent a ON a.runtime_id = ar.id
+		WHERE ar.id = $1
+		LIMIT 1
+	`, rt1).Scan(&workspaceID, &ownerID, &agentID); err != nil {
+		t.Fatalf("load fixture agent: %v", err)
+	}
+
+	var issueID, foreignTaskID string
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO issue (
+			workspace_id, title, status, priority, creator_id, creator_type,
+			number, position
+		)
+		VALUES ($1, 'cross-runtime priority trap', 'in_progress', 'none',
+		        $2, 'member', 899999, 99)
+		RETURNING id
+	`, workspaceID, ownerID).Scan(&issueID); err != nil {
+		t.Fatalf("create cross-runtime issue: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO agent_task_queue (
+			agent_id, runtime_id, issue_id, status, priority, context
+		)
+		VALUES ($1, $2, $3, 'queued', 100, '{}'::jsonb)
+		RETURNING id
+	`, agentID, rt2, issueID).Scan(&foreignTaskID); err != nil {
+		t.Fatalf("create cross-runtime task: %v", err)
+	}
+	t.Cleanup(func() {
+		c := context.Background()
+		pool.Exec(c, `DELETE FROM agent_task_queue WHERE id = $1`, foreignTaskID)
+		pool.Exec(c, `DELETE FROM issue WHERE id = $1`, issueID)
+	})
+
+	claimed, err := svc.ClaimTasksForRuntimes(
+		ctx,
+		[]pgtype.UUID{util.MustParseUUID(rt1)},
+		1,
+	)
+	if err != nil {
+		t.Fatalf("claim rt1: %v", err)
+	}
+	if len(claimed) != 1 {
+		t.Fatalf("claimed %d tasks, want 1", len(claimed))
+	}
+	if got := util.UUIDToString(claimed[0].RuntimeID); got != rt1 {
+		t.Fatalf("claimed runtime = %s, want %s", got, rt1)
+	}
+
+	var status string
+	if err := pool.QueryRow(ctx, `
+		SELECT status FROM agent_task_queue WHERE id = $1
+	`, foreignTaskID).Scan(&status); err != nil {
+		t.Fatalf("read foreign task status: %v", err)
+	}
+	if status != "queued" {
+		t.Fatalf("foreign-runtime task status = %s, want queued", status)
+	}
+}
+
 // TestClaimTasksForRuntimes_EmptyInputs guards the trivial short-circuits.
 func TestClaimTasksForRuntimes_EmptyInputs(t *testing.T) {
 	ctx := context.Background()

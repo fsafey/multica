@@ -3,6 +3,7 @@ package execenv
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -10,13 +11,26 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
 // QuarantineRefPrefix is the durable recovery namespace for task commits that
 // were not safely published to a local_directory source checkout.
 const QuarantineRefPrefix = "refs/multica/quarantine/"
+
+const MaxWorkflowBundleBytes int64 = 100 << 20
+
+type WorkflowBundleArtifact struct {
+	Path         string
+	BaseCommit   string
+	ResultCommit string
+	SHA256       string
+	Size         int64
+	ChangedPaths []string
+}
 
 type publishAppliedError struct {
 	cause error
@@ -84,6 +98,182 @@ func (w *IsolatedLocalWorktree) FinalizeSerialPublishBack(publish bool, provider
 
 	w.removeLocked(logger)
 	return nil
+}
+
+func (w *IsolatedLocalWorktree) BuildWorkflowBundle(provider, outputDir string, allowedPaths []string) (WorkflowBundleArtifact, error) {
+	if w == nil || w.SourceRepo == "" || w.WorkDir == "" || w.TaskID == "" || w.BaseCommit == "" {
+		return WorkflowBundleArtifact{}, errors.New("execenv: workflow bundle worktree metadata is incomplete")
+	}
+	taskSHA, err := gitOutput(w.WorkDir, "rev-parse", "--verify", "HEAD^{commit}")
+	if err != nil {
+		return WorkflowBundleArtifact{}, fmt.Errorf("execenv: workflow bundle resolve result commit: %w", err)
+	}
+	if taskSHA == w.BaseCommit {
+		return WorkflowBundleArtifact{}, errors.New("execenv: workflow bundle requires a result commit after the base commit")
+	}
+	ancestor, err := gitSuccess(w.WorkDir, "merge-base", "--is-ancestor", w.BaseCommit, taskSHA)
+	if err != nil {
+		return WorkflowBundleArtifact{}, fmt.Errorf("execenv: workflow bundle verify ancestry: %w", err)
+	}
+	if !ancestor {
+		return WorkflowBundleArtifact{}, fmt.Errorf("execenv: workflow result commit %s is not a descendant of base %s", taskSHA, w.BaseCommit)
+	}
+	changed, err := nulPathSet(w.SourceRepo, "diff", "--name-only", "--no-renames", "-z", w.BaseCommit, taskSHA, "--")
+	if err != nil {
+		return WorkflowBundleArtifact{}, fmt.Errorf("execenv: workflow bundle list changed paths: %w", err)
+	}
+	if len(changed) == 0 {
+		return WorkflowBundleArtifact{}, errors.New("execenv: workflow bundle result has no changed paths")
+	}
+	if taskPath, managedPath, overlap := firstPathOverlap(changed, w.managedPaths); overlap {
+		return WorkflowBundleArtifact{}, fmt.Errorf("execenv: workflow bundle refused because committed task path %q is daemon-managed runtime material %q", taskPath, managedPath)
+	}
+	normalizedAllowed, err := normalizeWorkflowAllowedPaths(allowedPaths)
+	if err != nil {
+		return WorkflowBundleArtifact{}, err
+	}
+	changedPaths := make([]string, 0, len(changed))
+	for changedPath := range changed {
+		if !workflowPathAllowed(changedPath, normalizedAllowed) {
+			return WorkflowBundleArtifact{}, fmt.Errorf("execenv: workflow bundle changed path %q outside the declared write set", changedPath)
+		}
+		changedPaths = append(changedPaths, changedPath)
+	}
+	sort.Strings(changedPaths)
+
+	if err := CleanupRuntimeConfig(w.WorkDir, provider); err != nil {
+		return WorkflowBundleArtifact{}, fmt.Errorf("execenv: workflow bundle cleanup runtime config: %w", err)
+	}
+	if err := CleanupSidecars(filepath.Dir(w.WorkDir)); err != nil {
+		return WorkflowBundleArtifact{}, fmt.Errorf("execenv: workflow bundle cleanup sidecars: %w", err)
+	}
+	if status, err := gitOutputBytes(w.WorkDir, "status", "--porcelain=v1", "-z", "--untracked-files=all"); err != nil {
+		return WorkflowBundleArtifact{}, fmt.Errorf("execenv: workflow bundle inspect worktree: %w", err)
+	} else if len(status) != 0 {
+		return WorkflowBundleArtifact{}, errors.New("execenv: workflow bundle refused because the task worktree is not clean after sidecar cleanup")
+	}
+
+	if err := os.MkdirAll(outputDir, 0o700); err != nil {
+		return WorkflowBundleArtifact{}, fmt.Errorf("execenv: create workflow bundle output directory: %w", err)
+	}
+	file, err := os.CreateTemp(outputDir, "workflow-*.bundle")
+	if err != nil {
+		return WorkflowBundleArtifact{}, fmt.Errorf("execenv: create workflow bundle: %w", err)
+	}
+	bundlePath := file.Name()
+	if err := file.Close(); err != nil {
+		os.Remove(bundlePath)
+		return WorkflowBundleArtifact{}, fmt.Errorf("execenv: close workflow bundle placeholder: %w", err)
+	}
+	if out, err := exec.Command("git", "-C", w.WorkDir, "bundle", "create", bundlePath, taskSHA, "^"+w.BaseCommit).CombinedOutput(); err != nil {
+		os.Remove(bundlePath)
+		return WorkflowBundleArtifact{}, fmt.Errorf("execenv: create workflow git bundle: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+	if out, err := exec.Command("git", "-C", w.WorkDir, "bundle", "verify", bundlePath).CombinedOutput(); err != nil {
+		os.Remove(bundlePath)
+		return WorkflowBundleArtifact{}, fmt.Errorf("execenv: verify workflow git bundle: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+	info, err := os.Stat(bundlePath)
+	if err != nil {
+		os.Remove(bundlePath)
+		return WorkflowBundleArtifact{}, fmt.Errorf("execenv: stat workflow git bundle: %w", err)
+	}
+	if info.Size() < 1 || info.Size() > MaxWorkflowBundleBytes {
+		os.Remove(bundlePath)
+		return WorkflowBundleArtifact{}, fmt.Errorf("execenv: workflow bundle size %d exceeds limit %d", info.Size(), MaxWorkflowBundleBytes)
+	}
+	bundleFile, err := os.Open(bundlePath)
+	if err != nil {
+		os.Remove(bundlePath)
+		return WorkflowBundleArtifact{}, fmt.Errorf("execenv: open workflow bundle for digest: %w", err)
+	}
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, bundleFile); err != nil {
+		bundleFile.Close()
+		os.Remove(bundlePath)
+		return WorkflowBundleArtifact{}, fmt.Errorf("execenv: hash workflow bundle: %w", err)
+	}
+	if err := bundleFile.Close(); err != nil {
+		os.Remove(bundlePath)
+		return WorkflowBundleArtifact{}, fmt.Errorf("execenv: close workflow bundle: %w", err)
+	}
+	return WorkflowBundleArtifact{
+		Path:         bundlePath,
+		BaseCommit:   w.BaseCommit,
+		ResultCommit: taskSHA,
+		SHA256:       hex.EncodeToString(hasher.Sum(nil)),
+		Size:         info.Size(),
+		ChangedPaths: changedPaths,
+	}, nil
+}
+
+func normalizeWorkflowAllowedPaths(paths []string) ([]string, error) {
+	if len(paths) == 0 {
+		return nil, errors.New("execenv: workflow output contract has an empty write set")
+	}
+	out := make([]string, 0, len(paths))
+	for _, raw := range paths {
+		value := filepath.ToSlash(strings.TrimSpace(raw))
+		value = strings.TrimPrefix(value, "./")
+		if value == "" || strings.HasPrefix(value, "/") || value == ".." || strings.HasPrefix(value, "../") {
+			return nil, fmt.Errorf("execenv: invalid workflow write-set path %q", raw)
+		}
+		out = append(out, value)
+	}
+	return out, nil
+}
+
+func workflowPathAllowed(changedPath string, allowedPaths []string) bool {
+	changedPath = filepath.ToSlash(changedPath)
+	for _, allowed := range allowedPaths {
+		if changedPath == allowed {
+			return true
+		}
+		if strings.HasSuffix(allowed, "/**") {
+			prefix := strings.TrimSuffix(allowed, "**")
+			if strings.HasPrefix(changedPath, prefix) {
+				return true
+			}
+		}
+		if strings.HasSuffix(allowed, "/") && strings.HasPrefix(changedPath, allowed) {
+			return true
+		}
+		if matched, err := path.Match(allowed, changedPath); err == nil && matched {
+			return true
+		}
+	}
+	return false
+}
+
+func ValidateWorkflowChangedPaths(changedPaths, allowedPaths []string) error {
+	normalized, err := normalizeWorkflowAllowedPaths(allowedPaths)
+	if err != nil {
+		return err
+	}
+	for _, changedPath := range changedPaths {
+		if !workflowPathAllowed(changedPath, normalized) {
+			return fmt.Errorf("execenv: workflow changed path %q outside the declared write set", changedPath)
+		}
+	}
+	return nil
+}
+
+func (w *IsolatedLocalWorktree) FinalizeWorkflowBundle(submitted bool, logger *slog.Logger) error {
+	if w == nil {
+		return nil
+	}
+	lock := lockForRepo(w.SourceRepo)
+	lock.Lock()
+	defer lock.Unlock()
+	taskSHA, err := gitOutput(w.WorkDir, "rev-parse", "--verify", "HEAD^{commit}")
+	if err != nil {
+		return fmt.Errorf("execenv: resolve workflow bundle task commit: %w", err)
+	}
+	if submitted {
+		w.removeLocked(logger)
+		return nil
+	}
+	return w.quarantineAndRemoveLocked(taskSHA, logger)
 }
 
 func (w *IsolatedLocalWorktree) publishSerialFastForwardLocked(taskSHA, provider string) error {

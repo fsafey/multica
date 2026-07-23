@@ -54,7 +54,7 @@ type CreateTaskMessageRow struct {
 	Input        []byte             `json:"input"`
 	Output       pgtype.Text        `json:"output"`
 	CreatedAt    pgtype.Timestamptz `json:"created_at"`
-	ArrivalOrder pgtype.Int8        `json:"arrival_order"`
+	ArrivalOrder int64              `json:"arrival_order"`
 	Inserted     bool               `json:"inserted"`
 }
 

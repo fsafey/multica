@@ -3364,6 +3364,10 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 	if task.Agent != nil {
 		agentName = task.Agent.Name
 	}
+	if task.Integration != nil {
+		d.handleWorkflowIntegration(ctx, task, taskLog)
+		return
+	}
 	if task.ChatSessionID != "" {
 		taskLog.Info("picked chat task", "chat_session", shortID(task.ChatSessionID), "agent", agentName, "provider", provider)
 	} else {
@@ -3444,6 +3448,25 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 		}
 	}()
 
+	if task.Workflow != nil {
+		leaseCtx, stopLeaseRenewal := context.WithCancel(runCtx)
+		defer stopLeaseRenewal()
+		go func() {
+			ticker := time.NewTicker(15 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-leaseCtx.Done():
+					return
+				case <-ticker.C:
+					if err := d.client.RenewWorkflowTaskLease(leaseCtx, task.RuntimeID, task.ID); err != nil {
+						taskLog.Warn("workflow lease renewal failed", "error", err)
+					}
+				}
+			}
+		}()
+	}
+
 	result, err := d.runner.run(runCtx, task, provider, slot, taskLog)
 	finalizePublishBack := func(publish bool) error {
 		if result.PublishBackWorktree == nil {
@@ -3455,6 +3478,14 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 			taskLog,
 		)
 		result.PublishBackWorktree = nil
+		return finalizeErr
+	}
+	finalizeWorkflowBundle := func(submitted bool) error {
+		if result.WorkflowBundleWorktree == nil {
+			return nil
+		}
+		finalizeErr := result.WorkflowBundleWorktree.FinalizeWorkflowBundle(submitted, taskLog)
+		result.WorkflowBundleWorktree = nil
 		return finalizeErr
 	}
 
@@ -3476,6 +3507,9 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 		if finalizeErr := finalizePublishBack(false); finalizeErr != nil {
 			taskLog.Error("local_directory publish-back quarantine failed", "error", finalizeErr)
 		}
+		if finalizeErr := finalizeWorkflowBundle(false); finalizeErr != nil {
+			taskLog.Error("workflow bundle quarantine failed", "error", finalizeErr)
+		}
 		// runner.run has returned, so the transcript flush is complete —
 		// tell the server it can settle its deferred chat finalization
 		// (#5219). Best-effort: the sweeper grace period covers a lost ack.
@@ -3490,6 +3524,9 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 		taskLog.Error("task failed", "error", err)
 		if finalizeErr := finalizePublishBack(false); finalizeErr != nil {
 			taskLog.Error("local_directory publish-back quarantine failed", "error", finalizeErr)
+		}
+		if finalizeErr := finalizeWorkflowBundle(false); finalizeErr != nil {
+			taskLog.Error("workflow bundle quarantine failed", "error", finalizeErr)
 		}
 		// runTask returned without a TaskResult, so we don't have a SessionID
 		// to forward — best we can do is record the failure.
@@ -3522,6 +3559,9 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 		if finalizeErr := finalizePublishBack(false); finalizeErr != nil {
 			taskLog.Error("local_directory publish-back quarantine failed", "error", finalizeErr)
 		}
+		if finalizeErr := finalizeWorkflowBundle(false); finalizeErr != nil {
+			taskLog.Error("workflow bundle quarantine failed", "error", finalizeErr)
+		}
 		// Same contract as the poll-cancelled path above: the transcript is
 		// flushed, so let the server settle its deferred chat finalization.
 		if ackErr := d.client.AckTaskCancelled(ctx, task.ID, transcriptExpectation(result)); ackErr != nil {
@@ -3545,6 +3585,22 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 		result.FailureReason = "local_directory_publish_status_unconfirmed"
 		result.Comment = appendTaskResultComment(result.Comment, note)
 	}
+	if result.WorkflowBundleWorktree != nil && result.Status == "completed" && (finalStatusErr != nil || finalStatus != "running") {
+		note := fmt.Sprintf(
+			"Workflow bundle was not submitted because the daemon could not confirm that the task was still running (status=%q, error=%v). Recovery ref target: %s%s.",
+			finalStatus,
+			finalStatusErr,
+			execenv.QuarantineRefPrefix,
+			task.ID,
+		)
+		if finalizeErr := finalizeWorkflowBundle(false); finalizeErr != nil {
+			taskLog.Error("workflow bundle quarantine failed after unconfirmed task status", "error", finalizeErr)
+			note += " Finalizer error: " + finalizeErr.Error()
+		}
+		result.Status = "blocked"
+		result.FailureReason = "workflow_bundle_status_unconfirmed"
+		result.Comment = appendTaskResultComment(result.Comment, note)
+	}
 
 	if result.PublishBackWorktree != nil {
 		publish := result.Status == "completed"
@@ -3566,6 +3622,70 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 						quarantineRef,
 						finalizeErr,
 					))
+				}
+			}
+		}
+	}
+	if result.WorkflowBundleWorktree != nil {
+		if result.Status != "completed" {
+			if finalizeErr := finalizeWorkflowBundle(false); finalizeErr != nil {
+				taskLog.Error("workflow bundle quarantine failed", "error", finalizeErr)
+			}
+		} else if task.Workflow == nil {
+			if finalizeErr := finalizeWorkflowBundle(false); finalizeErr != nil {
+				taskLog.Error("workflow bundle quarantine failed", "error", finalizeErr)
+			}
+			result.Status = "blocked"
+			result.FailureReason = "workflow_bundle_context_missing"
+			result.Comment = appendTaskResultComment(result.Comment, "Workflow bundle mode requires a durable workflow claim.")
+		} else {
+			allowedPaths, parseErr := workflowAllowedPaths(task.Workflow.OutputContract)
+			if parseErr != nil {
+				if finalizeErr := finalizeWorkflowBundle(false); finalizeErr != nil {
+					taskLog.Error("workflow bundle quarantine failed", "error", finalizeErr)
+				}
+				result.Status = "blocked"
+				result.FailureReason = "workflow_bundle_contract_invalid"
+				result.Comment = appendTaskResultComment(result.Comment, parseErr.Error())
+			} else {
+				artifact, buildErr := result.WorkflowBundleWorktree.BuildWorkflowBundle(
+					result.WorkflowBundleProvider,
+					filepath.Join(result.EnvRoot, "output"),
+					allowedPaths,
+				)
+				if buildErr != nil {
+					if finalizeErr := finalizeWorkflowBundle(false); finalizeErr != nil {
+						taskLog.Error("workflow bundle quarantine failed", "error", finalizeErr)
+					}
+					result.Status = "blocked"
+					result.FailureReason = "workflow_bundle_validation_failed"
+					result.Comment = appendTaskResultComment(result.Comment, buildErr.Error())
+				} else {
+					manifest, manifestErr := workflowBundleManifestJSON(task, artifact)
+					if manifestErr != nil {
+						if finalizeErr := finalizeWorkflowBundle(false); finalizeErr != nil {
+							taskLog.Error("workflow bundle quarantine failed", "error", finalizeErr)
+						}
+						result.Status = "blocked"
+						result.FailureReason = "workflow_bundle_manifest_failed"
+						result.Comment = appendTaskResultComment(result.Comment, manifestErr.Error())
+					} else if submitErr := d.client.SubmitWorkflowBundle(ctx, task.ID, artifact.Path, artifact.SHA256, manifest); submitErr != nil {
+						if finalizeErr := finalizeWorkflowBundle(false); finalizeErr != nil {
+							taskLog.Error("workflow bundle quarantine failed", "error", finalizeErr)
+						}
+						result.Status = "blocked"
+						result.FailureReason = "workflow_bundle_submit_failed"
+						result.Comment = appendTaskResultComment(result.Comment, submitErr.Error())
+					} else {
+						if finalizeErr := finalizeWorkflowBundle(true); finalizeErr != nil {
+							taskLog.Error("workflow bundle cleanup failed after durable submission", "error", finalizeErr)
+						}
+						_ = os.Remove(artifact.Path)
+						result.Comment = appendTaskResultComment(
+							result.Comment,
+							fmt.Sprintf("Submitted immutable workflow bundle `%s` for deterministic integration.", artifact.SHA256),
+						)
+					}
 				}
 			}
 		}
@@ -3607,6 +3727,67 @@ func appendTaskResultComment(comment, note string) string {
 		return note
 	}
 	return comment + "\n\n" + note
+}
+
+type workflowNodeOutputContract struct {
+	AllowedPaths []string `json:"allowed_paths"`
+	WriteSet     []string `json:"write_set"`
+}
+
+type workflowBundleManifest struct {
+	RunID        string   `json:"run_id"`
+	PassageKey   string   `json:"passage_key"`
+	NodeID       string   `json:"node_id"`
+	NodeKey      string   `json:"node_key"`
+	Generation   int32    `json:"generation"`
+	AttemptID    string   `json:"attempt_id"`
+	ClaimEpoch   int64    `json:"claim_epoch"`
+	BaseCommit   string   `json:"base_commit"`
+	ResultCommit string   `json:"result_commit"`
+	InputDigest  string   `json:"input_digest,omitempty"`
+	LawDigest    string   `json:"law_digest,omitempty"`
+	AgentID      string   `json:"agent_id"`
+	RuntimeID    string   `json:"runtime_id"`
+	ChangedPaths []string `json:"changed_paths"`
+	BundleSHA256 string   `json:"bundle_sha256"`
+}
+
+func workflowAllowedPaths(raw json.RawMessage) ([]string, error) {
+	var contract workflowNodeOutputContract
+	if err := json.Unmarshal(raw, &contract); err != nil {
+		return nil, fmt.Errorf("parse workflow output contract: %w", err)
+	}
+	paths := contract.AllowedPaths
+	if len(paths) == 0 {
+		paths = contract.WriteSet
+	}
+	if len(paths) == 0 {
+		return nil, errors.New("workflow output contract must declare allowed_paths or write_set")
+	}
+	return paths, nil
+}
+
+func workflowBundleManifestJSON(task Task, artifact execenv.WorkflowBundleArtifact) ([]byte, error) {
+	if task.Workflow == nil {
+		return nil, errors.New("workflow task context is missing")
+	}
+	return json.Marshal(workflowBundleManifest{
+		RunID:        task.Workflow.RunID,
+		PassageKey:   task.Workflow.PassageKey,
+		NodeID:       task.Workflow.NodeID,
+		NodeKey:      task.Workflow.NodeKey,
+		Generation:   task.Workflow.Generation,
+		AttemptID:    task.Workflow.AttemptID,
+		ClaimEpoch:   task.Workflow.ClaimEpoch,
+		BaseCommit:   artifact.BaseCommit,
+		ResultCommit: artifact.ResultCommit,
+		InputDigest:  task.Workflow.InputDigest,
+		LawDigest:    task.Workflow.LawDigest,
+		AgentID:      task.AgentID,
+		RuntimeID:    task.RuntimeID,
+		ChangedPaths: artifact.ChangedPaths,
+		BundleSHA256: artifact.SHA256,
+	})
 }
 
 // acquireLocalDirectoryLockIfNeeded inspects the task's project resources for
@@ -3664,7 +3845,7 @@ func (d *Daemon) acquireLocalDirectoryLockIfNeeded(ctx context.Context, task Tas
 	// writes back to the source checkout. publish_back=serial_ff is different:
 	// it retains this mutex for the full task so BaseCommit, agent execution,
 	// publication or quarantine, and cleanup form one serialized lifecycle.
-	if assignment.Ref.Isolate && assignment.Ref.PublishBack == "" {
+	if assignment.Ref.Isolate && assignment.Ref.PublishBack != localDirectoryPublishBackSerialFF {
 		taskLog.Info("local_directory: worktree isolation enabled; skipping whole-task path mutex")
 		return nil, false
 	}
@@ -4307,8 +4488,10 @@ func skillRefFromBundle(bundle SkillData) SkillRefData {
 
 func taskPrepareTimeoutResult(result TaskResult) TaskResult {
 	return TaskResult{
-		PublishBackWorktree: result.PublishBackWorktree,
-		PublishBackProvider: result.PublishBackProvider,
+		PublishBackWorktree:    result.PublishBackWorktree,
+		PublishBackProvider:    result.PublishBackProvider,
+		WorkflowBundleWorktree: result.WorkflowBundleWorktree,
+		WorkflowBundleProvider: result.WorkflowBundleProvider,
 	}
 }
 
@@ -4439,6 +4622,18 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		InitiatorEmail:                   task.InitiatorEmail,
 		WorkspaceContext:                 task.WorkspaceContext,
 		ConnectedApps:                    task.ConnectedApps,
+	}
+	if task.Workflow != nil {
+		taskCtx.WorkflowRunID = task.Workflow.RunID
+		taskCtx.WorkflowNodeID = task.Workflow.NodeID
+		taskCtx.WorkflowAttemptID = task.Workflow.AttemptID
+		taskCtx.WorkflowPassageKey = task.Workflow.PassageKey
+		taskCtx.WorkflowNodeKey = task.Workflow.NodeKey
+		taskCtx.WorkflowGeneration = task.Workflow.Generation
+		taskCtx.WorkflowClaimEpoch = task.Workflow.ClaimEpoch
+		taskCtx.WorkflowInputDigest = task.Workflow.InputDigest
+		taskCtx.WorkflowLawDigest = task.Workflow.LawDigest
+		taskCtx.WorkflowOutputContract = task.Workflow.OutputContract
 	}
 
 	// Mark candidate env roots as active before any env work so the GC loop
@@ -4614,7 +4809,8 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		if localAssignment != nil {
 			prepParams.LocalWorkDir = localAssignment.AbsPath
 			prepParams.Isolate = localAssignment.Ref.Isolate
-			prepParams.PublishBack = localAssignment.Ref.PublishBack == localDirectoryPublishBackSerialFF
+			prepParams.PublishBack = localAssignment.Ref.PublishBack == localDirectoryPublishBackSerialFF ||
+				localAssignment.Ref.PublishBack == localDirectoryPublishSubmitBundle
 		}
 		env, err = d.prepareExecutionEnvironment(prepareCtx, prepParams)
 		if err != nil {
@@ -4631,6 +4827,11 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			defer func() {
 				taskResult.PublishBackWorktree = env.IsolatedWorktree
 				taskResult.PublishBackProvider = provider
+			}()
+		} else if localAssignment != nil && localAssignment.Ref.PublishBack == localDirectoryPublishSubmitBundle {
+			defer func() {
+				taskResult.WorkflowBundleWorktree = env.IsolatedWorktree
+				taskResult.WorkflowBundleProvider = provider
 			}()
 		} else {
 			defer env.IsolatedWorktree.Remove(d.logger)

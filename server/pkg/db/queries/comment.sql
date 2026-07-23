@@ -7,6 +7,14 @@ WHERE issue_id = $1 AND workspace_id = $2
 ORDER BY created_at ASC, id ASC
 LIMIT $3;
 
+-- name: ListRecentCommentsForIssue :many
+-- Newest comments first so a capped correctness check fails closed when an
+-- issue ever exceeds the defensive row limit.
+SELECT * FROM comment
+WHERE issue_id = $1 AND workspace_id = $2
+ORDER BY created_at DESC, id DESC
+LIMIT $3;
+
 -- name: ListCommentsSinceForIssue :many
 -- Comments created strictly after $3 in chronological order, capped at $4.
 -- Powers the CLI's `--since` agent-polling flow.

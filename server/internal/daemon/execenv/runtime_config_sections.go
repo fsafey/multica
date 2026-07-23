@@ -168,6 +168,30 @@ func writeConnectedApps(b *strings.Builder, ctx TaskContextForEnv) {
 	b.WriteString("\nUse the listed MCP server when the task asks to read or act in one of these apps.\n\n")
 }
 
+func writeWorkflowNodeContract(b *strings.Builder, ctx TaskContextForEnv) {
+	if ctx.WorkflowNodeID == "" {
+		return
+	}
+	b.WriteString("## Durable Workflow Node\n\n")
+	fmt.Fprintf(b, "- Run: `%s`\n", ctx.WorkflowRunID)
+	fmt.Fprintf(b, "- Passage: `%s`\n", ctx.WorkflowPassageKey)
+	fmt.Fprintf(b, "- Node: `%s` (generation %d)\n", ctx.WorkflowNodeKey, ctx.WorkflowGeneration)
+	fmt.Fprintf(b, "- Attempt: `%s` (claim epoch %d)\n", ctx.WorkflowAttemptID, ctx.WorkflowClaimEpoch)
+	if ctx.WorkflowInputDigest != "" {
+		fmt.Fprintf(b, "- Input digest: `%s`\n", ctx.WorkflowInputDigest)
+	}
+	if ctx.WorkflowLawDigest != "" {
+		fmt.Fprintf(b, "- Law digest: `%s`\n", ctx.WorkflowLawDigest)
+	}
+	if len(ctx.WorkflowOutputContract) > 0 {
+		fmt.Fprintf(b, "- Output contract: `%s`\n", strings.TrimSpace(string(ctx.WorkflowOutputContract)))
+	}
+	b.WriteString("\nThe graph controller is the only production dispatcher for this issue.\n")
+	b.WriteString("Do not hand work to another production agent through mentions.\n")
+	b.WriteString("Change only paths allowed by the output contract and finish with a clean result commit.\n")
+	b.WriteString("A completed response is not accepted until the daemon submits and the integrator accepts that commit.\n\n")
+}
+
 func sanitizeBriefCodeToken(s string) string {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -588,6 +612,7 @@ func buildMetaSkillContentSlim(provider string, ctx TaskContextForEnv) string {
 	writeTaskInitiator(&b, ctx)
 	writeWorkspaceContext(&b, ctx)
 	writeConnectedApps(&b, ctx)
+	writeWorkflowNodeContract(&b, ctx)
 
 	switch kind {
 	case kindQuickCreate:

@@ -1534,6 +1534,23 @@ func (h *Handler) enqueueCommentAgentTriggers(ctx context.Context, issue db.Issu
 		results[uuidToString(trigger.Agent.ID)] = commentEnqueueResult{status: status, reason: reason, execSquadID: execSquadID}
 	}
 	for _, trigger := range triggers {
+		workflowManaged, err := h.Queries.IsWorkflowManagedProductionAgent(ctx, db.IsWorkflowManagedProductionAgentParams{
+			IssueID:     issue.ID,
+			AgentID:     trigger.Agent.ID,
+			WorkspaceID: issue.WorkspaceID,
+		})
+		if err != nil {
+			slog.Warn("workflow-managed dispatch check failed",
+				"issue_id", uuidToString(issue.ID),
+				"agent_id", uuidToString(trigger.Agent.ID),
+				"error", err)
+			record(trigger, DispatchBlocked, ReasonInternalError)
+			continue
+		}
+		if workflowManaged {
+			record(trigger, DispatchBlocked, ReasonWorkflowManaged)
+			continue
+		}
 		if trigger.AlreadyPending {
 			// MUL-4195: a queued/dispatched task for this (issue, agent)
 			// already exists. Historically we DROPPED the comment here, losing
@@ -1638,6 +1655,9 @@ func commentBlockedTargetOutcomes(targets []commentMentionTarget) []CommentTrigg
 func commentEnqueueFailureReason(err error) DispatchReasonCode {
 	if errors.Is(err, service.ErrAttributionFailClosed) {
 		return ReasonAttributionBlocked
+	}
+	if errors.Is(err, service.ErrWorkflowManagedDispatch) {
+		return ReasonWorkflowManaged
 	}
 	return ReasonInternalError
 }

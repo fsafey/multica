@@ -1,0 +1,1 @@
+DROP INDEX CONCURRENTLY IF EXISTS runtime_pool_workspace_name_unique;

@@ -59,6 +59,7 @@ const (
 	ReasonAttributionBlocked    = dispatch.ReasonAttributionBlocked
 	ReasonAlreadyActive         = dispatch.ReasonAlreadyActive
 	ReasonSelfTriggerSuppressed = dispatch.ReasonSelfTriggerSuppressed
+	ReasonWorkflowManaged       = dispatch.ReasonWorkflowManaged
 	ReasonInternalError         = dispatch.ReasonInternalError
 )
 
@@ -119,6 +120,8 @@ func dispatchBlockedFallbackMessage(code DispatchReasonCode) string {
 		return "the run couldn't be attributed to a responsible member"
 	case ReasonAlreadyActive:
 		return "a run is already active for this target"
+	case ReasonWorkflowManaged:
+		return "this production target is dispatched by the issue workflow"
 	default:
 		return "the run was blocked"
 	}

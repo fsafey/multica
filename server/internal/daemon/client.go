@@ -3,11 +3,16 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -250,6 +255,7 @@ func (c *Client) ClaimTask(ctx context.Context, runtimeID string) (*Task, error)
 // recovered by ReclaimStaleDispatchedTasksForRuntimes on the next poll. Kept
 // comfortably above p99 claim latency so recovery stays the exception.
 const batchClaimRequestTimeout = 5 * time.Second
+const maxWorkflowBundleBytes int64 = 100 << 20
 
 // ClaimTasks is the machine-level (MUL-4257) batch counterpart of ClaimTask:
 // it asks the server, in a single request, to claim up to maxTasks tasks across
@@ -446,6 +452,148 @@ func (c *Client) CompleteTask(ctx context.Context, taskID, output, branchName, s
 	}
 	addTranscriptExpectation(body, transcriptExpectation)
 	return c.postJSONWithRetry(ctx, fmt.Sprintf("/api/daemon/tasks/%s/complete", taskID), body, nil, defaultTerminalRetrySchedule)
+}
+
+func (c *Client) RenewWorkflowTaskLease(ctx context.Context, runtimeID, taskID string) error {
+	return c.postJSON(
+		ctx,
+		fmt.Sprintf("/api/daemon/runtimes/%s/tasks/%s/workflow-lease", runtimeID, taskID),
+		map[string]any{},
+		nil,
+	)
+}
+
+func (c *Client) SubmitWorkflowBundle(
+	ctx context.Context,
+	taskID, bundlePath, sha256Digest string,
+	manifest []byte,
+) error {
+	bundle, err := os.ReadFile(bundlePath)
+	if err != nil {
+		return fmt.Errorf("read workflow bundle: %w", err)
+	}
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	if err := writer.WriteField("sha256", sha256Digest); err != nil {
+		return err
+	}
+	if err := writer.WriteField("manifest", string(manifest)); err != nil {
+		return err
+	}
+	part, err := writer.CreateFormFile("bundle", filepath.Base(bundlePath))
+	if err != nil {
+		return err
+	}
+	if _, err := part.Write(bundle); err != nil {
+		return err
+	}
+	if err := writer.Close(); err != nil {
+		return err
+	}
+	path := fmt.Sprintf("/api/daemon/tasks/%s/workflow-bundle", taskID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, &body)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	c.setIdentityHeaders(req)
+	resp, err := c.bundleClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return &requestError{
+			Method:     http.MethodPost,
+			Path:       path,
+			StatusCode: resp.StatusCode,
+			Body:       strings.TrimSpace(string(data)),
+		}
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return nil
+}
+
+func (c *Client) DownloadWorkflowIntegrationBundle(
+	ctx context.Context,
+	eventID, destination, expectedDigest string,
+) error {
+	path := fmt.Sprintf("/api/daemon/workflow-integrations/%s/bundle", eventID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
+	if err != nil {
+		return err
+	}
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	c.setIdentityHeaders(req)
+	resp, err := c.bundleClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return &requestError{Method: http.MethodGet, Path: path, StatusCode: resp.StatusCode, Body: strings.TrimSpace(string(data))}
+	}
+	file, err := os.OpenFile(destination, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("create integration bundle: %w", err)
+	}
+	hasher := sha256.New()
+	_, copyErr := io.Copy(io.MultiWriter(file, hasher), io.LimitReader(resp.Body, maxWorkflowBundleBytes+1))
+	closeErr := file.Close()
+	if copyErr != nil {
+		os.Remove(destination)
+		return fmt.Errorf("download integration bundle: %w", copyErr)
+	}
+	if closeErr != nil {
+		os.Remove(destination)
+		return fmt.Errorf("close integration bundle: %w", closeErr)
+	}
+	info, err := os.Stat(destination)
+	if err != nil {
+		os.Remove(destination)
+		return err
+	}
+	if info.Size() < 1 || info.Size() > maxWorkflowBundleBytes {
+		os.Remove(destination)
+		return fmt.Errorf("integration bundle size %d is invalid", info.Size())
+	}
+	got := hex.EncodeToString(hasher.Sum(nil))
+	if got != strings.ToLower(strings.TrimSpace(expectedDigest)) {
+		os.Remove(destination)
+		return fmt.Errorf("integration bundle digest mismatch: got %s", got)
+	}
+	return nil
+}
+
+func (c *Client) RenewWorkflowIntegrationLease(ctx context.Context, eventID string) error {
+	return c.postJSON(ctx, fmt.Sprintf("/api/daemon/workflow-integrations/%s/lease", eventID), map[string]any{}, nil)
+}
+
+func (c *Client) CompleteWorkflowIntegration(ctx context.Context, eventID, canonicalCommit string) error {
+	return c.postJSONWithRetry(
+		ctx,
+		fmt.Sprintf("/api/daemon/workflow-integrations/%s/complete", eventID),
+		map[string]any{"canonical_commit": canonicalCommit},
+		nil,
+		defaultTerminalRetrySchedule,
+	)
+}
+
+func (c *Client) FailWorkflowIntegration(ctx context.Context, eventID, message string, retryable bool) error {
+	return c.postJSONWithRetry(
+		ctx,
+		fmt.Sprintf("/api/daemon/workflow-integrations/%s/fail", eventID),
+		map[string]any{"error": message, "retryable": retryable},
+		nil,
+		defaultTerminalRetrySchedule,
+	)
 }
 
 func (c *Client) ReportTaskUsage(ctx context.Context, taskID string, usage []TaskUsageEntry) error {
