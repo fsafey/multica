@@ -165,6 +165,103 @@ SELECT * FROM workflow_node_attempt
 WHERE node_id = @node_id
 ORDER BY claim_epoch ASC;
 
+-- name: GetWorkflowRunMetrics :one
+WITH node_metrics AS (
+    SELECT
+        count(*)::int AS total_nodes,
+        count(*) FILTER (WHERE state = 'completed')::int AS completed_nodes,
+        count(*) FILTER (WHERE state = 'waiting_human')::int AS waiting_human_nodes,
+        count(*) FILTER (WHERE state IN ('blocked', 'failed'))::int AS blocked_nodes
+    FROM workflow_node n
+    WHERE n.run_id = sqlc.arg(workflow_run_id)
+),
+attempt_metrics AS (
+    SELECT
+        count(*)::int AS attempt_count,
+        count(*) FILTER (
+            WHERE a.preferred_daemon_at_claim IS NOT NULL
+              AND a.daemon_id = a.preferred_daemon_at_claim
+        )::int AS affinity_retained_attempts,
+        count(*) FILTER (WHERE a.affinity_stolen)::int AS stolen_attempts,
+        count(*) FILTER (
+            WHERE t.session_id IS NOT NULL
+              AND EXISTS (
+                  SELECT 1
+                  FROM agent_task_queue prior
+                  WHERE prior.id <> t.id
+                    AND prior.created_at < t.created_at
+                    AND prior.agent_id = t.agent_id
+                    AND prior.issue_id = t.issue_id
+                    AND prior.runtime_id = t.runtime_id
+                    AND prior.workflow_input_digest IS NOT DISTINCT FROM t.workflow_input_digest
+                    AND prior.workflow_law_digest IS NOT DISTINCT FROM t.workflow_law_digest
+                    AND prior.session_id = t.session_id
+                    AND prior.status = 'completed'
+              )
+        )::int AS session_resume_count
+    FROM workflow_node_attempt a
+    JOIN workflow_node n ON n.id = a.node_id
+    LEFT JOIN agent_task_queue t ON t.id = a.task_id
+    WHERE n.run_id = sqlc.arg(workflow_run_id)
+),
+result_metrics AS (
+    SELECT
+        count(*)::int AS accepted_result_count,
+        COALESCE(
+            avg(EXTRACT(EPOCH FROM (r.accepted_at - a.claimed_at))),
+            0
+        )::double precision AS avg_node_latency_seconds
+    FROM workflow_node_result r
+    JOIN workflow_node n ON n.id = r.node_id
+    JOIN workflow_node_attempt a ON a.id = r.attempt_id
+    WHERE n.run_id = sqlc.arg(workflow_run_id)
+),
+usage_metrics AS (
+    SELECT
+        COALESCE(sum(tu.input_tokens), 0)::bigint AS input_tokens,
+        COALESCE(sum(tu.output_tokens), 0)::bigint AS output_tokens,
+        COALESCE(sum(tu.cache_read_tokens), 0)::bigint AS cache_read_tokens,
+        COALESCE(sum(tu.cache_write_tokens), 0)::bigint AS cache_write_tokens
+    FROM task_usage tu
+    JOIN agent_task_queue t ON t.id = tu.task_id
+    JOIN workflow_node n ON n.id = t.workflow_node_id
+    WHERE n.run_id = sqlc.arg(workflow_run_id)
+)
+SELECT
+    node_metrics.*,
+    attempt_metrics.*,
+    result_metrics.*,
+    usage_metrics.*,
+    CAST(CASE
+        WHEN (
+            usage_metrics.input_tokens
+            + usage_metrics.cache_read_tokens
+            + usage_metrics.cache_write_tokens
+        ) = 0 THEN 0::double precision
+        ELSE usage_metrics.cache_read_tokens::double precision / (
+            usage_metrics.input_tokens
+            + usage_metrics.cache_read_tokens
+            + usage_metrics.cache_write_tokens
+        )::double precision
+    END AS double precision) AS cached_input_token_ratio
+FROM node_metrics, attempt_metrics, result_metrics, usage_metrics;
+
+-- name: ListWorkflowRunUsageByModel :many
+SELECT
+    lower(tu.provider) AS provider,
+    tu.model,
+    sum(tu.input_tokens)::bigint AS input_tokens,
+    sum(tu.output_tokens)::bigint AS output_tokens,
+    sum(tu.cache_read_tokens)::bigint AS cache_read_tokens,
+    sum(tu.cache_write_tokens)::bigint AS cache_write_tokens,
+    count(DISTINCT tu.task_id)::int AS task_count
+FROM task_usage tu
+JOIN agent_task_queue t ON t.id = tu.task_id
+JOIN workflow_node n ON n.id = t.workflow_node_id
+WHERE n.run_id = sqlc.arg(workflow_run_id)
+GROUP BY lower(tu.provider), tu.model
+ORDER BY lower(tu.provider), tu.model;
+
 -- name: IsWorkflowManagedIssue :one
 SELECT EXISTS (
     SELECT 1
@@ -301,10 +398,14 @@ RETURNING *;
 
 -- name: CreateWorkflowNodeAttempt :one
 INSERT INTO workflow_node_attempt (
-    id, node_id, claim_epoch, runtime_id, daemon_id, status, lease_expires_at
+    id, node_id, claim_epoch, runtime_id, daemon_id,
+    preferred_daemon_at_claim, affinity_stolen, status, lease_expires_at
 )
 VALUES (
-    @id, @node_id, @claim_epoch, @runtime_id, @daemon_id, 'claimed',
+    @id, @node_id, @claim_epoch, @runtime_id, @daemon_id,
+    sqlc.narg(preferred_daemon_at_claim),
+    COALESCE(sqlc.narg(affinity_stolen)::boolean, FALSE),
+    'claimed',
     now() + make_interval(secs => @lease_seconds::double precision)
 )
 RETURNING *;
@@ -745,6 +846,37 @@ WITH candidate AS (
       AND rp.enabled = TRUE
       AND n.state = 'submitted'
       AND a.status = 'submitted'
+      AND (
+          SELECT count(*)
+          FROM workflow_outbox active_outbox
+          JOIN workflow_node active_node ON active_node.id = active_outbox.node_id
+          JOIN workflow_run active_run ON active_run.id = active_node.run_id
+          WHERE active_outbox.status = 'processing'
+            AND active_outbox.event_type IN (
+                'workflow.artifact_submitted',
+                'workflow.deterministic_ready'
+            )
+            AND active_run.integration_pool_id = wr.integration_pool_id
+      ) < rp.max_inflight
+      AND NOT EXISTS (
+          SELECT 1
+          FROM workflow_outbox active_outbox
+          JOIN workflow_node active_node ON active_node.id = active_outbox.node_id
+          JOIN workflow_run active_run ON active_run.id = active_node.run_id
+          WHERE active_outbox.status = 'processing'
+            AND active_outbox.event_type IN (
+                'workflow.artifact_submitted',
+                'workflow.deterministic_ready'
+            )
+            AND active_run.project_id = wr.project_id
+            AND COALESCE(
+                active_run.metadata->>'book_slug',
+                active_run.id::text
+            ) = COALESCE(
+                wr.metadata->>'book_slug',
+                wr.id::text
+            )
+      )
     ORDER BY o.available_at ASC, o.created_at ASC
     LIMIT 1
     FOR UPDATE OF o SKIP LOCKED

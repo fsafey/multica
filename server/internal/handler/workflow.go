@@ -337,7 +337,22 @@ func (h *Handler) GetWorkflowRun(w http.ResponseWriter, r *http.Request) {
 			Result:       result,
 		})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"run": run, "nodes": inspected})
+	metrics, err := h.Queries.GetWorkflowRunMetrics(r.Context(), run.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load workflow metrics")
+		return
+	}
+	usageByModel, err := h.Queries.ListWorkflowRunUsageByModel(r.Context(), run.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load workflow usage")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"run":            run,
+		"nodes":          inspected,
+		"metrics":        metrics,
+		"usage_by_model": usageByModel,
+	})
 }
 
 func (h *Handler) CompleteWorkflowGate(w http.ResponseWriter, r *http.Request) {

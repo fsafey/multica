@@ -100,6 +100,8 @@ CREATE TABLE IF NOT EXISTS workflow_node_attempt (
     task_id UUID,
     runtime_id UUID,
     daemon_id TEXT NOT NULL,
+    preferred_daemon_at_claim TEXT,
+    affinity_stolen BOOLEAN NOT NULL DEFAULT FALSE,
     status TEXT NOT NULL DEFAULT 'claimed'
         CHECK (status IN (
             'claimed', 'running', 'submitted', 'failed', 'expired',

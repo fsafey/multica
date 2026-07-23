@@ -106,7 +106,7 @@ SET task_id = $1
 WHERE id = $2
   AND node_id = $3
   AND task_id IS NULL
-RETURNING id, node_id, claim_epoch, task_id, runtime_id, daemon_id, status, lease_expires_at, base_commit, result_commit, artifact_key, artifact_digest, artifact_size, manifest, error, claimed_at, started_at, submitted_at, completed_at
+RETURNING id, node_id, claim_epoch, task_id, runtime_id, daemon_id, preferred_daemon_at_claim, affinity_stolen, status, lease_expires_at, base_commit, result_commit, artifact_key, artifact_digest, artifact_size, manifest, error, claimed_at, started_at, submitted_at, completed_at
 `
 
 type AttachTaskToWorkflowAttemptParams struct {
@@ -125,6 +125,8 @@ func (q *Queries) AttachTaskToWorkflowAttempt(ctx context.Context, arg AttachTas
 		&i.TaskID,
 		&i.RuntimeID,
 		&i.DaemonID,
+		&i.PreferredDaemonAtClaim,
+		&i.AffinityStolen,
 		&i.Status,
 		&i.LeaseExpiresAt,
 		&i.BaseCommit,
@@ -415,6 +417,37 @@ WITH candidate AS (
       AND rp.enabled = TRUE
       AND n.state = 'submitted'
       AND a.status = 'submitted'
+      AND (
+          SELECT count(*)
+          FROM workflow_outbox active_outbox
+          JOIN workflow_node active_node ON active_node.id = active_outbox.node_id
+          JOIN workflow_run active_run ON active_run.id = active_node.run_id
+          WHERE active_outbox.status = 'processing'
+            AND active_outbox.event_type IN (
+                'workflow.artifact_submitted',
+                'workflow.deterministic_ready'
+            )
+            AND active_run.integration_pool_id = wr.integration_pool_id
+      ) < rp.max_inflight
+      AND NOT EXISTS (
+          SELECT 1
+          FROM workflow_outbox active_outbox
+          JOIN workflow_node active_node ON active_node.id = active_outbox.node_id
+          JOIN workflow_run active_run ON active_run.id = active_node.run_id
+          WHERE active_outbox.status = 'processing'
+            AND active_outbox.event_type IN (
+                'workflow.artifact_submitted',
+                'workflow.deterministic_ready'
+            )
+            AND active_run.project_id = wr.project_id
+            AND COALESCE(
+                active_run.metadata->>'book_slug',
+                active_run.id::text
+            ) = COALESCE(
+                wr.metadata->>'book_slug',
+                wr.id::text
+            )
+      )
     ORDER BY o.available_at ASC, o.created_at ASC
     LIMIT 1
     FOR UPDATE OF o SKIP LOCKED
@@ -945,7 +978,7 @@ VALUES (
     now() + make_interval(secs => $6::double precision),
     $7, $8, now(), now()
 )
-RETURNING id, node_id, claim_epoch, task_id, runtime_id, daemon_id, status, lease_expires_at, base_commit, result_commit, artifact_key, artifact_digest, artifact_size, manifest, error, claimed_at, started_at, submitted_at, completed_at
+RETURNING id, node_id, claim_epoch, task_id, runtime_id, daemon_id, preferred_daemon_at_claim, affinity_stolen, status, lease_expires_at, base_commit, result_commit, artifact_key, artifact_digest, artifact_size, manifest, error, claimed_at, started_at, submitted_at, completed_at
 `
 
 type CreateDeterministicWorkflowNodeAttemptParams struct {
@@ -978,6 +1011,8 @@ func (q *Queries) CreateDeterministicWorkflowNodeAttempt(ctx context.Context, ar
 		&i.TaskID,
 		&i.RuntimeID,
 		&i.DaemonID,
+		&i.PreferredDaemonAtClaim,
+		&i.AffinityStolen,
 		&i.Status,
 		&i.LeaseExpiresAt,
 		&i.BaseCommit,
@@ -1006,7 +1041,7 @@ VALUES (
     now(), $4, $4, $5,
     $6, now(), now(), now(), now()
 )
-RETURNING id, node_id, claim_epoch, task_id, runtime_id, daemon_id, status, lease_expires_at, base_commit, result_commit, artifact_key, artifact_digest, artifact_size, manifest, error, claimed_at, started_at, submitted_at, completed_at
+RETURNING id, node_id, claim_epoch, task_id, runtime_id, daemon_id, preferred_daemon_at_claim, affinity_stolen, status, lease_expires_at, base_commit, result_commit, artifact_key, artifact_digest, artifact_size, manifest, error, claimed_at, started_at, submitted_at, completed_at
 `
 
 type CreateImportedWorkflowNodeAttemptParams struct {
@@ -1035,6 +1070,8 @@ func (q *Queries) CreateImportedWorkflowNodeAttempt(ctx context.Context, arg Cre
 		&i.TaskID,
 		&i.RuntimeID,
 		&i.DaemonID,
+		&i.PreferredDaemonAtClaim,
+		&i.AffinityStolen,
 		&i.Status,
 		&i.LeaseExpiresAt,
 		&i.BaseCommit,
@@ -1361,22 +1398,28 @@ func (q *Queries) CreateWorkflowNode(ctx context.Context, arg CreateWorkflowNode
 
 const createWorkflowNodeAttempt = `-- name: CreateWorkflowNodeAttempt :one
 INSERT INTO workflow_node_attempt (
-    id, node_id, claim_epoch, runtime_id, daemon_id, status, lease_expires_at
+    id, node_id, claim_epoch, runtime_id, daemon_id,
+    preferred_daemon_at_claim, affinity_stolen, status, lease_expires_at
 )
 VALUES (
-    $1, $2, $3, $4, $5, 'claimed',
-    now() + make_interval(secs => $6::double precision)
+    $1, $2, $3, $4, $5,
+    $6,
+    COALESCE($7::boolean, FALSE),
+    'claimed',
+    now() + make_interval(secs => $8::double precision)
 )
-RETURNING id, node_id, claim_epoch, task_id, runtime_id, daemon_id, status, lease_expires_at, base_commit, result_commit, artifact_key, artifact_digest, artifact_size, manifest, error, claimed_at, started_at, submitted_at, completed_at
+RETURNING id, node_id, claim_epoch, task_id, runtime_id, daemon_id, preferred_daemon_at_claim, affinity_stolen, status, lease_expires_at, base_commit, result_commit, artifact_key, artifact_digest, artifact_size, manifest, error, claimed_at, started_at, submitted_at, completed_at
 `
 
 type CreateWorkflowNodeAttemptParams struct {
-	ID           pgtype.UUID `json:"id"`
-	NodeID       pgtype.UUID `json:"node_id"`
-	ClaimEpoch   int64       `json:"claim_epoch"`
-	RuntimeID    pgtype.UUID `json:"runtime_id"`
-	DaemonID     string      `json:"daemon_id"`
-	LeaseSeconds float64     `json:"lease_seconds"`
+	ID                     pgtype.UUID `json:"id"`
+	NodeID                 pgtype.UUID `json:"node_id"`
+	ClaimEpoch             int64       `json:"claim_epoch"`
+	RuntimeID              pgtype.UUID `json:"runtime_id"`
+	DaemonID               string      `json:"daemon_id"`
+	PreferredDaemonAtClaim pgtype.Text `json:"preferred_daemon_at_claim"`
+	AffinityStolen         pgtype.Bool `json:"affinity_stolen"`
+	LeaseSeconds           float64     `json:"lease_seconds"`
 }
 
 func (q *Queries) CreateWorkflowNodeAttempt(ctx context.Context, arg CreateWorkflowNodeAttemptParams) (WorkflowNodeAttempt, error) {
@@ -1386,6 +1429,8 @@ func (q *Queries) CreateWorkflowNodeAttempt(ctx context.Context, arg CreateWorkf
 		arg.ClaimEpoch,
 		arg.RuntimeID,
 		arg.DaemonID,
+		arg.PreferredDaemonAtClaim,
+		arg.AffinityStolen,
 		arg.LeaseSeconds,
 	)
 	var i WorkflowNodeAttempt
@@ -1396,6 +1441,8 @@ func (q *Queries) CreateWorkflowNodeAttempt(ctx context.Context, arg CreateWorkf
 		&i.TaskID,
 		&i.RuntimeID,
 		&i.DaemonID,
+		&i.PreferredDaemonAtClaim,
+		&i.AffinityStolen,
 		&i.Status,
 		&i.LeaseExpiresAt,
 		&i.BaseCommit,
@@ -1571,7 +1618,7 @@ SET status = $1,
 WHERE id = $3
   AND claim_epoch = $4
   AND status IN ('claimed', 'running')
-RETURNING id, node_id, claim_epoch, task_id, runtime_id, daemon_id, status, lease_expires_at, base_commit, result_commit, artifact_key, artifact_digest, artifact_size, manifest, error, claimed_at, started_at, submitted_at, completed_at
+RETURNING id, node_id, claim_epoch, task_id, runtime_id, daemon_id, preferred_daemon_at_claim, affinity_stolen, status, lease_expires_at, base_commit, result_commit, artifact_key, artifact_digest, artifact_size, manifest, error, claimed_at, started_at, submitted_at, completed_at
 `
 
 type FailWorkflowAttemptParams struct {
@@ -1596,6 +1643,8 @@ func (q *Queries) FailWorkflowAttempt(ctx context.Context, arg FailWorkflowAttem
 		&i.TaskID,
 		&i.RuntimeID,
 		&i.DaemonID,
+		&i.PreferredDaemonAtClaim,
+		&i.AffinityStolen,
 		&i.Status,
 		&i.LeaseExpiresAt,
 		&i.BaseCommit,
@@ -1744,7 +1793,7 @@ func (q *Queries) GetRuntimePoolInWorkspace(ctx context.Context, arg GetRuntimeP
 }
 
 const getWorkflowAttemptByTask = `-- name: GetWorkflowAttemptByTask :one
-SELECT a.id, a.node_id, a.claim_epoch, a.task_id, a.runtime_id, a.daemon_id, a.status, a.lease_expires_at, a.base_commit, a.result_commit, a.artifact_key, a.artifact_digest, a.artifact_size, a.manifest, a.error, a.claimed_at, a.started_at, a.submitted_at, a.completed_at
+SELECT a.id, a.node_id, a.claim_epoch, a.task_id, a.runtime_id, a.daemon_id, a.preferred_daemon_at_claim, a.affinity_stolen, a.status, a.lease_expires_at, a.base_commit, a.result_commit, a.artifact_key, a.artifact_digest, a.artifact_size, a.manifest, a.error, a.claimed_at, a.started_at, a.submitted_at, a.completed_at
 FROM workflow_node_attempt a
 WHERE a.task_id = $1
 `
@@ -1759,6 +1808,8 @@ func (q *Queries) GetWorkflowAttemptByTask(ctx context.Context, taskID pgtype.UU
 		&i.TaskID,
 		&i.RuntimeID,
 		&i.DaemonID,
+		&i.PreferredDaemonAtClaim,
+		&i.AffinityStolen,
 		&i.Status,
 		&i.LeaseExpiresAt,
 		&i.BaseCommit,
@@ -2065,9 +2116,132 @@ func (q *Queries) GetWorkflowRunInWorkspace(ctx context.Context, arg GetWorkflow
 	return i, err
 }
 
+const getWorkflowRunMetrics = `-- name: GetWorkflowRunMetrics :one
+WITH node_metrics AS (
+    SELECT
+        count(*)::int AS total_nodes,
+        count(*) FILTER (WHERE state = 'completed')::int AS completed_nodes,
+        count(*) FILTER (WHERE state = 'waiting_human')::int AS waiting_human_nodes,
+        count(*) FILTER (WHERE state IN ('blocked', 'failed'))::int AS blocked_nodes
+    FROM workflow_node n
+    WHERE n.run_id = $1
+),
+attempt_metrics AS (
+    SELECT
+        count(*)::int AS attempt_count,
+        count(*) FILTER (
+            WHERE a.preferred_daemon_at_claim IS NOT NULL
+              AND a.daemon_id = a.preferred_daemon_at_claim
+        )::int AS affinity_retained_attempts,
+        count(*) FILTER (WHERE a.affinity_stolen)::int AS stolen_attempts,
+        count(*) FILTER (
+            WHERE t.session_id IS NOT NULL
+              AND EXISTS (
+                  SELECT 1
+                  FROM agent_task_queue prior
+                  WHERE prior.id <> t.id
+                    AND prior.created_at < t.created_at
+                    AND prior.agent_id = t.agent_id
+                    AND prior.issue_id = t.issue_id
+                    AND prior.runtime_id = t.runtime_id
+                    AND prior.workflow_input_digest IS NOT DISTINCT FROM t.workflow_input_digest
+                    AND prior.workflow_law_digest IS NOT DISTINCT FROM t.workflow_law_digest
+                    AND prior.session_id = t.session_id
+                    AND prior.status = 'completed'
+              )
+        )::int AS session_resume_count
+    FROM workflow_node_attempt a
+    JOIN workflow_node n ON n.id = a.node_id
+    LEFT JOIN agent_task_queue t ON t.id = a.task_id
+    WHERE n.run_id = $1
+),
+result_metrics AS (
+    SELECT
+        count(*)::int AS accepted_result_count,
+        COALESCE(
+            avg(EXTRACT(EPOCH FROM (r.accepted_at - a.claimed_at))),
+            0
+        )::double precision AS avg_node_latency_seconds
+    FROM workflow_node_result r
+    JOIN workflow_node n ON n.id = r.node_id
+    JOIN workflow_node_attempt a ON a.id = r.attempt_id
+    WHERE n.run_id = $1
+),
+usage_metrics AS (
+    SELECT
+        COALESCE(sum(tu.input_tokens), 0)::bigint AS input_tokens,
+        COALESCE(sum(tu.output_tokens), 0)::bigint AS output_tokens,
+        COALESCE(sum(tu.cache_read_tokens), 0)::bigint AS cache_read_tokens,
+        COALESCE(sum(tu.cache_write_tokens), 0)::bigint AS cache_write_tokens
+    FROM task_usage tu
+    JOIN agent_task_queue t ON t.id = tu.task_id
+    JOIN workflow_node n ON n.id = t.workflow_node_id
+    WHERE n.run_id = $1
+)
+SELECT
+    node_metrics.total_nodes, node_metrics.completed_nodes, node_metrics.waiting_human_nodes, node_metrics.blocked_nodes,
+    attempt_metrics.attempt_count, attempt_metrics.affinity_retained_attempts, attempt_metrics.stolen_attempts, attempt_metrics.session_resume_count,
+    result_metrics.accepted_result_count, result_metrics.avg_node_latency_seconds,
+    usage_metrics.input_tokens, usage_metrics.output_tokens, usage_metrics.cache_read_tokens, usage_metrics.cache_write_tokens,
+    CAST(CASE
+        WHEN (
+            usage_metrics.input_tokens
+            + usage_metrics.cache_read_tokens
+            + usage_metrics.cache_write_tokens
+        ) = 0 THEN 0::double precision
+        ELSE usage_metrics.cache_read_tokens::double precision / (
+            usage_metrics.input_tokens
+            + usage_metrics.cache_read_tokens
+            + usage_metrics.cache_write_tokens
+        )::double precision
+    END AS double precision) AS cached_input_token_ratio
+FROM node_metrics, attempt_metrics, result_metrics, usage_metrics
+`
+
+type GetWorkflowRunMetricsRow struct {
+	TotalNodes               int32   `json:"total_nodes"`
+	CompletedNodes           int32   `json:"completed_nodes"`
+	WaitingHumanNodes        int32   `json:"waiting_human_nodes"`
+	BlockedNodes             int32   `json:"blocked_nodes"`
+	AttemptCount             int32   `json:"attempt_count"`
+	AffinityRetainedAttempts int32   `json:"affinity_retained_attempts"`
+	StolenAttempts           int32   `json:"stolen_attempts"`
+	SessionResumeCount       int32   `json:"session_resume_count"`
+	AcceptedResultCount      int32   `json:"accepted_result_count"`
+	AvgNodeLatencySeconds    float64 `json:"avg_node_latency_seconds"`
+	InputTokens              int64   `json:"input_tokens"`
+	OutputTokens             int64   `json:"output_tokens"`
+	CacheReadTokens          int64   `json:"cache_read_tokens"`
+	CacheWriteTokens         int64   `json:"cache_write_tokens"`
+	CachedInputTokenRatio    float64 `json:"cached_input_token_ratio"`
+}
+
+func (q *Queries) GetWorkflowRunMetrics(ctx context.Context, workflowRunID pgtype.UUID) (GetWorkflowRunMetricsRow, error) {
+	row := q.db.QueryRow(ctx, getWorkflowRunMetrics, workflowRunID)
+	var i GetWorkflowRunMetricsRow
+	err := row.Scan(
+		&i.TotalNodes,
+		&i.CompletedNodes,
+		&i.WaitingHumanNodes,
+		&i.BlockedNodes,
+		&i.AttemptCount,
+		&i.AffinityRetainedAttempts,
+		&i.StolenAttempts,
+		&i.SessionResumeCount,
+		&i.AcceptedResultCount,
+		&i.AvgNodeLatencySeconds,
+		&i.InputTokens,
+		&i.OutputTokens,
+		&i.CacheReadTokens,
+		&i.CacheWriteTokens,
+		&i.CachedInputTokenRatio,
+	)
+	return i, err
+}
+
 const getWorkflowTaskLeaseContext = `-- name: GetWorkflowTaskLeaseContext :one
 SELECT
-    a.id, a.node_id, a.claim_epoch, a.task_id, a.runtime_id, a.daemon_id, a.status, a.lease_expires_at, a.base_commit, a.result_commit, a.artifact_key, a.artifact_digest, a.artifact_size, a.manifest, a.error, a.claimed_at, a.started_at, a.submitted_at, a.completed_at,
+    a.id, a.node_id, a.claim_epoch, a.task_id, a.runtime_id, a.daemon_id, a.preferred_daemon_at_claim, a.affinity_stolen, a.status, a.lease_expires_at, a.base_commit, a.result_commit, a.artifact_key, a.artifact_digest, a.artifact_size, a.manifest, a.error, a.claimed_at, a.started_at, a.submitted_at, a.completed_at,
     n.run_id,
     n.state AS node_state,
     rp.lease_seconds
@@ -2078,28 +2252,30 @@ WHERE a.task_id = $1
 `
 
 type GetWorkflowTaskLeaseContextRow struct {
-	ID             pgtype.UUID        `json:"id"`
-	NodeID         pgtype.UUID        `json:"node_id"`
-	ClaimEpoch     int64              `json:"claim_epoch"`
-	TaskID         pgtype.UUID        `json:"task_id"`
-	RuntimeID      pgtype.UUID        `json:"runtime_id"`
-	DaemonID       string             `json:"daemon_id"`
-	Status         string             `json:"status"`
-	LeaseExpiresAt pgtype.Timestamptz `json:"lease_expires_at"`
-	BaseCommit     pgtype.Text        `json:"base_commit"`
-	ResultCommit   pgtype.Text        `json:"result_commit"`
-	ArtifactKey    pgtype.Text        `json:"artifact_key"`
-	ArtifactDigest pgtype.Text        `json:"artifact_digest"`
-	ArtifactSize   pgtype.Int8        `json:"artifact_size"`
-	Manifest       []byte             `json:"manifest"`
-	Error          pgtype.Text        `json:"error"`
-	ClaimedAt      pgtype.Timestamptz `json:"claimed_at"`
-	StartedAt      pgtype.Timestamptz `json:"started_at"`
-	SubmittedAt    pgtype.Timestamptz `json:"submitted_at"`
-	CompletedAt    pgtype.Timestamptz `json:"completed_at"`
-	RunID          pgtype.UUID        `json:"run_id"`
-	NodeState      string             `json:"node_state"`
-	LeaseSeconds   int32              `json:"lease_seconds"`
+	ID                     pgtype.UUID        `json:"id"`
+	NodeID                 pgtype.UUID        `json:"node_id"`
+	ClaimEpoch             int64              `json:"claim_epoch"`
+	TaskID                 pgtype.UUID        `json:"task_id"`
+	RuntimeID              pgtype.UUID        `json:"runtime_id"`
+	DaemonID               string             `json:"daemon_id"`
+	PreferredDaemonAtClaim pgtype.Text        `json:"preferred_daemon_at_claim"`
+	AffinityStolen         bool               `json:"affinity_stolen"`
+	Status                 string             `json:"status"`
+	LeaseExpiresAt         pgtype.Timestamptz `json:"lease_expires_at"`
+	BaseCommit             pgtype.Text        `json:"base_commit"`
+	ResultCommit           pgtype.Text        `json:"result_commit"`
+	ArtifactKey            pgtype.Text        `json:"artifact_key"`
+	ArtifactDigest         pgtype.Text        `json:"artifact_digest"`
+	ArtifactSize           pgtype.Int8        `json:"artifact_size"`
+	Manifest               []byte             `json:"manifest"`
+	Error                  pgtype.Text        `json:"error"`
+	ClaimedAt              pgtype.Timestamptz `json:"claimed_at"`
+	StartedAt              pgtype.Timestamptz `json:"started_at"`
+	SubmittedAt            pgtype.Timestamptz `json:"submitted_at"`
+	CompletedAt            pgtype.Timestamptz `json:"completed_at"`
+	RunID                  pgtype.UUID        `json:"run_id"`
+	NodeState              string             `json:"node_state"`
+	LeaseSeconds           int32              `json:"lease_seconds"`
 }
 
 func (q *Queries) GetWorkflowTaskLeaseContext(ctx context.Context, taskID pgtype.UUID) (GetWorkflowTaskLeaseContextRow, error) {
@@ -2112,6 +2288,8 @@ func (q *Queries) GetWorkflowTaskLeaseContext(ctx context.Context, taskID pgtype
 		&i.TaskID,
 		&i.RuntimeID,
 		&i.DaemonID,
+		&i.PreferredDaemonAtClaim,
+		&i.AffinityStolen,
 		&i.Status,
 		&i.LeaseExpiresAt,
 		&i.BaseCommit,
@@ -2306,7 +2484,7 @@ func (q *Queries) ListAgentRuntimePools(ctx context.Context, arg ListAgentRuntim
 }
 
 const listExpiredWorkflowAttempts = `-- name: ListExpiredWorkflowAttempts :many
-SELECT a.id, a.node_id, a.claim_epoch, a.task_id, a.runtime_id, a.daemon_id, a.status, a.lease_expires_at, a.base_commit, a.result_commit, a.artifact_key, a.artifact_digest, a.artifact_size, a.manifest, a.error, a.claimed_at, a.started_at, a.submitted_at, a.completed_at
+SELECT a.id, a.node_id, a.claim_epoch, a.task_id, a.runtime_id, a.daemon_id, a.preferred_daemon_at_claim, a.affinity_stolen, a.status, a.lease_expires_at, a.base_commit, a.result_commit, a.artifact_key, a.artifact_digest, a.artifact_size, a.manifest, a.error, a.claimed_at, a.started_at, a.submitted_at, a.completed_at
 FROM workflow_node_attempt a
 JOIN workflow_node n ON n.current_attempt_id = a.id
 JOIN workflow_run r ON r.id = n.run_id
@@ -2335,6 +2513,8 @@ func (q *Queries) ListExpiredWorkflowAttempts(ctx context.Context, maxAttempts i
 			&i.TaskID,
 			&i.RuntimeID,
 			&i.DaemonID,
+			&i.PreferredDaemonAtClaim,
+			&i.AffinityStolen,
 			&i.Status,
 			&i.LeaseExpiresAt,
 			&i.BaseCommit,
@@ -2437,7 +2617,7 @@ func (q *Queries) ListRuntimePools(ctx context.Context, workspaceID pgtype.UUID)
 }
 
 const listWorkflowNodeAttempts = `-- name: ListWorkflowNodeAttempts :many
-SELECT id, node_id, claim_epoch, task_id, runtime_id, daemon_id, status, lease_expires_at, base_commit, result_commit, artifact_key, artifact_digest, artifact_size, manifest, error, claimed_at, started_at, submitted_at, completed_at FROM workflow_node_attempt
+SELECT id, node_id, claim_epoch, task_id, runtime_id, daemon_id, preferred_daemon_at_claim, affinity_stolen, status, lease_expires_at, base_commit, result_commit, artifact_key, artifact_digest, artifact_size, manifest, error, claimed_at, started_at, submitted_at, completed_at FROM workflow_node_attempt
 WHERE node_id = $1
 ORDER BY claim_epoch ASC
 `
@@ -2458,6 +2638,8 @@ func (q *Queries) ListWorkflowNodeAttempts(ctx context.Context, nodeID pgtype.UU
 			&i.TaskID,
 			&i.RuntimeID,
 			&i.DaemonID,
+			&i.PreferredDaemonAtClaim,
+			&i.AffinityStolen,
 			&i.Status,
 			&i.LeaseExpiresAt,
 			&i.BaseCommit,
@@ -2627,6 +2809,61 @@ func (q *Queries) ListWorkflowNodes(ctx context.Context, runID pgtype.UUID) ([]W
 	return items, nil
 }
 
+const listWorkflowRunUsageByModel = `-- name: ListWorkflowRunUsageByModel :many
+SELECT
+    lower(tu.provider) AS provider,
+    tu.model,
+    sum(tu.input_tokens)::bigint AS input_tokens,
+    sum(tu.output_tokens)::bigint AS output_tokens,
+    sum(tu.cache_read_tokens)::bigint AS cache_read_tokens,
+    sum(tu.cache_write_tokens)::bigint AS cache_write_tokens,
+    count(DISTINCT tu.task_id)::int AS task_count
+FROM task_usage tu
+JOIN agent_task_queue t ON t.id = tu.task_id
+JOIN workflow_node n ON n.id = t.workflow_node_id
+WHERE n.run_id = $1
+GROUP BY lower(tu.provider), tu.model
+ORDER BY lower(tu.provider), tu.model
+`
+
+type ListWorkflowRunUsageByModelRow struct {
+	Provider         string `json:"provider"`
+	Model            string `json:"model"`
+	InputTokens      int64  `json:"input_tokens"`
+	OutputTokens     int64  `json:"output_tokens"`
+	CacheReadTokens  int64  `json:"cache_read_tokens"`
+	CacheWriteTokens int64  `json:"cache_write_tokens"`
+	TaskCount        int32  `json:"task_count"`
+}
+
+func (q *Queries) ListWorkflowRunUsageByModel(ctx context.Context, workflowRunID pgtype.UUID) ([]ListWorkflowRunUsageByModelRow, error) {
+	rows, err := q.db.Query(ctx, listWorkflowRunUsageByModel, workflowRunID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListWorkflowRunUsageByModelRow{}
+	for rows.Next() {
+		var i ListWorkflowRunUsageByModelRow
+		if err := rows.Scan(
+			&i.Provider,
+			&i.Model,
+			&i.InputTokens,
+			&i.OutputTokens,
+			&i.CacheReadTokens,
+			&i.CacheWriteTokens,
+			&i.TaskCount,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listWorkflowRuns = `-- name: ListWorkflowRuns :many
 SELECT id, workspace_id, project_id, anchor_issue_id, graph_key, graph_version, status, integration_pool_id, wip_limit, human_gate_limit, input_digest, law_digest, metadata, created_by, created_at, updated_at, completed_at FROM workflow_run
 WHERE workspace_id = $1
@@ -2677,7 +2914,7 @@ SET status = 'integrated', completed_at = now()
 WHERE id = $1
   AND claim_epoch = $2
   AND status = 'submitted'
-RETURNING id, node_id, claim_epoch, task_id, runtime_id, daemon_id, status, lease_expires_at, base_commit, result_commit, artifact_key, artifact_digest, artifact_size, manifest, error, claimed_at, started_at, submitted_at, completed_at
+RETURNING id, node_id, claim_epoch, task_id, runtime_id, daemon_id, preferred_daemon_at_claim, affinity_stolen, status, lease_expires_at, base_commit, result_commit, artifact_key, artifact_digest, artifact_size, manifest, error, claimed_at, started_at, submitted_at, completed_at
 `
 
 type MarkWorkflowAttemptIntegratedParams struct {
@@ -2695,6 +2932,8 @@ func (q *Queries) MarkWorkflowAttemptIntegrated(ctx context.Context, arg MarkWor
 		&i.TaskID,
 		&i.RuntimeID,
 		&i.DaemonID,
+		&i.PreferredDaemonAtClaim,
+		&i.AffinityStolen,
 		&i.Status,
 		&i.LeaseExpiresAt,
 		&i.BaseCommit,
@@ -2984,7 +3223,7 @@ WHERE a.task_id = $2
   AND a.claim_epoch = n.claim_epoch
   AND a.status IN ('claimed', 'running')
   AND n.state IN ('claimed', 'running')
-RETURNING a.id, a.node_id, a.claim_epoch, a.task_id, a.runtime_id, a.daemon_id, a.status, a.lease_expires_at, a.base_commit, a.result_commit, a.artifact_key, a.artifact_digest, a.artifact_size, a.manifest, a.error, a.claimed_at, a.started_at, a.submitted_at, a.completed_at
+RETURNING a.id, a.node_id, a.claim_epoch, a.task_id, a.runtime_id, a.daemon_id, a.preferred_daemon_at_claim, a.affinity_stolen, a.status, a.lease_expires_at, a.base_commit, a.result_commit, a.artifact_key, a.artifact_digest, a.artifact_size, a.manifest, a.error, a.claimed_at, a.started_at, a.submitted_at, a.completed_at
 `
 
 type RenewWorkflowAttemptLeaseParams struct {
@@ -3002,6 +3241,8 @@ func (q *Queries) RenewWorkflowAttemptLease(ctx context.Context, arg RenewWorkfl
 		&i.TaskID,
 		&i.RuntimeID,
 		&i.DaemonID,
+		&i.PreferredDaemonAtClaim,
+		&i.AffinityStolen,
 		&i.Status,
 		&i.LeaseExpiresAt,
 		&i.BaseCommit,
@@ -3638,7 +3879,7 @@ WHERE a.task_id = $2
   AND a.claim_epoch = n.claim_epoch
   AND a.status = 'claimed'
   AND n.state = 'claimed'
-RETURNING a.id, a.node_id, a.claim_epoch, a.task_id, a.runtime_id, a.daemon_id, a.status, a.lease_expires_at, a.base_commit, a.result_commit, a.artifact_key, a.artifact_digest, a.artifact_size, a.manifest, a.error, a.claimed_at, a.started_at, a.submitted_at, a.completed_at
+RETURNING a.id, a.node_id, a.claim_epoch, a.task_id, a.runtime_id, a.daemon_id, a.preferred_daemon_at_claim, a.affinity_stolen, a.status, a.lease_expires_at, a.base_commit, a.result_commit, a.artifact_key, a.artifact_digest, a.artifact_size, a.manifest, a.error, a.claimed_at, a.started_at, a.submitted_at, a.completed_at
 `
 
 type StartWorkflowAttemptByTaskParams struct {
@@ -3656,6 +3897,8 @@ func (q *Queries) StartWorkflowAttemptByTask(ctx context.Context, arg StartWorkf
 		&i.TaskID,
 		&i.RuntimeID,
 		&i.DaemonID,
+		&i.PreferredDaemonAtClaim,
+		&i.AffinityStolen,
 		&i.Status,
 		&i.LeaseExpiresAt,
 		&i.BaseCommit,
@@ -3692,7 +3935,7 @@ WHERE a.id = $7
   AND a.claim_epoch = n.claim_epoch
   AND a.status IN ('claimed', 'running')
   AND n.state IN ('claimed', 'running')
-RETURNING a.id, a.node_id, a.claim_epoch, a.task_id, a.runtime_id, a.daemon_id, a.status, a.lease_expires_at, a.base_commit, a.result_commit, a.artifact_key, a.artifact_digest, a.artifact_size, a.manifest, a.error, a.claimed_at, a.started_at, a.submitted_at, a.completed_at
+RETURNING a.id, a.node_id, a.claim_epoch, a.task_id, a.runtime_id, a.daemon_id, a.preferred_daemon_at_claim, a.affinity_stolen, a.status, a.lease_expires_at, a.base_commit, a.result_commit, a.artifact_key, a.artifact_digest, a.artifact_size, a.manifest, a.error, a.claimed_at, a.started_at, a.submitted_at, a.completed_at
 `
 
 type SubmitWorkflowAttemptArtifactParams struct {
@@ -3725,6 +3968,8 @@ func (q *Queries) SubmitWorkflowAttemptArtifact(ctx context.Context, arg SubmitW
 		&i.TaskID,
 		&i.RuntimeID,
 		&i.DaemonID,
+		&i.PreferredDaemonAtClaim,
+		&i.AffinityStolen,
 		&i.Status,
 		&i.LeaseExpiresAt,
 		&i.BaseCommit,

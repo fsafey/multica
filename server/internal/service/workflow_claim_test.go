@@ -144,15 +144,15 @@ func TestWorkflowClaimFiftyWorkersCreateOneAttempt(t *testing.T) {
 		cleanup := context.Background()
 		for _, statement := range []string{
 			`DELETE FROM workflow_outbox WHERE run_id = $1`,
-			`DELETE FROM workflow_resource_claim WHERE node_id = $1`,
-			`DELETE FROM workflow_node_result WHERE node_id = $1`,
-			`DELETE FROM workflow_node_attempt WHERE node_id = $1`,
-			`DELETE FROM workflow_node_resource WHERE node_id = $1`,
-			`DELETE FROM workflow_node_dependency WHERE node_id = $1 OR depends_on_node_id = $1`,
-			`DELETE FROM agent_task_queue WHERE workflow_node_id = $1`,
-			`DELETE FROM workflow_node WHERE id = $1`,
+			`DELETE FROM workflow_resource_claim WHERE node_id IN (SELECT id FROM workflow_node WHERE run_id = $1)`,
+			`DELETE FROM workflow_node_result WHERE node_id IN (SELECT id FROM workflow_node WHERE run_id = $1)`,
+			`DELETE FROM workflow_node_attempt WHERE node_id IN (SELECT id FROM workflow_node WHERE run_id = $1)`,
+			`DELETE FROM workflow_node_resource WHERE node_id IN (SELECT id FROM workflow_node WHERE run_id = $1)`,
+			`DELETE FROM workflow_node_dependency WHERE node_id IN (SELECT id FROM workflow_node WHERE run_id = $1) OR depends_on_node_id IN (SELECT id FROM workflow_node WHERE run_id = $1)`,
+			`DELETE FROM agent_task_queue WHERE workflow_node_id IN (SELECT id FROM workflow_node WHERE run_id = $1)`,
+			`DELETE FROM workflow_node WHERE run_id = $1`,
 		} {
-			_, _ = pool.Exec(cleanup, statement, nodeID)
+			_, _ = pool.Exec(cleanup, statement, runID)
 		}
 		_, _ = pool.Exec(cleanup, `DELETE FROM workflow_run WHERE id = $1`, runID)
 		_, _ = pool.Exec(cleanup, `DELETE FROM agent_runtime_pool WHERE agent_id = $1`, agentID)
@@ -217,5 +217,128 @@ func TestWorkflowClaimFiftyWorkersCreateOneAttempt(t *testing.T) {
 	}
 	if attempts != 1 || claims != 1 || tasks != 1 {
 		t.Fatalf("attempts=%d claims=%d tasks=%d, want 1 each", attempts, claims, tasks)
+	}
+	var preferredAtClaim *string
+	var affinityStolen bool
+	if err := pool.QueryRow(ctx, `
+		SELECT preferred_daemon_at_claim, affinity_stolen
+		FROM workflow_node_attempt
+		WHERE node_id = $1
+	`, nodeID).Scan(&preferredAtClaim, &affinityStolen); err != nil {
+		t.Fatalf("load affinity evidence: %v", err)
+	}
+	if preferredAtClaim == nil || *preferredAtClaim != "daemon-workflow" {
+		t.Fatalf("preferred daemon at claim = %v, want daemon-workflow", preferredAtClaim)
+	}
+	if affinityStolen {
+		t.Fatal("first claim was incorrectly recorded as stolen")
+	}
+
+	if _, err := pool.Exec(ctx, `
+		UPDATE runtime_pool SET max_inflight = 2 WHERE id = $1
+	`, runtimePoolID); err != nil {
+		t.Fatalf("raise integration pool capacity: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE workflow_node SET state = 'submitted' WHERE id = $1
+	`, nodeID); err != nil {
+		t.Fatalf("submit first node: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE workflow_node_attempt SET status = 'submitted' WHERE node_id = $1
+	`, nodeID); err != nil {
+		t.Fatalf("submit first attempt: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO workflow_outbox (run_id, node_id, event_type, payload)
+		VALUES ($1, $2, 'workflow.artifact_submitted', '{}'::jsonb)
+	`, runID, nodeID); err != nil {
+		t.Fatalf("enqueue first integration: %v", err)
+	}
+
+	var secondNodeID, secondAttemptID string
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO workflow_node (
+			run_id, issue_id, passage_key, node_key, executor_kind,
+			agent_id, runtime_pool_id, state, claim_epoch, ready_at,
+			output_contract
+		)
+		VALUES (
+			$1, $2, 'passage-2', 'node-2', 'agent',
+			$3, $4, 'submitted', 1, now(),
+			'{"allowed_paths":["pipeline-output/passage-2/node.md"]}'::jsonb
+		)
+		RETURNING id
+	`, runID, issueID, agentID, runtimePoolID).Scan(&secondNodeID); err != nil {
+		t.Fatalf("create second submitted node: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO workflow_node_attempt (
+			node_id, claim_epoch, runtime_id, daemon_id, status,
+			lease_expires_at, artifact_digest, manifest, submitted_at
+		)
+		VALUES (
+			$1, 1, $2, 'daemon-workflow', 'submitted',
+			now() + interval '90 seconds', 'sha256:test', '{}'::jsonb, now()
+		)
+		RETURNING id
+	`, secondNodeID, runtimeID).Scan(&secondAttemptID); err != nil {
+		t.Fatalf("create second submitted attempt: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE workflow_node SET current_attempt_id = $2 WHERE id = $1
+	`, secondNodeID, secondAttemptID); err != nil {
+		t.Fatalf("attach second submitted attempt: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO workflow_outbox (run_id, node_id, event_type, payload)
+		VALUES ($1, $2, 'workflow.artifact_submitted', '{}'::jsonb)
+	`, runID, secondNodeID); err != nil {
+		t.Fatalf("enqueue second integration: %v", err)
+	}
+
+	integrationJobs, err := service.ClaimIntegrationJobs(
+		ctx,
+		"daemon-workflow",
+		runtimes,
+		2,
+	)
+	if err != nil {
+		t.Fatalf("claim integration jobs: %v", err)
+	}
+	if len(integrationJobs) != 1 {
+		t.Fatalf("claimed %d integration jobs for one book, want 1", len(integrationJobs))
+	}
+	var pendingJobs, processingJobs int
+	if err := pool.QueryRow(ctx, `
+		SELECT
+			count(*) FILTER (WHERE status = 'pending'),
+			count(*) FILTER (WHERE status = 'processing')
+		FROM workflow_outbox
+		WHERE run_id = $1
+		  AND event_type = 'workflow.artifact_submitted'
+	`, runID).Scan(&pendingJobs, &processingJobs); err != nil {
+		t.Fatalf("count integration jobs: %v", err)
+	}
+	if pendingJobs != 1 || processingJobs != 1 {
+		t.Fatalf("integration jobs pending=%d processing=%d, want 1 each", pendingJobs, processingJobs)
+	}
+	metrics, err := db.New(pool).GetWorkflowRunMetrics(ctx, util.MustParseUUID(runID))
+	if err != nil {
+		t.Fatalf("load workflow run metrics: %v", err)
+	}
+	if metrics.TotalNodes != 2 || metrics.AttemptCount != 2 {
+		t.Fatalf(
+			"workflow metrics nodes=%d attempts=%d, want 2 each",
+			metrics.TotalNodes,
+			metrics.AttemptCount,
+		)
+	}
+	if metrics.AffinityRetainedAttempts != 1 || metrics.StolenAttempts != 0 {
+		t.Fatalf(
+			"workflow affinity metrics retained=%d stolen=%d, want 1 and 0",
+			metrics.AffinityRetainedAttempts,
+			metrics.StolenAttempts,
+		)
 	}
 }

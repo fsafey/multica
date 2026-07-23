@@ -1099,25 +1099,27 @@ type WorkflowNode struct {
 }
 
 type WorkflowNodeAttempt struct {
-	ID             pgtype.UUID        `json:"id"`
-	NodeID         pgtype.UUID        `json:"node_id"`
-	ClaimEpoch     int64              `json:"claim_epoch"`
-	TaskID         pgtype.UUID        `json:"task_id"`
-	RuntimeID      pgtype.UUID        `json:"runtime_id"`
-	DaemonID       string             `json:"daemon_id"`
-	Status         string             `json:"status"`
-	LeaseExpiresAt pgtype.Timestamptz `json:"lease_expires_at"`
-	BaseCommit     pgtype.Text        `json:"base_commit"`
-	ResultCommit   pgtype.Text        `json:"result_commit"`
-	ArtifactKey    pgtype.Text        `json:"artifact_key"`
-	ArtifactDigest pgtype.Text        `json:"artifact_digest"`
-	ArtifactSize   pgtype.Int8        `json:"artifact_size"`
-	Manifest       []byte             `json:"manifest"`
-	Error          pgtype.Text        `json:"error"`
-	ClaimedAt      pgtype.Timestamptz `json:"claimed_at"`
-	StartedAt      pgtype.Timestamptz `json:"started_at"`
-	SubmittedAt    pgtype.Timestamptz `json:"submitted_at"`
-	CompletedAt    pgtype.Timestamptz `json:"completed_at"`
+	ID                     pgtype.UUID        `json:"id"`
+	NodeID                 pgtype.UUID        `json:"node_id"`
+	ClaimEpoch             int64              `json:"claim_epoch"`
+	TaskID                 pgtype.UUID        `json:"task_id"`
+	RuntimeID              pgtype.UUID        `json:"runtime_id"`
+	DaemonID               string             `json:"daemon_id"`
+	PreferredDaemonAtClaim pgtype.Text        `json:"preferred_daemon_at_claim"`
+	AffinityStolen         bool               `json:"affinity_stolen"`
+	Status                 string             `json:"status"`
+	LeaseExpiresAt         pgtype.Timestamptz `json:"lease_expires_at"`
+	BaseCommit             pgtype.Text        `json:"base_commit"`
+	ResultCommit           pgtype.Text        `json:"result_commit"`
+	ArtifactKey            pgtype.Text        `json:"artifact_key"`
+	ArtifactDigest         pgtype.Text        `json:"artifact_digest"`
+	ArtifactSize           pgtype.Int8        `json:"artifact_size"`
+	Manifest               []byte             `json:"manifest"`
+	Error                  pgtype.Text        `json:"error"`
+	ClaimedAt              pgtype.Timestamptz `json:"claimed_at"`
+	StartedAt              pgtype.Timestamptz `json:"started_at"`
+	SubmittedAt            pgtype.Timestamptz `json:"submitted_at"`
+	CompletedAt            pgtype.Timestamptz `json:"completed_at"`
 }
 
 type WorkflowNodeDependency struct {

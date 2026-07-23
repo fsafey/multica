@@ -672,12 +672,21 @@ func (s *WorkflowService) MaterializeReadyAgentTasks(
 			if err != nil {
 				return fmt.Errorf("claim workflow node: %w", err)
 			}
+			preferredDaemonAtClaim := candidate.PreferredDaemonID
+			if !preferredDaemonAtClaim.Valid {
+				preferredDaemonAtClaim = optionalText(daemonID)
+			}
 			if _, err := qtx.CreateWorkflowNodeAttempt(ctx, db.CreateWorkflowNodeAttemptParams{
-				ID:           attemptID,
-				NodeID:       node.ID,
-				ClaimEpoch:   node.ClaimEpoch,
-				RuntimeID:    candidate.SelectedRuntimeID,
-				DaemonID:     daemonID,
+				ID:                     attemptID,
+				NodeID:                 node.ID,
+				ClaimEpoch:             node.ClaimEpoch,
+				RuntimeID:              candidate.SelectedRuntimeID,
+				DaemonID:               daemonID,
+				PreferredDaemonAtClaim: preferredDaemonAtClaim,
+				AffinityStolen: pgtype.Bool{
+					Bool:  candidate.PreferredDaemonID.Valid && candidate.PreferredDaemonID.String != daemonID,
+					Valid: true,
+				},
 				LeaseSeconds: float64(candidate.LeaseSeconds),
 			}); err != nil {
 				return fmt.Errorf("create workflow attempt: %w", err)
@@ -853,9 +862,20 @@ func (s *WorkflowService) ClaimIntegrationJobs(
 	}
 	jobs := make([]db.ClaimWorkflowIntegrationJobRow, 0, maxJobs)
 	for len(jobs) < maxJobs {
-		job, err := s.Queries.ClaimWorkflowIntegrationJob(ctx, db.ClaimWorkflowIntegrationJobParams{
-			RuntimeIds: runtimeIDs,
-			DaemonID:   optionalText(daemonID),
+		var job db.ClaimWorkflowIntegrationJobRow
+		err := s.runInTx(ctx, func(qtx *db.Queries) error {
+			if err := qtx.AcquireWorkflowClaimLock(ctx); err != nil {
+				return fmt.Errorf("acquire workflow integration claim lock: %w", err)
+			}
+			claimed, err := qtx.ClaimWorkflowIntegrationJob(ctx, db.ClaimWorkflowIntegrationJobParams{
+				RuntimeIds: runtimeIDs,
+				DaemonID:   optionalText(daemonID),
+			})
+			if err != nil {
+				return err
+			}
+			job = claimed
+			return nil
 		})
 		if errors.Is(err, pgx.ErrNoRows) {
 			break
