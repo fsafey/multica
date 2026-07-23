@@ -2946,6 +2946,7 @@ func workflowAttemptMatchesSubmission(
 		current.ResultCommit.String == resultCommit &&
 		current.ArtifactDigest.Valid &&
 		current.ArtifactDigest.String == digest &&
+		current.ArtifactKey.Valid &&
 		current.ArtifactSize.Valid &&
 		current.ArtifactSize.Int64 == artifactSize
 }
@@ -3052,8 +3053,16 @@ func (h *Handler) SubmitWorkflowBundle(w http.ResponseWriter, r *http.Request) {
 		Manifest:       manifestRaw,
 	})
 	if err != nil {
-		h.Storage.Delete(r.Context(), artifactKey)
 		current, currentErr := h.Queries.GetWorkflowAttemptByTask(r.Context(), task.ID)
+		// Preserve this upload when PostgreSQL committed the submission but the
+		// commit acknowledgement was lost. A different committed key means a
+		// concurrent request won, so this request can remove only its own
+		// request-unique object. On read failure, leak safely for storage GC
+		// rather than risk deleting the sole durable artifact.
+		if currentErr == nil &&
+			(!current.ArtifactKey.Valid || current.ArtifactKey.String != artifactKey) {
+			h.Storage.Delete(r.Context(), artifactKey)
+		}
 		if currentErr == nil && workflowAttemptMatchesSubmission(
 			current,
 			attempt.ID,
