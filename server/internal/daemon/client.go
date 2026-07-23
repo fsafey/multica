@@ -153,10 +153,18 @@ func NewClient(baseURL string) *Client {
 	return &Client{
 		baseURL:      baseURL,
 		client:       &http.Client{Timeout: 30 * time.Second, Transport: cloneDefaultTransport()},
-		bundleClient: &http.Client{},
+		bundleClient: &http.Client{Transport: cloneBundleTransport()},
 		platform:     "daemon",
 		os:           normalizeGOOS(runtime.GOOS),
 	}
+}
+
+func cloneBundleTransport() http.RoundTripper {
+	transport := cloneDefaultTransport()
+	if httpTransport, ok := transport.(*http.Transport); ok {
+		httpTransport.ExpectContinueTimeout = 15 * time.Second
+	}
+	return transport
 }
 
 func cloneDefaultTransport() http.RoundTripper {
@@ -491,31 +499,54 @@ func (c *Client) SubmitWorkflowBundle(
 		return err
 	}
 	path := fmt.Sprintf("/api/daemon/tasks/%s/workflow-bundle", taskID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, &body)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", writer.FormDataContentType())
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
-	}
-	c.setIdentityHeaders(req)
-	resp, err := c.bundleClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return &requestError{
-			Method:     http.MethodPost,
-			Path:       path,
-			StatusCode: resp.StatusCode,
-			Body:       strings.TrimSpace(string(data)),
+	contentType := writer.FormDataContentType()
+	encodedBody := body.Bytes()
+	var lastErr error
+	for attempt := 0; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			if lastErr != nil {
+				return lastErr
+			}
+			return err
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(encodedBody))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", contentType)
+		req.Header.Set("Expect", "100-continue")
+		if c.token != "" {
+			req.Header.Set("Authorization", "Bearer "+c.token)
+		}
+		c.setIdentityHeaders(req)
+		resp, err := c.bundleClient.Do(req)
+		if err == nil {
+			func() {
+				defer resp.Body.Close()
+				if resp.StatusCode >= 400 {
+					data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+					err = &requestError{
+						Method:     http.MethodPost,
+						Path:       path,
+						StatusCode: resp.StatusCode,
+						Body:       strings.TrimSpace(string(data)),
+					}
+					return
+				}
+				_, _ = io.Copy(io.Discard, resp.Body)
+			}()
+		}
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !isTransientError(err) || attempt >= len(workflowBundleSubmitRetrySchedule) {
+			return err
+		}
+		if sleepErr := retrySleep(ctx, workflowBundleSubmitRetrySchedule[attempt]); sleepErr != nil {
+			return err
 		}
 	}
-	_, _ = io.Copy(io.Discard, resp.Body)
-	return nil
 }
 
 func (c *Client) DownloadWorkflowIntegrationBundle(
@@ -1050,6 +1081,18 @@ var defaultTerminalRetrySchedule = []time.Duration{
 var skillBundleResolveRetrySchedule = []time.Duration{
 	500 * time.Millisecond,
 	2 * time.Second,
+}
+
+// workflowBundleSubmitRetrySchedule protects a completed, validated workflow
+// result from brief control-plane or storage outages. The submission endpoint
+// is idempotent for an active attempt: once it reaches submitted/integrated,
+// replay returns success without ingesting the artifact again. Reusing the
+// same encoded multipart body also keeps the bundle, manifest, and digest
+// identical across attempts.
+var workflowBundleSubmitRetrySchedule = []time.Duration{
+	1 * time.Second,
+	4 * time.Second,
+	16 * time.Second,
 }
 
 // executionEvidenceRetrySchedule matches the terminal-callback recovery budget.

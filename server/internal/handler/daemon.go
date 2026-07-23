@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/analytics"
 	"github.com/multica-ai/multica/server/internal/auth"
@@ -2913,6 +2914,42 @@ type workflowBundleManifest struct {
 	BundleSHA256 string   `json:"bundle_sha256"`
 }
 
+func workflowBundleArtifactKey(
+	workspaceID string,
+	manifest workflowBundleManifest,
+	digest string,
+) string {
+	return fmt.Sprintf(
+		"workflows/%s/%s/%s/%s-%s.bundle",
+		workspaceID,
+		manifest.RunID,
+		manifest.NodeID,
+		manifest.AttemptID,
+		digest,
+	)
+}
+
+func workflowAttemptMatchesSubmission(
+	current db.WorkflowNodeAttempt,
+	expectedAttemptID pgtype.UUID,
+	expectedClaimEpoch int64,
+	baseCommit, resultCommit, digest string,
+	artifactSize int64,
+) bool {
+	return (current.Status == "submitted" || current.Status == "integrated") &&
+		uuidToString(current.ID) == uuidToString(expectedAttemptID) &&
+		current.ClaimEpoch == expectedClaimEpoch &&
+		current.BaseCommit.Valid &&
+		current.BaseCommit.String == baseCommit &&
+		current.ResultCommit.Valid &&
+		current.ResultCommit.String == resultCommit &&
+		current.ArtifactDigest.Valid &&
+		current.ArtifactDigest.String == digest &&
+		current.ArtifactKey.Valid &&
+		current.ArtifactSize.Valid &&
+		current.ArtifactSize.Int64 == artifactSize
+}
+
 func (h *Handler) SubmitWorkflowBundle(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskId")
 	task, workspaceID, ok := h.requireDaemonTaskAccessWithWorkspace(w, r, taskID)
@@ -2925,7 +2962,11 @@ func (h *Handler) SubmitWorkflowBundle(w http.ResponseWriter, r *http.Request) {
 	}
 	attempt, err := h.Queries.GetWorkflowAttemptByTask(r.Context(), task.ID)
 	if err != nil {
-		writeError(w, http.StatusConflict, "workflow attempt not found")
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusConflict, "workflow attempt not found")
+		} else {
+			writeError(w, http.StatusServiceUnavailable, "workflow attempt lookup failed")
+		}
 		return
 	}
 	if daemonID := middleware.DaemonIDFromContext(r.Context()); daemonID != "" && daemonID != attempt.DaemonID {
@@ -2933,6 +2974,13 @@ func (h *Handler) SubmitWorkflowBundle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if attempt.Status == "submitted" || attempt.Status == "integrated" {
+		// Expect: 100-continue lets the daemon learn the durable result without
+		// retransmitting the bundle. Older clients may already be streaming, so
+		// drain their bounded body before returning to preserve the connection.
+		if !strings.EqualFold(r.Header.Get("Expect"), "100-continue") {
+			r.Body = http.MaxBytesReader(w, r.Body, service.MaxWorkflowBundleSize+(2<<20))
+			_, _ = io.Copy(io.Discard, r.Body)
+		}
 		writeJSON(w, http.StatusOK, attempt)
 		return
 	}
@@ -2941,9 +2989,12 @@ func (h *Handler) SubmitWorkflowBundle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, service.MaxWorkflowBundleSize+(2<<20))
-	if err := r.ParseMultipartForm(service.MaxWorkflowBundleSize + (2 << 20)); err != nil {
+	if err := r.ParseMultipartForm(1 << 20); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid workflow bundle form")
 		return
+	}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
 	}
 	file, _, err := r.FormFile("bundle")
 	if err != nil {
@@ -2994,14 +3045,11 @@ func (h *Handler) SubmitWorkflowBundle(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "workflow bundle manifest does not match the active claim")
 		return
 	}
-	artifactKey := fmt.Sprintf(
-		"workflows/%s/%s/%s/%s-%s.bundle",
-		workspaceID,
-		manifest.RunID,
-		manifest.NodeID,
-		manifest.AttemptID,
-		digest,
-	)
+	// Retries of one immutable submission share a content-addressed key.
+	// Concurrent uploads therefore write identical bytes, bound orphan storage
+	// to one object per attempt and digest, and let a later retry self-heal a
+	// failed upload without racing a winner's artifact.
+	artifactKey := workflowBundleArtifactKey(workspaceID, manifest, digest)
 	if _, err := h.Storage.Upload(r.Context(), artifactKey, bundle, "application/x-git-bundle", manifest.AttemptID+".bundle"); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to store workflow bundle")
 		return
@@ -3018,8 +3066,35 @@ func (h *Handler) SubmitWorkflowBundle(w http.ResponseWriter, r *http.Request) {
 		Manifest:       manifestRaw,
 	})
 	if err != nil {
-		h.Storage.Delete(r.Context(), artifactKey)
-		writeError(w, http.StatusConflict, err.Error())
+		cleanupCtx, cancelCleanup := context.WithTimeout(
+			context.WithoutCancel(r.Context()),
+			5*time.Second,
+		)
+		defer cancelCleanup()
+		current, currentErr := h.Queries.GetWorkflowAttemptByTask(cleanupCtx, task.ID)
+		// Never delete the content-addressed object here. An overlapping request
+		// may still be committing the same key, while any failed retry is
+		// bounded to that one key and will overwrite it on its next attempt.
+		if currentErr == nil && workflowAttemptMatchesSubmission(
+			current,
+			attempt.ID,
+			attempt.ClaimEpoch,
+			manifest.BaseCommit,
+			manifest.ResultCommit,
+			digest,
+			int64(len(bundle)),
+		) {
+			writeJSON(w, http.StatusOK, current)
+			return
+		}
+		if currentErr != nil && !errors.Is(currentErr, pgx.ErrNoRows) {
+			writeError(w, http.StatusServiceUnavailable, "workflow submission state unavailable")
+		} else if errors.Is(err, service.ErrStaleWorkflowAttempt) ||
+			errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusConflict, err.Error())
+		} else {
+			writeError(w, http.StatusServiceUnavailable, "workflow bundle submission failed")
+		}
 		return
 	}
 	writeJSON(w, http.StatusAccepted, submitted)

@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync/atomic"
@@ -15,6 +18,177 @@ import (
 	"github.com/multica-ai/multica/server/pkg/executionevidence"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
+
+type countingReadCloser struct {
+	io.ReadCloser
+	bytesRead atomic.Int64
+}
+
+func (r *countingReadCloser) Read(buffer []byte) (int, error) {
+	count, err := r.ReadCloser.Read(buffer)
+	r.bytesRead.Add(int64(count))
+	return count, err
+}
+
+func TestSubmitWorkflowBundleRetriesTransientFailureWithSameArtifact(t *testing.T) {
+	defer noSleepRetry(t)()
+
+	bundle := []byte("immutable workflow bundle")
+	bundlePath := filepath.Join(t.TempDir(), "result.bundle")
+	if err := os.WriteFile(bundlePath, bundle, 0o600); err != nil {
+		t.Fatalf("write bundle fixture: %v", err)
+	}
+	manifest := []byte(`{"attempt_id":"attempt-1"}`)
+
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Path; got != "/api/daemon/tasks/task-1/workflow-bundle" {
+			t.Errorf("path = %q, want workflow bundle endpoint", got)
+		}
+		if got := r.Header.Get("Expect"); got != "100-continue" {
+			t.Errorf("Expect = %q, want 100-continue", got)
+		}
+		if err := r.ParseMultipartForm(1 << 20); err != nil {
+			t.Errorf("parse multipart form: %v", err)
+			http.Error(w, "invalid test multipart form", http.StatusBadRequest)
+			return
+		}
+		if got := r.FormValue("sha256"); got != "digest-1" {
+			t.Errorf("sha256 = %q, want digest-1", got)
+		}
+		if got := r.FormValue("manifest"); got != string(manifest) {
+			t.Errorf("manifest = %q, want %q", got, manifest)
+		}
+		file, _, err := r.FormFile("bundle")
+		if err != nil {
+			t.Errorf("read bundle form file: %v", err)
+			http.Error(w, "missing test bundle", http.StatusBadRequest)
+			return
+		}
+		defer file.Close()
+		gotBundle, err := io.ReadAll(file)
+		if err != nil {
+			t.Errorf("read bundle body: %v", err)
+			http.Error(w, "unreadable test bundle", http.StatusBadRequest)
+			return
+		}
+		if string(gotBundle) != string(bundle) {
+			t.Errorf("bundle = %q, want %q", gotBundle, bundle)
+		}
+		if calls.Add(1) == 1 {
+			http.Error(w, "temporary outage", http.StatusBadGateway)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	client := NewClient(srv.URL)
+	if err := client.SubmitWorkflowBundle(
+		context.Background(),
+		"task-1",
+		bundlePath,
+		"digest-1",
+		manifest,
+	); err != nil {
+		t.Fatalf("SubmitWorkflowBundle: %v", err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("calls = %d, want 2", got)
+	}
+}
+
+func TestSubmitWorkflowBundleExpectContinueAcceptsEarlyDurableResponse(t *testing.T) {
+	bundlePath := filepath.Join(t.TempDir(), "result.bundle")
+	if err := os.WriteFile(bundlePath, make([]byte, 2<<20), 0o600); err != nil {
+		t.Fatalf("write bundle fixture: %v", err)
+	}
+
+	requestBodies := make(chan *countingReadCloser, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestBody := &countingReadCloser{ReadCloser: r.Body}
+		r.Body = requestBody
+		if got := r.Header.Get("Expect"); got != "100-continue" {
+			t.Errorf("Expect = %q, want 100-continue", got)
+		}
+		time.Sleep(50 * time.Millisecond)
+		requestBodies <- requestBody
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	client := NewClient(srv.URL)
+	transport, ok := client.bundleClient.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("bundle transport = %T, want *http.Transport", client.bundleClient.Transport)
+	}
+	if transport.ExpectContinueTimeout != 15*time.Second {
+		t.Fatalf(
+			"ExpectContinueTimeout = %s, want 15s",
+			transport.ExpectContinueTimeout,
+		)
+	}
+	if err := client.SubmitWorkflowBundle(
+		context.Background(),
+		"task-1",
+		bundlePath,
+		"digest-1",
+		[]byte(`{"attempt_id":"attempt-1"}`),
+	); err != nil {
+		t.Fatalf("SubmitWorkflowBundle: %v", err)
+	}
+	requestBody := <-requestBodies
+	if got := requestBody.bytesRead.Load(); got != 0 {
+		t.Fatalf("server read %d body bytes before early durable response", got)
+	}
+}
+
+func TestSubmitWorkflowBundleDoesNotRetryPermanentFailure(t *testing.T) {
+	defer noSleepRetry(t)()
+
+	bundlePath := filepath.Join(t.TempDir(), "result.bundle")
+	if err := os.WriteFile(bundlePath, []byte("bundle"), 0o600); err != nil {
+		t.Fatalf("write bundle fixture: %v", err)
+	}
+
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		http.Error(w, "manifest mismatch", http.StatusConflict)
+	}))
+	t.Cleanup(srv.Close)
+
+	client := NewClient(srv.URL)
+	err := client.SubmitWorkflowBundle(
+		context.Background(),
+		"task-1",
+		bundlePath,
+		"digest-1",
+		[]byte(`{"attempt_id":"stale"}`),
+	)
+	if err == nil {
+		t.Fatal("expected permanent submission error")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("calls = %d, want 1", got)
+	}
+}
+
+func TestWorkflowBundleSubmitRetryScheduleIsBounded(t *testing.T) {
+	want := []time.Duration{time.Second, 4 * time.Second, 16 * time.Second}
+	if len(workflowBundleSubmitRetrySchedule) != len(want) {
+		t.Fatalf(
+			"schedule length = %d, want %d",
+			len(workflowBundleSubmitRetrySchedule),
+			len(want),
+		)
+	}
+	for i, delay := range want {
+		if workflowBundleSubmitRetrySchedule[i] != delay {
+			t.Errorf("schedule[%d] = %s, want %s", i, workflowBundleSubmitRetrySchedule[i], delay)
+		}
+	}
+}
 
 func TestClient_IdentityHeaders_PostJSON(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
