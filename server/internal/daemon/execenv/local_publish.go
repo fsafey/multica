@@ -111,6 +111,19 @@ func (w *IsolatedLocalWorktree) BuildWorkflowBundle(provider, outputDir string, 
 	if taskSHA == w.BaseCommit {
 		return WorkflowBundleArtifact{}, errors.New("execenv: workflow bundle requires a result commit after the base commit")
 	}
+	bundleRef := "refs/heads/" + w.Branch
+	branchSHA, err := gitOutput(w.WorkDir, "rev-parse", "--verify", bundleRef+"^{commit}")
+	if err != nil {
+		return WorkflowBundleArtifact{}, fmt.Errorf("execenv: workflow bundle resolve task branch: %w", err)
+	}
+	if branchSHA != taskSHA {
+		return WorkflowBundleArtifact{}, fmt.Errorf(
+			"execenv: workflow result commit %s does not match owned task branch %s at %s",
+			taskSHA,
+			bundleRef,
+			branchSHA,
+		)
+	}
 	ancestor, err := gitSuccess(w.WorkDir, "merge-base", "--is-ancestor", w.BaseCommit, taskSHA)
 	if err != nil {
 		return WorkflowBundleArtifact{}, fmt.Errorf("execenv: workflow bundle verify ancestry: %w", err)
@@ -165,7 +178,7 @@ func (w *IsolatedLocalWorktree) BuildWorkflowBundle(provider, outputDir string, 
 		os.Remove(bundlePath)
 		return WorkflowBundleArtifact{}, fmt.Errorf("execenv: close workflow bundle placeholder: %w", err)
 	}
-	if out, err := exec.Command("git", "-C", w.WorkDir, "bundle", "create", bundlePath, taskSHA, "^"+w.BaseCommit).CombinedOutput(); err != nil {
+	if out, err := exec.Command("git", "-C", w.WorkDir, "bundle", "create", bundlePath, bundleRef, "^"+w.BaseCommit).CombinedOutput(); err != nil {
 		os.Remove(bundlePath)
 		return WorkflowBundleArtifact{}, fmt.Errorf("execenv: create workflow git bundle: %s: %w", strings.TrimSpace(string(out)), err)
 	}

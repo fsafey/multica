@@ -71,6 +71,50 @@ func TestFirstPathOverlapFindsBothAncestorDirections(t *testing.T) {
 	}
 }
 
+func TestWorkflowBundleBuildsFromOwnedTaskBranch(t *testing.T) {
+	src := newSourceRepo(t)
+	wt, err := prepareIsolatedLocalWorktree(
+		src,
+		isolatedWorkDir(t.TempDir()),
+		"task-bundle-11111111",
+		nil,
+		true,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskSHA := commitTaskFile(t, wt, "pipeline-output/passage/01-segmented.md", "segmented\n")
+
+	artifact, err := wt.BuildWorkflowBundle(
+		"codex",
+		t.TempDir(),
+		[]string{"pipeline-output/passage/01-segmented.md"},
+	)
+	if err != nil {
+		t.Fatalf("build workflow bundle: %v", err)
+	}
+	if artifact.BaseCommit != wt.BaseCommit || artifact.ResultCommit != taskSHA {
+		t.Fatalf(
+			"bundle commits base=%s result=%s, want %s and %s",
+			artifact.BaseCommit,
+			artifact.ResultCommit,
+			wt.BaseCommit,
+			taskSHA,
+		)
+	}
+	if len(artifact.ChangedPaths) != 1 || artifact.ChangedPaths[0] != "pipeline-output/passage/01-segmented.md" {
+		t.Fatalf("bundle changed paths = %v", artifact.ChangedPaths)
+	}
+	heads := git(t, src, "bundle", "list-heads", artifact.Path)
+	if !strings.Contains(heads, taskSHA+" refs/heads/"+wt.Branch) {
+		t.Fatalf("bundle does not advertise the owned task branch:\n%s", heads)
+	}
+	if err := wt.FinalizeWorkflowBundle(true, nil); err != nil {
+		t.Fatalf("finalize submitted bundle: %v", err)
+	}
+	assertWorktreeRemoved(t, src, wt)
+}
+
 func TestSerialPublishBack_FastForwardsAndPreservesUnrelatedDirt(t *testing.T) {
 	src := newSourceRepo(t)
 	base := git(t, src, "rev-parse", "HEAD")
