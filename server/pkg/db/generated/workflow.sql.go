@@ -314,6 +314,133 @@ func (q *Queries) CancelWorkflowOutboxForNode(ctx context.Context, arg CancelWor
 	return result.RowsAffected(), nil
 }
 
+const cancelWorkflowRun = `-- name: CancelWorkflowRun :one
+UPDATE workflow_run
+SET status = 'cancelled',
+    completed_at = now(),
+    updated_at = now()
+WHERE id = $1
+  AND workspace_id = $2
+  AND status IN ('running', 'paused')
+RETURNING id, workspace_id, project_id, anchor_issue_id, graph_key, graph_version, status, integration_pool_id, wip_limit, human_gate_limit, input_digest, law_digest, metadata, created_by, created_at, updated_at, completed_at
+`
+
+type CancelWorkflowRunParams struct {
+	ID          pgtype.UUID `json:"id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+}
+
+func (q *Queries) CancelWorkflowRun(ctx context.Context, arg CancelWorkflowRunParams) (WorkflowRun, error) {
+	row := q.db.QueryRow(ctx, cancelWorkflowRun, arg.ID, arg.WorkspaceID)
+	var i WorkflowRun
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.ProjectID,
+		&i.AnchorIssueID,
+		&i.GraphKey,
+		&i.GraphVersion,
+		&i.Status,
+		&i.IntegrationPoolID,
+		&i.WipLimit,
+		&i.HumanGateLimit,
+		&i.InputDigest,
+		&i.LawDigest,
+		&i.Metadata,
+		&i.CreatedBy,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.CompletedAt,
+	)
+	return i, err
+}
+
+const cancelWorkflowRunAttempts = `-- name: CancelWorkflowRunAttempts :execrows
+UPDATE workflow_node_attempt attempt
+SET status = 'cancelled',
+    error = $1,
+    completed_at = now()
+FROM workflow_node node
+WHERE attempt.node_id = node.id
+  AND node.run_id = $2
+  AND attempt.status IN ('claimed', 'running', 'submitted')
+`
+
+type CancelWorkflowRunAttemptsParams struct {
+	Error pgtype.Text `json:"error"`
+	RunID pgtype.UUID `json:"run_id"`
+}
+
+func (q *Queries) CancelWorkflowRunAttempts(ctx context.Context, arg CancelWorkflowRunAttemptsParams) (int64, error) {
+	result, err := q.db.Exec(ctx, cancelWorkflowRunAttempts, arg.Error, arg.RunID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const cancelWorkflowRunNodes = `-- name: CancelWorkflowRunNodes :execrows
+UPDATE workflow_node
+SET state = 'cancelled',
+    updated_at = now()
+WHERE run_id = $1
+  AND state NOT IN ('completed', 'cancelled')
+`
+
+func (q *Queries) CancelWorkflowRunNodes(ctx context.Context, runID pgtype.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, cancelWorkflowRunNodes, runID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const cancelWorkflowRunOutbox = `-- name: CancelWorkflowRunOutbox :execrows
+UPDATE workflow_outbox
+SET status = 'failed',
+    last_error = $1,
+    completed_at = now()
+WHERE run_id = $2
+  AND status IN ('pending', 'processing')
+`
+
+type CancelWorkflowRunOutboxParams struct {
+	Error pgtype.Text `json:"error"`
+	RunID pgtype.UUID `json:"run_id"`
+}
+
+func (q *Queries) CancelWorkflowRunOutbox(ctx context.Context, arg CancelWorkflowRunOutboxParams) (int64, error) {
+	result, err := q.db.Exec(ctx, cancelWorkflowRunOutbox, arg.Error, arg.RunID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const cancelWorkflowRunTasks = `-- name: CancelWorkflowRunTasks :execrows
+UPDATE agent_task_queue task
+SET status = 'cancelled',
+    error = $1,
+    completed_at = now()
+FROM workflow_node node
+WHERE task.workflow_node_id = node.id
+  AND node.run_id = $2
+  AND task.status IN ('queued', 'dispatched', 'waiting_local_directory', 'running')
+`
+
+type CancelWorkflowRunTasksParams struct {
+	Error pgtype.Text `json:"error"`
+	RunID pgtype.UUID `json:"run_id"`
+}
+
+func (q *Queries) CancelWorkflowRunTasks(ctx context.Context, arg CancelWorkflowRunTasksParams) (int64, error) {
+	result, err := q.db.Exec(ctx, cancelWorkflowRunTasks, arg.Error, arg.RunID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const cancelWorkflowTaskForAttempt = `-- name: CancelWorkflowTaskForAttempt :execrows
 UPDATE agent_task_queue
 SET status = 'cancelled',
@@ -795,21 +922,26 @@ func (q *Queries) CompleteImportedWorkflowNode(ctx context.Context, arg Complete
 
 const completeWorkflowHumanGate = `-- name: CompleteWorkflowHumanGate :one
 UPDATE workflow_node
-SET state = 'completed', completed_at = now(), updated_at = now()
-WHERE id = $1
-  AND run_id = $2
+SET state = 'completed',
+    claim_epoch = claim_epoch + 1,
+    current_attempt_id = $1,
+    completed_at = now(),
+    updated_at = now()
+WHERE id = $2
+  AND run_id = $3
   AND executor_kind = 'human_gate'
   AND state = 'waiting_human'
 RETURNING id, run_id, issue_id, passage_key, node_key, generation, executor_kind, agent_id, runtime_pool_id, state, priority, preferred_daemon_id, stealable_at, claim_epoch, current_attempt_id, input_digest, law_digest, output_contract, max_attempts, ready_at, started_at, completed_at, created_at, updated_at
 `
 
 type CompleteWorkflowHumanGateParams struct {
-	NodeID pgtype.UUID `json:"node_id"`
-	RunID  pgtype.UUID `json:"run_id"`
+	AttemptID pgtype.UUID `json:"attempt_id"`
+	NodeID    pgtype.UUID `json:"node_id"`
+	RunID     pgtype.UUID `json:"run_id"`
 }
 
 func (q *Queries) CompleteWorkflowHumanGate(ctx context.Context, arg CompleteWorkflowHumanGateParams) (WorkflowNode, error) {
-	row := q.db.QueryRow(ctx, completeWorkflowHumanGate, arg.NodeID, arg.RunID)
+	row := q.db.QueryRow(ctx, completeWorkflowHumanGate, arg.AttemptID, arg.NodeID, arg.RunID)
 	var i WorkflowNode
 	err := row.Scan(
 		&i.ID,
@@ -937,6 +1069,77 @@ func (q *Queries) CompleteWorkflowOutboxEvent(ctx context.Context, id pgtype.UUI
 		&i.CompletedAt,
 	)
 	return i, err
+}
+
+const completeWorkflowRunIfTerminal = `-- name: CompleteWorkflowRunIfTerminal :one
+UPDATE workflow_run run
+SET status = 'completed',
+    completed_at = now(),
+    updated_at = now()
+WHERE run.id = $1
+  AND run.status IN ('running', 'paused')
+  AND NOT EXISTS (
+      SELECT 1
+      FROM workflow_node node
+      WHERE node.run_id = run.id
+        AND node.state <> 'completed'
+  )
+RETURNING run.id, run.workspace_id, run.project_id, run.anchor_issue_id, run.graph_key, run.graph_version, run.status, run.integration_pool_id, run.wip_limit, run.human_gate_limit, run.input_digest, run.law_digest, run.metadata, run.created_by, run.created_at, run.updated_at, run.completed_at
+`
+
+func (q *Queries) CompleteWorkflowRunIfTerminal(ctx context.Context, runID pgtype.UUID) (WorkflowRun, error) {
+	row := q.db.QueryRow(ctx, completeWorkflowRunIfTerminal, runID)
+	var i WorkflowRun
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.ProjectID,
+		&i.AnchorIssueID,
+		&i.GraphKey,
+		&i.GraphVersion,
+		&i.Status,
+		&i.IntegrationPoolID,
+		&i.WipLimit,
+		&i.HumanGateLimit,
+		&i.InputDigest,
+		&i.LawDigest,
+		&i.Metadata,
+		&i.CreatedBy,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.CompletedAt,
+	)
+	return i, err
+}
+
+const countProcessingWorkflowIntegrationEventsForNode = `-- name: CountProcessingWorkflowIntegrationEventsForNode :one
+SELECT count(*)
+FROM workflow_outbox
+WHERE node_id = $1
+  AND status = 'processing'
+  AND event_type IN ('workflow.artifact_submitted', 'workflow.deterministic_ready')
+`
+
+func (q *Queries) CountProcessingWorkflowIntegrationEventsForNode(ctx context.Context, nodeID pgtype.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countProcessingWorkflowIntegrationEventsForNode, nodeID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const countProcessingWorkflowIntegrationEventsForRun = `-- name: CountProcessingWorkflowIntegrationEventsForRun :one
+SELECT count(*)
+FROM workflow_outbox
+WHERE run_id = $1
+  AND status = 'processing'
+  AND event_type IN ('workflow.artifact_submitted', 'workflow.deterministic_ready')
+`
+
+func (q *Queries) CountProcessingWorkflowIntegrationEventsForRun(ctx context.Context, runID pgtype.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countProcessingWorkflowIntegrationEventsForRun, runID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
 }
 
 const countWorkflowAttemptResourceClaims = `-- name: CountWorkflowAttemptResourceClaims :one
@@ -1305,6 +1508,110 @@ func (q *Queries) CreateWorkflowAgentTask(ctx context.Context, arg CreateWorkflo
 		&i.WorkflowClaimEpoch,
 		&i.WorkflowInputDigest,
 		&i.WorkflowLawDigest,
+	)
+	return i, err
+}
+
+const createWorkflowHumanGateAttempt = `-- name: CreateWorkflowHumanGateAttempt :one
+INSERT INTO workflow_node_attempt (
+    id, node_id, claim_epoch, runtime_id, daemon_id, status,
+    lease_expires_at, base_commit, result_commit, artifact_digest,
+    manifest, claimed_at, started_at, submitted_at, completed_at
+)
+VALUES (
+    $1, $2, $3, NULL, 'human-gate', 'integrated',
+    now(), $4, $4, $5,
+    $6, now(), now(), now(), now()
+)
+RETURNING id, node_id, claim_epoch, task_id, runtime_id, daemon_id, preferred_daemon_at_claim, affinity_stolen, status, lease_expires_at, base_commit, result_commit, artifact_key, artifact_digest, artifact_size, manifest, error, claimed_at, started_at, submitted_at, completed_at
+`
+
+type CreateWorkflowHumanGateAttemptParams struct {
+	ID              pgtype.UUID `json:"id"`
+	NodeID          pgtype.UUID `json:"node_id"`
+	ClaimEpoch      int64       `json:"claim_epoch"`
+	CanonicalCommit pgtype.Text `json:"canonical_commit"`
+	ArtifactDigest  pgtype.Text `json:"artifact_digest"`
+	Manifest        []byte      `json:"manifest"`
+}
+
+func (q *Queries) CreateWorkflowHumanGateAttempt(ctx context.Context, arg CreateWorkflowHumanGateAttemptParams) (WorkflowNodeAttempt, error) {
+	row := q.db.QueryRow(ctx, createWorkflowHumanGateAttempt,
+		arg.ID,
+		arg.NodeID,
+		arg.ClaimEpoch,
+		arg.CanonicalCommit,
+		arg.ArtifactDigest,
+		arg.Manifest,
+	)
+	var i WorkflowNodeAttempt
+	err := row.Scan(
+		&i.ID,
+		&i.NodeID,
+		&i.ClaimEpoch,
+		&i.TaskID,
+		&i.RuntimeID,
+		&i.DaemonID,
+		&i.PreferredDaemonAtClaim,
+		&i.AffinityStolen,
+		&i.Status,
+		&i.LeaseExpiresAt,
+		&i.BaseCommit,
+		&i.ResultCommit,
+		&i.ArtifactKey,
+		&i.ArtifactDigest,
+		&i.ArtifactSize,
+		&i.Manifest,
+		&i.Error,
+		&i.ClaimedAt,
+		&i.StartedAt,
+		&i.SubmittedAt,
+		&i.CompletedAt,
+	)
+	return i, err
+}
+
+const createWorkflowHumanGateResult = `-- name: CreateWorkflowHumanGateResult :one
+INSERT INTO workflow_node_result (
+    node_id, attempt_id, generation, claim_epoch, canonical_commit,
+    artifact_digest, manifest
+)
+SELECT
+    node.id, $1, node.generation, node.claim_epoch,
+    $2, $3, $4
+FROM workflow_node node
+WHERE node.id = $5
+  AND node.current_attempt_id = $1
+  AND node.state = 'completed'
+RETURNING node_id, attempt_id, generation, claim_epoch, canonical_commit, artifact_digest, manifest, accepted_at
+`
+
+type CreateWorkflowHumanGateResultParams struct {
+	AttemptID       pgtype.UUID `json:"attempt_id"`
+	CanonicalCommit string      `json:"canonical_commit"`
+	ArtifactDigest  string      `json:"artifact_digest"`
+	Manifest        []byte      `json:"manifest"`
+	NodeID          pgtype.UUID `json:"node_id"`
+}
+
+func (q *Queries) CreateWorkflowHumanGateResult(ctx context.Context, arg CreateWorkflowHumanGateResultParams) (WorkflowNodeResult, error) {
+	row := q.db.QueryRow(ctx, createWorkflowHumanGateResult,
+		arg.AttemptID,
+		arg.CanonicalCommit,
+		arg.ArtifactDigest,
+		arg.Manifest,
+		arg.NodeID,
+	)
+	var i WorkflowNodeResult
+	err := row.Scan(
+		&i.NodeID,
+		&i.AttemptID,
+		&i.Generation,
+		&i.ClaimEpoch,
+		&i.CanonicalCommit,
+		&i.ArtifactDigest,
+		&i.Manifest,
+		&i.AcceptedAt,
 	)
 	return i, err
 }
@@ -1823,6 +2130,30 @@ func (q *Queries) GetWorkflowAttemptByTask(ctx context.Context, taskID pgtype.UU
 		&i.StartedAt,
 		&i.SubmittedAt,
 		&i.CompletedAt,
+	)
+	return i, err
+}
+
+const getWorkflowHumanGateDependencyResult = `-- name: GetWorkflowHumanGateDependencyResult :one
+SELECT result.node_id, result.attempt_id, result.generation, result.claim_epoch, result.canonical_commit, result.artifact_digest, result.manifest, result.accepted_at
+FROM workflow_node_dependency dependency
+JOIN workflow_node_result result
+  ON result.node_id = dependency.depends_on_node_id
+WHERE dependency.node_id = $1
+`
+
+func (q *Queries) GetWorkflowHumanGateDependencyResult(ctx context.Context, nodeID pgtype.UUID) (WorkflowNodeResult, error) {
+	row := q.db.QueryRow(ctx, getWorkflowHumanGateDependencyResult, nodeID)
+	var i WorkflowNodeResult
+	err := row.Scan(
+		&i.NodeID,
+		&i.AttemptID,
+		&i.Generation,
+		&i.ClaimEpoch,
+		&i.CanonicalCommit,
+		&i.ArtifactDigest,
+		&i.Manifest,
+		&i.AcceptedAt,
 	)
 	return i, err
 }
@@ -3099,6 +3430,46 @@ func (q *Queries) MarkWorkflowNodeSubmitted(ctx context.Context, arg MarkWorkflo
 	return i, err
 }
 
+const pauseWorkflowRun = `-- name: PauseWorkflowRun :one
+UPDATE workflow_run
+SET status = 'paused',
+    updated_at = now()
+WHERE id = $1
+  AND workspace_id = $2
+  AND status = 'running'
+RETURNING id, workspace_id, project_id, anchor_issue_id, graph_key, graph_version, status, integration_pool_id, wip_limit, human_gate_limit, input_digest, law_digest, metadata, created_by, created_at, updated_at, completed_at
+`
+
+type PauseWorkflowRunParams struct {
+	ID          pgtype.UUID `json:"id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+}
+
+func (q *Queries) PauseWorkflowRun(ctx context.Context, arg PauseWorkflowRunParams) (WorkflowRun, error) {
+	row := q.db.QueryRow(ctx, pauseWorkflowRun, arg.ID, arg.WorkspaceID)
+	var i WorkflowRun
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.ProjectID,
+		&i.AnchorIssueID,
+		&i.GraphKey,
+		&i.GraphVersion,
+		&i.Status,
+		&i.IntegrationPoolID,
+		&i.WipLimit,
+		&i.HumanGateLimit,
+		&i.InputDigest,
+		&i.LawDigest,
+		&i.Metadata,
+		&i.CreatedBy,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.CompletedAt,
+	)
+	return i, err
+}
+
 const releaseReadyWorkflowSuccessors = `-- name: ReleaseReadyWorkflowSuccessors :many
 UPDATE workflow_node successor
 SET state = CASE
@@ -3111,13 +3482,21 @@ SET state = CASE
     END,
     stealable_at = CASE
         WHEN successor.executor_kind = 'agent'
-        THEN now() + make_interval(secs => pool.affinity_grace_seconds)
+        THEN now() + make_interval(
+            secs => COALESCE(
+                (
+                    SELECT pool.affinity_grace_seconds
+                    FROM runtime_pool pool
+                    WHERE pool.id = successor.runtime_pool_id
+                ),
+                60
+            )::double precision
+        )
         ELSE successor.stealable_at
     END,
     preferred_daemon_id = COALESCE(successor.preferred_daemon_id, completed.preferred_daemon_id),
     updated_at = now()
 FROM workflow_node completed
-LEFT JOIN runtime_pool pool ON pool.id = successor.runtime_pool_id
 WHERE completed.id = $1
   AND successor.run_id = completed.run_id
   AND successor.state = 'pending'
@@ -3189,6 +3568,21 @@ WHERE attempt_id = $1
 
 func (q *Queries) ReleaseWorkflowAttemptResources(ctx context.Context, attemptID pgtype.UUID) (int64, error) {
 	result, err := q.db.Exec(ctx, releaseWorkflowAttemptResources, attemptID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const releaseWorkflowRunResources = `-- name: ReleaseWorkflowRunResources :execrows
+DELETE FROM workflow_resource_claim claim
+USING workflow_node node
+WHERE claim.node_id = node.id
+  AND node.run_id = $1
+`
+
+func (q *Queries) ReleaseWorkflowRunResources(ctx context.Context, runID pgtype.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, releaseWorkflowRunResources, runID)
 	if err != nil {
 		return 0, err
 	}
@@ -3383,6 +3777,46 @@ func (q *Queries) RequeueWorkflowNodeAfterAttempt(ctx context.Context, arg Reque
 		&i.CompletedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const resumeWorkflowRun = `-- name: ResumeWorkflowRun :one
+UPDATE workflow_run
+SET status = 'running',
+    updated_at = now()
+WHERE id = $1
+  AND workspace_id = $2
+  AND status = 'paused'
+RETURNING id, workspace_id, project_id, anchor_issue_id, graph_key, graph_version, status, integration_pool_id, wip_limit, human_gate_limit, input_digest, law_digest, metadata, created_by, created_at, updated_at, completed_at
+`
+
+type ResumeWorkflowRunParams struct {
+	ID          pgtype.UUID `json:"id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+}
+
+func (q *Queries) ResumeWorkflowRun(ctx context.Context, arg ResumeWorkflowRunParams) (WorkflowRun, error) {
+	row := q.db.QueryRow(ctx, resumeWorkflowRun, arg.ID, arg.WorkspaceID)
+	var i WorkflowRun
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.ProjectID,
+		&i.AnchorIssueID,
+		&i.GraphKey,
+		&i.GraphVersion,
+		&i.Status,
+		&i.IntegrationPoolID,
+		&i.WipLimit,
+		&i.HumanGateLimit,
+		&i.InputDigest,
+		&i.LawDigest,
+		&i.Metadata,
+		&i.CreatedBy,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.CompletedAt,
 	)
 	return i, err
 }

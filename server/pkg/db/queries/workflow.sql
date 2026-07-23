@@ -112,6 +112,97 @@ SET status = @status,
 WHERE id = @id AND workspace_id = @workspace_id
 RETURNING *;
 
+-- name: PauseWorkflowRun :one
+UPDATE workflow_run
+SET status = 'paused',
+    updated_at = now()
+WHERE id = @id
+  AND workspace_id = @workspace_id
+  AND status = 'running'
+RETURNING *;
+
+-- name: ResumeWorkflowRun :one
+UPDATE workflow_run
+SET status = 'running',
+    updated_at = now()
+WHERE id = @id
+  AND workspace_id = @workspace_id
+  AND status = 'paused'
+RETURNING *;
+
+-- name: CompleteWorkflowRunIfTerminal :one
+UPDATE workflow_run run
+SET status = 'completed',
+    completed_at = now(),
+    updated_at = now()
+WHERE run.id = @run_id
+  AND run.status IN ('running', 'paused')
+  AND NOT EXISTS (
+      SELECT 1
+      FROM workflow_node node
+      WHERE node.run_id = run.id
+        AND node.state <> 'completed'
+  )
+RETURNING run.*;
+
+-- name: CancelWorkflowRunAttempts :execrows
+UPDATE workflow_node_attempt attempt
+SET status = 'cancelled',
+    error = @error,
+    completed_at = now()
+FROM workflow_node node
+WHERE attempt.node_id = node.id
+  AND node.run_id = @run_id
+  AND attempt.status IN ('claimed', 'running', 'submitted');
+
+-- name: CountProcessingWorkflowIntegrationEventsForRun :one
+SELECT count(*)
+FROM workflow_outbox
+WHERE run_id = @run_id
+  AND status = 'processing'
+  AND event_type IN ('workflow.artifact_submitted', 'workflow.deterministic_ready');
+
+-- name: CancelWorkflowRunTasks :execrows
+UPDATE agent_task_queue task
+SET status = 'cancelled',
+    error = @error,
+    completed_at = now()
+FROM workflow_node node
+WHERE task.workflow_node_id = node.id
+  AND node.run_id = @run_id
+  AND task.status IN ('queued', 'dispatched', 'waiting_local_directory', 'running');
+
+-- name: ReleaseWorkflowRunResources :execrows
+DELETE FROM workflow_resource_claim claim
+USING workflow_node node
+WHERE claim.node_id = node.id
+  AND node.run_id = @run_id;
+
+-- name: CancelWorkflowRunOutbox :execrows
+UPDATE workflow_outbox
+SET status = 'failed',
+    last_error = @error,
+    completed_at = now()
+WHERE run_id = @run_id
+  AND status IN ('pending', 'processing');
+
+-- name: CancelWorkflowRunNodes :execrows
+UPDATE workflow_node
+SET state = 'cancelled',
+    updated_at = now()
+WHERE run_id = @run_id
+  AND state NOT IN ('completed', 'cancelled');
+
+-- name: CancelWorkflowRun :one
+UPDATE workflow_run
+SET status = 'cancelled',
+    completed_at = now(),
+    updated_at = now()
+WHERE id = @id
+  AND workspace_id = @workspace_id
+  AND status IN ('running', 'paused')
+RETURNING *;
+
 -- name: CreateWorkflowNode :one
 INSERT INTO workflow_node (
     run_id, issue_id, passage_key, node_key, generation, executor_kind,
@@ -1073,13 +1164,21 @@ SET state = CASE
     END,
     stealable_at = CASE
         WHEN successor.executor_kind = 'agent'
-        THEN now() + make_interval(secs => pool.affinity_grace_seconds)
+        THEN now() + make_interval(
+            secs => COALESCE(
+                (
+                    SELECT pool.affinity_grace_seconds
+                    FROM runtime_pool pool
+                    WHERE pool.id = successor.runtime_pool_id
+                ),
+                60
+            )::double precision
+        )
         ELSE successor.stealable_at
     END,
     preferred_daemon_id = COALESCE(successor.preferred_daemon_id, completed.preferred_daemon_id),
     updated_at = now()
 FROM workflow_node completed
-LEFT JOIN runtime_pool pool ON pool.id = successor.runtime_pool_id
 WHERE completed.id = @completed_node_id
   AND successor.run_id = completed.run_id
   AND successor.state = 'pending'
@@ -1130,11 +1229,49 @@ RETURNING *;
 
 -- name: CompleteWorkflowHumanGate :one
 UPDATE workflow_node
-SET state = 'completed', completed_at = now(), updated_at = now()
+SET state = 'completed',
+    claim_epoch = claim_epoch + 1,
+    current_attempt_id = @attempt_id,
+    completed_at = now(),
+    updated_at = now()
 WHERE id = @node_id
   AND run_id = @run_id
   AND executor_kind = 'human_gate'
   AND state = 'waiting_human'
+RETURNING *;
+
+-- name: GetWorkflowHumanGateDependencyResult :one
+SELECT result.*
+FROM workflow_node_dependency dependency
+JOIN workflow_node_result result
+  ON result.node_id = dependency.depends_on_node_id
+WHERE dependency.node_id = @node_id;
+
+-- name: CreateWorkflowHumanGateAttempt :one
+INSERT INTO workflow_node_attempt (
+    id, node_id, claim_epoch, runtime_id, daemon_id, status,
+    lease_expires_at, base_commit, result_commit, artifact_digest,
+    manifest, claimed_at, started_at, submitted_at, completed_at
+)
+VALUES (
+    @id, @node_id, @claim_epoch, NULL, 'human-gate', 'integrated',
+    now(), @canonical_commit, @canonical_commit, @artifact_digest,
+    @manifest, now(), now(), now(), now()
+)
+RETURNING *;
+
+-- name: CreateWorkflowHumanGateResult :one
+INSERT INTO workflow_node_result (
+    node_id, attempt_id, generation, claim_epoch, canonical_commit,
+    artifact_digest, manifest
+)
+SELECT
+    node.id, @attempt_id, node.generation, node.claim_epoch,
+    @canonical_commit, @artifact_digest, @manifest
+FROM workflow_node node
+WHERE node.id = @node_id
+  AND node.current_attempt_id = @attempt_id
+  AND node.state = 'completed'
 RETURNING *;
 
 -- name: RetryWorkflowNode :one
@@ -1186,6 +1323,13 @@ SET status = 'failed',
     completed_at = now()
 WHERE node_id = @node_id
   AND status IN ('pending', 'processing');
+
+-- name: CountProcessingWorkflowIntegrationEventsForNode :one
+SELECT count(*)
+FROM workflow_outbox
+WHERE node_id = @node_id
+  AND status = 'processing'
+  AND event_type IN ('workflow.artifact_submitted', 'workflow.deterministic_ready');
 
 -- name: InsertWorkflowAuditEvent :one
 INSERT INTO workflow_outbox (

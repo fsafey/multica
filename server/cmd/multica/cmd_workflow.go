@@ -44,6 +44,27 @@ var workflowGateCompleteCmd = &cobra.Command{
 	RunE:  runWorkflowGateComplete,
 }
 
+var workflowPauseCmd = &cobra.Command{
+	Use:   "pause <run-id>",
+	Short: "Pause new claims for a workflow run",
+	Args:  exactArgs(1),
+	RunE:  runWorkflowPause,
+}
+
+var workflowResumeCmd = &cobra.Command{
+	Use:   "resume <run-id>",
+	Short: "Resume claims for a paused workflow run",
+	Args:  exactArgs(1),
+	RunE:  runWorkflowResume,
+}
+
+var workflowCancelRunCmd = &cobra.Command{
+	Use:   "cancel-run <run-id>",
+	Short: "Fence and cancel an entire workflow run",
+	Args:  exactArgs(1),
+	RunE:  runWorkflowCancelRun,
+}
+
 var workflowRetryCmd = &cobra.Command{
 	Use:   "retry <run-id> <node-id>",
 	Short: "Audit and retry a blocked or failed workflow node",
@@ -95,12 +116,19 @@ func init() {
 	workflowCmd.AddCommand(workflowGetCmd)
 	workflowCmd.AddCommand(workflowCreateCmd)
 	workflowCmd.AddCommand(workflowGateCompleteCmd)
+	workflowCmd.AddCommand(workflowPauseCmd)
+	workflowCmd.AddCommand(workflowResumeCmd)
+	workflowCmd.AddCommand(workflowCancelRunCmd)
 	workflowCmd.AddCommand(workflowRetryCmd)
 	workflowCmd.AddCommand(workflowCancelCmd)
 	workflowListCmd.Flags().String("output", "table", "Output format: table or json")
 	workflowGetCmd.Flags().String("output", "json", "Output format: json")
 	workflowCreateCmd.Flags().String("file", "", "Path to a workflow graph JSON document")
 	_ = workflowCreateCmd.MarkFlagRequired("file")
+	workflowGateCompleteCmd.Flags().String("comment-id", "", "Durable issue comment containing the accepted gate control")
+	workflowGateCompleteCmd.Flags().String("verdict", "", "Accepted gate verdict: approved or auto_promoted")
+	_ = workflowGateCompleteCmd.MarkFlagRequired("comment-id")
+	_ = workflowGateCompleteCmd.MarkFlagRequired("verdict")
 	workflowRetryCmd.Flags().String("input-digest", "", "Replacement input digest for the new generation")
 	workflowRetryCmd.Flags().String("law-digest", "", "Replacement editorial-law digest for the new generation")
 
@@ -204,6 +232,11 @@ func workflowNodeCommandPath(client *cli.APIClient, runID, nodeID, command strin
 		"/nodes/" + url.PathEscape(nodeID) + "/" + command
 }
 
+func workflowRunCommandPath(client *cli.APIClient, runID, command string) string {
+	return "/api/workspaces/" + url.PathEscape(client.WorkspaceID) +
+		"/workflow-runs/" + url.PathEscape(runID) + "/" + command
+}
+
 func runWorkflowGateComplete(cmd *cobra.Command, args []string) error {
 	client, err := workflowAPIClient(cmd)
 	if err != nil {
@@ -212,10 +245,44 @@ func runWorkflowGateComplete(cmd *cobra.Command, args []string) error {
 	ctx, cancel := cli.APIContext(context.Background())
 	defer cancel()
 	var node map[string]any
-	if err := client.PostJSON(ctx, workflowNodeCommandPath(client, args[0], args[1], "gate-complete"), map[string]any{}, &node); err != nil {
+	commentID, _ := cmd.Flags().GetString("comment-id")
+	verdict, _ := cmd.Flags().GetString("verdict")
+	body := map[string]any{"comment_id": commentID, "verdict": verdict}
+	if err := client.PostJSON(ctx, workflowNodeCommandPath(client, args[0], args[1], "gate-complete"), body, &node); err != nil {
 		return fmt.Errorf("complete workflow gate: %w", err)
 	}
 	return cli.PrintJSON(os.Stdout, node)
+}
+
+func runWorkflowRunCommand(cmd *cobra.Command, runID, command string) error {
+	client, err := workflowAPIClient(cmd)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := cli.APIContext(context.Background())
+	defer cancel()
+	var run map[string]any
+	if err := client.PostJSON(
+		ctx,
+		workflowRunCommandPath(client, runID, command),
+		map[string]any{},
+		&run,
+	); err != nil {
+		return fmt.Errorf("%s workflow run: %w", command, err)
+	}
+	return cli.PrintJSON(os.Stdout, run)
+}
+
+func runWorkflowPause(cmd *cobra.Command, args []string) error {
+	return runWorkflowRunCommand(cmd, args[0], "pause")
+}
+
+func runWorkflowResume(cmd *cobra.Command, args []string) error {
+	return runWorkflowRunCommand(cmd, args[0], "resume")
+}
+
+func runWorkflowCancelRun(cmd *cobra.Command, args []string) error {
+	return runWorkflowRunCommand(cmd, args[0], "cancel")
 }
 
 func runWorkflowRetry(cmd *cobra.Command, args []string) error {

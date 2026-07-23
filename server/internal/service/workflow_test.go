@@ -101,6 +101,59 @@ func TestValidateWorkflowGraphRejectsUnsafeDeterministicContract(t *testing.T) {
 	}
 }
 
+func TestValidateWorkflowGraphRequiresIntegrationPoolForDeterministicNodes(t *testing.T) {
+	spec := validWorkflowGraphSpec()
+	spec.IntegrationPoolID = pgtype.UUID{}
+	err := validateWorkflowGraph(spec)
+	if err == nil || !strings.Contains(err.Error(), "integration_pool_id") {
+		t.Fatalf("integration pool error = %v", err)
+	}
+}
+
+func TestValidateWorkflowGraphRequiresDurableHumanGateContract(t *testing.T) {
+	spec := validWorkflowGraphSpec()
+	spec.Nodes = append(spec.Nodes, WorkflowNodeSpec{
+		Key:          "passage:gate",
+		IssueID:      workflowTestUUID(3),
+		PassageKey:   "passage",
+		NodeKey:      "gate-10",
+		ExecutorKind: "human_gate",
+		OutputContract: json.RawMessage(
+			`{"operation":"comment_gate_v1","gate":"gate-10","controls":{"approved":"[GATE APPROVED] pass 10","rejected":"[GATE REJECTED] pass 10"},"accepted_verdicts":["approved"],"allow_control_suffix":true}`,
+		),
+		DependsOn: []string{"passage:join"},
+	})
+	if err := validateWorkflowGraph(spec); err != nil {
+		t.Fatalf("valid human gate rejected: %v", err)
+	}
+	spec.Nodes[len(spec.Nodes)-1].OutputContract = json.RawMessage(`{"gate":"gate-10"}`)
+	err := validateWorkflowGraph(spec)
+	if err == nil || !strings.Contains(err.Error(), "comment_gate_v1") {
+		t.Fatalf("human gate contract error = %v", err)
+	}
+}
+
+func TestWorkflowGateControlMatchesExactAndDeclaredSuffix(t *testing.T) {
+	contract := humanGateWorkflowContract{
+		Controls:           map[string]string{"approved": "[GATE APPROVED] pass 10"},
+		AcceptedVerdicts:   []string{"approved"},
+		AllowControlSuffix: true,
+	}
+	if verdict, ok := workflowGateControlVerdict(
+		contract,
+		"[GATE APPROVED] pass 10 s1-s5",
+	); !ok || verdict != "approved" {
+		t.Fatalf("batch control verdict=%q ok=%v", verdict, ok)
+	}
+	contract.AllowControlSuffix = false
+	if _, ok := workflowGateControlVerdict(
+		contract,
+		"[GATE APPROVED] pass 10 s1-s5",
+	); ok {
+		t.Fatal("undeclared control suffix was accepted")
+	}
+}
+
 func TestValidateWorkflowGraphRequiresDependencyClosedImport(t *testing.T) {
 	spec := validWorkflowGraphSpec()
 	spec.ImportedCheckpoints = []WorkflowImportedCheckpointSpec{

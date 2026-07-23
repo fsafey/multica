@@ -90,6 +90,15 @@ type deterministicWorkflowContract struct {
 	TimeoutSeconds int32    `json:"timeout_seconds,omitempty"`
 }
 
+type humanGateWorkflowContract struct {
+	Operation           string            `json:"operation"`
+	Gate                string            `json:"gate"`
+	Controls            map[string]string `json:"controls"`
+	AcceptedVerdicts    []string          `json:"accepted_verdicts"`
+	AutoPromoterAgentID string            `json:"auto_promoter_agent_id,omitempty"`
+	AllowControlSuffix  bool              `json:"allow_control_suffix,omitempty"`
+}
+
 type WorkflowArtifactSubmission struct {
 	TaskID         pgtype.UUID
 	AttemptID      pgtype.UUID
@@ -163,6 +172,32 @@ func resolveWorkflowSuccessorInputDigests(
 		}); err != nil {
 			return fmt.Errorf("set workflow successor input digest: %w", err)
 		}
+	}
+	return nil
+}
+
+func completeWorkflowRunIfTerminal(
+	ctx context.Context,
+	qtx *db.Queries,
+	runID pgtype.UUID,
+) error {
+	run, err := qtx.CompleteWorkflowRunIfTerminal(ctx, runID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"status":       run.Status,
+		"completed_at": run.CompletedAt,
+	})
+	if _, err := qtx.InsertWorkflowAuditEvent(ctx, db.InsertWorkflowAuditEventParams{
+		RunID:     runID,
+		EventType: "workflow.run_completed",
+		Payload:   payload,
+	}); err != nil {
+		return fmt.Errorf("record workflow run completion: %w", err)
 	}
 	return nil
 }
@@ -268,6 +303,7 @@ func validateWorkflowGraph(spec WorkflowGraphSpec) error {
 	byKey := make(map[string]WorkflowNodeSpec, len(spec.Nodes))
 	inDegree := make(map[string]int, len(spec.Nodes))
 	successors := make(map[string][]string, len(spec.Nodes))
+	hasDeterministicNode := false
 	for _, node := range spec.Nodes {
 		key := strings.TrimSpace(node.Key)
 		if key == "" {
@@ -288,7 +324,42 @@ func validateWorkflowGraph(spec WorkflowGraphSpec) error {
 			if node.AgentID.Valid || node.RuntimePoolID.Valid {
 				return fmt.Errorf("%s workflow node %q must not declare agent_id or runtime_pool_id", node.ExecutorKind, key)
 			}
+			if node.ExecutorKind == "human_gate" {
+				if len(node.DependsOn) != 1 {
+					return fmt.Errorf("human gate workflow node %q requires exactly one dependency", key)
+				}
+				var contract humanGateWorkflowContract
+				if err := json.Unmarshal(jsonObjectOrEmpty(node.OutputContract), &contract); err != nil {
+					return fmt.Errorf("human gate workflow node %q has invalid output_contract: %w", key, err)
+				}
+				if contract.Operation != "comment_gate_v1" || strings.TrimSpace(contract.Gate) == "" {
+					return fmt.Errorf("human gate workflow node %q requires comment_gate_v1 and a gate name", key)
+				}
+				if strings.TrimSpace(contract.Controls["approved"]) == "" ||
+					strings.TrimSpace(contract.Controls["rejected"]) == "" {
+					return fmt.Errorf("human gate workflow node %q requires approved and rejected controls", key)
+				}
+				accepted := make(map[string]bool, len(contract.AcceptedVerdicts))
+				for _, verdict := range contract.AcceptedVerdicts {
+					if verdict != "approved" && verdict != "auto_promoted" {
+						return fmt.Errorf("human gate workflow node %q has unsupported accepted verdict %q", key, verdict)
+					}
+					accepted[verdict] = true
+				}
+				if !accepted["approved"] {
+					return fmt.Errorf("human gate workflow node %q must accept approved", key)
+				}
+				if accepted["auto_promoted"] {
+					if strings.TrimSpace(contract.Controls["auto_promoted"]) == "" {
+						return fmt.Errorf("human gate workflow node %q accepts auto_promoted without a control", key)
+					}
+					if _, err := uuid.Parse(strings.TrimSpace(contract.AutoPromoterAgentID)); err != nil {
+						return fmt.Errorf("human gate workflow node %q requires a valid auto_promoter_agent_id", key)
+					}
+				}
+			}
 			if node.ExecutorKind == "deterministic" {
+				hasDeterministicNode = true
 				var contract deterministicWorkflowContract
 				if err := json.Unmarshal(jsonObjectOrEmpty(node.OutputContract), &contract); err != nil {
 					return fmt.Errorf("deterministic workflow node %q has invalid output_contract: %w", key, err)
@@ -367,6 +438,9 @@ func validateWorkflowGraph(spec WorkflowGraphSpec) error {
 	if visited != len(byKey) {
 		return errors.New("workflow graph contains a dependency cycle")
 	}
+	if hasDeterministicNode && !spec.IntegrationPoolID.Valid {
+		return errors.New("workflow graph with deterministic nodes requires integration_pool_id")
+	}
 	imported := make(map[string]struct{}, len(spec.ImportedCheckpoints))
 	for _, checkpoint := range spec.ImportedCheckpoints {
 		key := strings.TrimSpace(checkpoint.NodeKey)
@@ -413,11 +487,15 @@ func (s *WorkflowService) CreateWorkflowRun(ctx context.Context, spec WorkflowGr
 		return db.WorkflowRun{}, errors.New("workflow anchor issue does not belong to the selected project")
 	}
 	if spec.IntegrationPoolID.Valid {
-		if _, err := s.Queries.GetRuntimePoolInWorkspace(ctx, db.GetRuntimePoolInWorkspaceParams{
+		pool, err := s.Queries.GetRuntimePoolInWorkspace(ctx, db.GetRuntimePoolInWorkspaceParams{
 			ID:          spec.IntegrationPoolID,
 			WorkspaceID: spec.WorkspaceID,
-		}); err != nil {
+		})
+		if err != nil {
 			return db.WorkflowRun{}, fmt.Errorf("load integration runtime pool: %w", err)
+		}
+		if !pool.Enabled {
+			return db.WorkflowRun{}, errors.New("integration runtime pool is disabled")
 		}
 	}
 
@@ -618,6 +696,9 @@ func (s *WorkflowService) CreateWorkflowRun(ctx context.Context, spec WorkflowGr
 			if err := resolveWorkflowSuccessorInputDigests(ctx, qtx, successors); err != nil {
 				return fmt.Errorf("resolve successors after imported checkpoint %q: %w", checkpoint.NodeKey, err)
 			}
+		}
+		if err := completeWorkflowRunIfTerminal(ctx, qtx, created.ID); err != nil {
+			return fmt.Errorf("complete fully imported workflow run: %w", err)
 		}
 		return nil
 	})
@@ -1075,24 +1156,211 @@ func (s *WorkflowService) FailIntegration(
 	})
 }
 
+func workflowGateFirstLine(content string) string {
+	content = strings.NewReplacer(`\[`, `[`, `\]`, `]`, `\_`, `_`).Replace(content)
+	for _, line := range strings.Split(content, "\n") {
+		if trimmed := strings.TrimSpace(line); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func workflowGateControlVerdict(
+	contract humanGateWorkflowContract,
+	line string,
+) (string, bool) {
+	for verdict, control := range contract.Controls {
+		control = strings.TrimSpace(control)
+		if line == control ||
+			(contract.AllowControlSuffix && strings.HasPrefix(line, control+" ")) {
+			return verdict, true
+		}
+	}
+	return "", false
+}
+
+func workflowGateAccepts(contract humanGateWorkflowContract, verdict string) bool {
+	for _, accepted := range contract.AcceptedVerdicts {
+		if accepted == verdict {
+			return true
+		}
+	}
+	return false
+}
+
+func validateWorkflowGateComment(
+	ctx context.Context,
+	qtx *db.Queries,
+	workspaceID pgtype.UUID,
+	node db.WorkflowNode,
+	commentID pgtype.UUID,
+	verdict string,
+	contract humanGateWorkflowContract,
+) (db.Comment, string, error) {
+	comment, err := qtx.GetCommentInWorkspace(ctx, db.GetCommentInWorkspaceParams{
+		ID:          commentID,
+		WorkspaceID: workspaceID,
+	})
+	if err != nil {
+		return db.Comment{}, "", fmt.Errorf("load workflow gate comment: %w", err)
+	}
+	if !sameUUID(comment.IssueID, node.IssueID) {
+		return db.Comment{}, "", errors.New("workflow gate comment belongs to another issue")
+	}
+	if comment.ParentID.Valid {
+		return db.Comment{}, "", errors.New("workflow gate comment must be top-level")
+	}
+	firstLine := workflowGateFirstLine(comment.Content)
+	commentVerdict, recognized := workflowGateControlVerdict(contract, firstLine)
+	if !recognized || commentVerdict != verdict {
+		return db.Comment{}, "", errors.New("workflow gate comment does not match the requested verdict")
+	}
+	if !workflowGateAccepts(contract, verdict) {
+		return db.Comment{}, "", fmt.Errorf("workflow gate verdict %q is not accepted", verdict)
+	}
+	switch verdict {
+	case "approved":
+		if comment.AuthorType != "member" {
+			return db.Comment{}, "", errors.New("workflow gate approval must be member-authored")
+		}
+	case "auto_promoted":
+		autoPromoter, err := uuid.Parse(strings.TrimSpace(contract.AutoPromoterAgentID))
+		if err != nil ||
+			comment.AuthorType != "agent" ||
+			!comment.AuthorID.Valid ||
+			comment.AuthorID.Bytes != autoPromoter {
+			return db.Comment{}, "", errors.New("workflow gate auto-promotion has the wrong agent author")
+		}
+	default:
+		return db.Comment{}, "", fmt.Errorf("unsupported workflow gate verdict %q", verdict)
+	}
+
+	comments, err := qtx.ListRecentCommentsForIssue(ctx, db.ListRecentCommentsForIssueParams{
+		IssueID:     node.IssueID,
+		WorkspaceID: workspaceID,
+		Limit:       2000,
+	})
+	if err != nil {
+		return db.Comment{}, "", fmt.Errorf("list workflow gate comments: %w", err)
+	}
+	var latest pgtype.UUID
+	for _, candidate := range comments {
+		if candidate.ParentID.Valid {
+			continue
+		}
+		if _, ok := workflowGateControlVerdict(
+			contract,
+			workflowGateFirstLine(candidate.Content),
+		); ok {
+			latest = candidate.ID
+			break
+		}
+	}
+	if !sameUUID(latest, comment.ID) {
+		return db.Comment{}, "", errors.New("workflow gate comment is not the latest gate control")
+	}
+	return comment, firstLine, nil
+}
+
 func (s *WorkflowService) CompleteHumanGate(
 	ctx context.Context,
-	runID, nodeID pgtype.UUID,
+	workspaceID, runID, nodeID, commentID pgtype.UUID,
+	verdict, actorID string,
 ) (db.WorkflowNode, error) {
+	verdict = strings.TrimSpace(strings.ToLower(verdict))
 	var gate db.WorkflowNode
 	err := s.runInTx(ctx, func(qtx *db.Queries) error {
+		current, err := qtx.GetWorkflowNode(ctx, nodeID)
+		if err != nil {
+			return fmt.Errorf("load workflow human gate: %w", err)
+		}
+		if !sameUUID(current.RunID, runID) {
+			return errors.New("workflow human gate does not belong to the run")
+		}
+		if current.ExecutorKind != "human_gate" || current.State != "waiting_human" {
+			return errors.New("workflow human gate is not waiting for a verdict")
+		}
+		var contract humanGateWorkflowContract
+		if err := json.Unmarshal(current.OutputContract, &contract); err != nil {
+			return fmt.Errorf("parse workflow human gate contract: %w", err)
+		}
+		comment, control, err := validateWorkflowGateComment(
+			ctx,
+			qtx,
+			workspaceID,
+			current,
+			commentID,
+			verdict,
+			contract,
+		)
+		if err != nil {
+			return err
+		}
+		dependencyResult, err := qtx.GetWorkflowHumanGateDependencyResult(ctx, nodeID)
+		if err != nil {
+			return fmt.Errorf("load workflow human gate dependency result: %w", err)
+		}
+		contentDigest := sha256.Sum256([]byte(comment.Content))
+		manifest, err := json.Marshal(map[string]any{
+			"schema_version":               1,
+			"operation":                    "comment_gate_v1",
+			"gate":                         contract.Gate,
+			"verdict":                      verdict,
+			"control":                      control,
+			"comment_id":                   util.UUIDToString(comment.ID),
+			"comment_author_type":          comment.AuthorType,
+			"comment_author_id":            util.UUIDToString(comment.AuthorID),
+			"comment_content_sha256":       fmt.Sprintf("sha256:%x", contentDigest),
+			"predecessor_canonical_commit": dependencyResult.CanonicalCommit,
+			"predecessor_artifact_digest":  dependencyResult.ArtifactDigest,
+			"recorded_by":                  actorID,
+		})
+		if err != nil {
+			return fmt.Errorf("encode workflow human gate evidence: %w", err)
+		}
+		evidenceDigest := sha256.Sum256(manifest)
+		artifactDigest := fmt.Sprintf("sha256:%x", evidenceDigest)
+		attemptID := newWorkflowUUID()
+		nextEpoch := current.ClaimEpoch + 1
+		if _, err := qtx.CreateWorkflowHumanGateAttempt(ctx, db.CreateWorkflowHumanGateAttemptParams{
+			ID:              attemptID,
+			NodeID:          nodeID,
+			ClaimEpoch:      nextEpoch,
+			CanonicalCommit: optionalText(dependencyResult.CanonicalCommit),
+			ArtifactDigest:  optionalText(artifactDigest),
+			Manifest:        manifest,
+		}); err != nil {
+			return fmt.Errorf("create workflow human gate attempt: %w", err)
+		}
 		completed, err := qtx.CompleteWorkflowHumanGate(ctx, db.CompleteWorkflowHumanGateParams{
-			NodeID: nodeID,
-			RunID:  runID,
+			AttemptID: attemptID,
+			NodeID:    nodeID,
+			RunID:     runID,
 		})
 		if err != nil {
 			return fmt.Errorf("complete workflow human gate: %w", err)
 		}
+		if _, err := qtx.CreateWorkflowHumanGateResult(ctx, db.CreateWorkflowHumanGateResultParams{
+			AttemptID:       attemptID,
+			CanonicalCommit: dependencyResult.CanonicalCommit,
+			ArtifactDigest:  artifactDigest,
+			Manifest:        manifest,
+			NodeID:          nodeID,
+		}); err != nil {
+			return fmt.Errorf("create workflow human gate result: %w", err)
+		}
+		payload, _ := json.Marshal(map[string]any{
+			"executor_kind":   "human_gate",
+			"comment_id":      util.UUIDToString(comment.ID),
+			"verdict":         verdict,
+			"artifact_digest": artifactDigest,
+		})
 		if _, err := qtx.InsertWorkflowOutbox(ctx, db.InsertWorkflowOutboxParams{
 			RunID:     runID,
 			NodeID:    nodeID,
 			EventType: "workflow.node_accepted",
-			Payload:   []byte(`{"executor_kind":"human_gate"}`),
+			Payload:   payload,
 		}); err != nil {
 			return fmt.Errorf("enqueue gate successor release: %w", err)
 		}
@@ -1100,6 +1368,131 @@ func (s *WorkflowService) CompleteHumanGate(
 		return nil
 	})
 	return gate, err
+}
+
+func (s *WorkflowService) PauseRun(
+	ctx context.Context,
+	workspaceID, runID pgtype.UUID,
+	actorID string,
+) (db.WorkflowRun, error) {
+	var run db.WorkflowRun
+	err := s.runInTx(ctx, func(qtx *db.Queries) error {
+		paused, err := qtx.PauseWorkflowRun(ctx, db.PauseWorkflowRunParams{
+			ID:          runID,
+			WorkspaceID: workspaceID,
+		})
+		if err != nil {
+			return fmt.Errorf("pause workflow run: %w", err)
+		}
+		payload, _ := json.Marshal(map[string]any{"command": "pause", "actor_id": actorID})
+		if _, err := qtx.InsertWorkflowAuditEvent(ctx, db.InsertWorkflowAuditEventParams{
+			RunID:     runID,
+			EventType: "workflow.operator_pause",
+			Payload:   payload,
+		}); err != nil {
+			return fmt.Errorf("audit workflow pause: %w", err)
+		}
+		run = paused
+		return nil
+	})
+	return run, err
+}
+
+func (s *WorkflowService) ResumeRun(
+	ctx context.Context,
+	workspaceID, runID pgtype.UUID,
+	actorID string,
+) (db.WorkflowRun, error) {
+	var run db.WorkflowRun
+	err := s.runInTx(ctx, func(qtx *db.Queries) error {
+		resumed, err := qtx.ResumeWorkflowRun(ctx, db.ResumeWorkflowRunParams{
+			ID:          runID,
+			WorkspaceID: workspaceID,
+		})
+		if err != nil {
+			return fmt.Errorf("resume workflow run: %w", err)
+		}
+		payload, _ := json.Marshal(map[string]any{"command": "resume", "actor_id": actorID})
+		if _, err := qtx.InsertWorkflowAuditEvent(ctx, db.InsertWorkflowAuditEventParams{
+			RunID:     runID,
+			EventType: "workflow.operator_resume",
+			Payload:   payload,
+		}); err != nil {
+			return fmt.Errorf("audit workflow resume: %w", err)
+		}
+		run = resumed
+		return nil
+	})
+	return run, err
+}
+
+func (s *WorkflowService) CancelRun(
+	ctx context.Context,
+	workspaceID, runID pgtype.UUID,
+	actorID string,
+) (db.WorkflowRun, error) {
+	var run db.WorkflowRun
+	err := s.runInTx(ctx, func(qtx *db.Queries) error {
+		if _, err := qtx.GetWorkflowRunInWorkspace(ctx, db.GetWorkflowRunInWorkspaceParams{
+			ID:          runID,
+			WorkspaceID: workspaceID,
+		}); err != nil {
+			return fmt.Errorf("load workflow run for cancellation: %w", err)
+		}
+		if err := qtx.AcquireWorkflowClaimLock(ctx); err != nil {
+			return fmt.Errorf("acquire workflow cancellation lock: %w", err)
+		}
+		processingIntegrations, err := qtx.CountProcessingWorkflowIntegrationEventsForRun(ctx, runID)
+		if err != nil {
+			return fmt.Errorf("count processing workflow integrations: %w", err)
+		}
+		if processingIntegrations > 0 {
+			return errors.New("workflow run has a processing integration job; pause and drain integration before cancellation")
+		}
+		message := pgtype.Text{String: "cancelled by workflow operator", Valid: true}
+		if _, err := qtx.CancelWorkflowRunAttempts(ctx, db.CancelWorkflowRunAttemptsParams{
+			Error: message,
+			RunID: runID,
+		}); err != nil {
+			return fmt.Errorf("cancel workflow run attempts: %w", err)
+		}
+		if _, err := qtx.CancelWorkflowRunTasks(ctx, db.CancelWorkflowRunTasksParams{
+			Error: message,
+			RunID: runID,
+		}); err != nil {
+			return fmt.Errorf("cancel workflow run tasks: %w", err)
+		}
+		if _, err := qtx.ReleaseWorkflowRunResources(ctx, runID); err != nil {
+			return fmt.Errorf("release workflow run resources: %w", err)
+		}
+		if _, err := qtx.CancelWorkflowRunOutbox(ctx, db.CancelWorkflowRunOutboxParams{
+			Error: message,
+			RunID: runID,
+		}); err != nil {
+			return fmt.Errorf("cancel workflow run outbox: %w", err)
+		}
+		if _, err := qtx.CancelWorkflowRunNodes(ctx, runID); err != nil {
+			return fmt.Errorf("cancel workflow run nodes: %w", err)
+		}
+		cancelled, err := qtx.CancelWorkflowRun(ctx, db.CancelWorkflowRunParams{
+			ID:          runID,
+			WorkspaceID: workspaceID,
+		})
+		if err != nil {
+			return fmt.Errorf("cancel workflow run: %w", err)
+		}
+		payload, _ := json.Marshal(map[string]any{"command": "cancel_run", "actor_id": actorID})
+		if _, err := qtx.InsertWorkflowAuditEvent(ctx, db.InsertWorkflowAuditEventParams{
+			RunID:     runID,
+			EventType: "workflow.operator_cancel_run",
+			Payload:   payload,
+		}); err != nil {
+			return fmt.Errorf("audit workflow run cancellation: %w", err)
+		}
+		run = cancelled
+		return nil
+	})
+	return run, err
 }
 
 func (s *WorkflowService) RetryNode(
@@ -1144,6 +1537,16 @@ func (s *WorkflowService) CancelNode(
 ) (db.WorkflowNode, error) {
 	var cancelled db.WorkflowNode
 	err := s.runInTx(ctx, func(qtx *db.Queries) error {
+		if err := qtx.AcquireWorkflowClaimLock(ctx); err != nil {
+			return fmt.Errorf("acquire workflow node cancellation lock: %w", err)
+		}
+		processingIntegrations, err := qtx.CountProcessingWorkflowIntegrationEventsForNode(ctx, nodeID)
+		if err != nil {
+			return fmt.Errorf("count processing workflow node integrations: %w", err)
+		}
+		if processingIntegrations > 0 {
+			return errors.New("workflow node has a processing integration job; drain integration before cancellation")
+		}
 		current, err := qtx.GetWorkflowNode(ctx, nodeID)
 		if err != nil {
 			return fmt.Errorf("load workflow node: %w", err)
@@ -1232,6 +1635,9 @@ func (s *WorkflowService) ProcessOutbox(ctx context.Context, maxEvents int32) (i
 			}
 			if _, err := qtx.CompleteWorkflowOutboxEvent(ctx, event.ID); err != nil {
 				return fmt.Errorf("complete workflow outbox event: %w", err)
+			}
+			if err := completeWorkflowRunIfTerminal(ctx, qtx, event.RunID); err != nil {
+				return fmt.Errorf("complete terminal workflow run: %w", err)
 			}
 			processed++
 		}

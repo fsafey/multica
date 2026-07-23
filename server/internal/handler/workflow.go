@@ -355,6 +355,11 @@ func (h *Handler) GetWorkflowRun(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+type workflowGateCompleteRequest struct {
+	CommentID string `json:"comment_id"`
+	Verdict   string `json:"verdict"`
+}
+
 func (h *Handler) CompleteWorkflowGate(w http.ResponseWriter, r *http.Request) {
 	workspaceID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "id"), "workspace_id")
 	if !ok {
@@ -374,12 +379,96 @@ func (h *Handler) CompleteWorkflowGate(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	node, err := h.WorkflowService.CompleteHumanGate(r.Context(), runID, nodeID)
+	var req workflowGateCompleteRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid workflow gate payload")
+		return
+	}
+	commentID, err := util.ParseUUID(req.CommentID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "comment_id must be a UUID")
+		return
+	}
+	node, err := h.WorkflowService.CompleteHumanGate(
+		r.Context(),
+		workspaceID,
+		runID,
+		nodeID,
+		commentID,
+		req.Verdict,
+		requestUserID(r),
+	)
 	if err != nil {
 		writeError(w, http.StatusConflict, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, node)
+}
+
+func (h *Handler) PauseWorkflowRun(w http.ResponseWriter, r *http.Request) {
+	workspaceID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "id"), "workspace_id")
+	if !ok {
+		return
+	}
+	runID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "runId"), "run_id")
+	if !ok {
+		return
+	}
+	run, err := h.WorkflowService.PauseRun(
+		r.Context(),
+		workspaceID,
+		runID,
+		requestUserID(r),
+	)
+	if err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, run)
+}
+
+func (h *Handler) ResumeWorkflowRun(w http.ResponseWriter, r *http.Request) {
+	workspaceID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "id"), "workspace_id")
+	if !ok {
+		return
+	}
+	runID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "runId"), "run_id")
+	if !ok {
+		return
+	}
+	run, err := h.WorkflowService.ResumeRun(
+		r.Context(),
+		workspaceID,
+		runID,
+		requestUserID(r),
+	)
+	if err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, run)
+}
+
+func (h *Handler) CancelWorkflowRun(w http.ResponseWriter, r *http.Request) {
+	workspaceID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "id"), "workspace_id")
+	if !ok {
+		return
+	}
+	runID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "runId"), "run_id")
+	if !ok {
+		return
+	}
+	run, err := h.WorkflowService.CancelRun(
+		r.Context(),
+		workspaceID,
+		runID,
+		requestUserID(r),
+	)
+	if err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, run)
 }
 
 type workflowRetryRequest struct {
