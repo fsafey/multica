@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/analytics"
 	"github.com/multica-ai/multica/server/internal/auth"
@@ -2920,13 +2919,12 @@ func workflowBundleArtifactKey(
 	digest string,
 ) string {
 	return fmt.Sprintf(
-		"workflows/%s/%s/%s/%s-%s-%s.bundle",
+		"workflows/%s/%s/%s/%s-%s.bundle",
 		workspaceID,
 		manifest.RunID,
 		manifest.NodeID,
 		manifest.AttemptID,
 		digest,
-		uuid.NewString(),
 	)
 }
 
@@ -2971,12 +2969,13 @@ func (h *Handler) SubmitWorkflowBundle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if attempt.Status == "submitted" || attempt.Status == "integrated" {
-		// Consume a valid retry body before acknowledging an already durable
-		// submission. Returning early can otherwise close the connection while
-		// the daemon is still writing a bundle larger than net/http's automatic
-		// drain allowance, hiding this 200 behind a transport error.
-		r.Body = http.MaxBytesReader(w, r.Body, service.MaxWorkflowBundleSize+(2<<20))
-		_, _ = io.Copy(io.Discard, r.Body)
+		// Expect: 100-continue lets the daemon learn the durable result without
+		// retransmitting the bundle. Older clients may already be streaming, so
+		// drain their bounded body before returning to preserve the connection.
+		if !strings.EqualFold(r.Header.Get("Expect"), "100-continue") {
+			r.Body = http.MaxBytesReader(w, r.Body, service.MaxWorkflowBundleSize+(2<<20))
+			_, _ = io.Copy(io.Discard, r.Body)
+		}
 		writeJSON(w, http.StatusOK, attempt)
 		return
 	}
@@ -2985,9 +2984,12 @@ func (h *Handler) SubmitWorkflowBundle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, service.MaxWorkflowBundleSize+(2<<20))
-	if err := r.ParseMultipartForm(service.MaxWorkflowBundleSize + (2 << 20)); err != nil {
+	if err := r.ParseMultipartForm(1 << 20); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid workflow bundle form")
 		return
+	}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
 	}
 	file, _, err := r.FormFile("bundle")
 	if err != nil {
@@ -3038,10 +3040,10 @@ func (h *Handler) SubmitWorkflowBundle(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "workflow bundle manifest does not match the active claim")
 		return
 	}
-	// Each HTTP attempt owns a distinct object. A retry can overlap the
-	// original request after an intermediary returns a transient 5xx while the
-	// origin keeps processing. A request-unique key lets the losing request
-	// delete only its own upload.
+	// Retries of one immutable submission share a content-addressed key.
+	// Concurrent uploads therefore write identical bytes, bound orphan storage
+	// to one object per attempt and digest, and let a later retry self-heal a
+	// failed upload without racing a winner's artifact.
 	artifactKey := workflowBundleArtifactKey(workspaceID, manifest, digest)
 	if _, err := h.Storage.Upload(r.Context(), artifactKey, bundle, "application/x-git-bundle", manifest.AttemptID+".bundle"); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to store workflow bundle")
@@ -3065,15 +3067,9 @@ func (h *Handler) SubmitWorkflowBundle(w http.ResponseWriter, r *http.Request) {
 		)
 		defer cancelCleanup()
 		current, currentErr := h.Queries.GetWorkflowAttemptByTask(cleanupCtx, task.ID)
-		// Preserve this upload when PostgreSQL committed the submission but the
-		// commit acknowledgement was lost. A different committed key means a
-		// concurrent request won, so this request can remove only its own
-		// request-unique object. On read failure, retain the object rather than
-		// risk deleting the sole durable artifact.
-		if currentErr == nil &&
-			(!current.ArtifactKey.Valid || current.ArtifactKey.String != artifactKey) {
-			h.Storage.Delete(cleanupCtx, artifactKey)
-		}
+		// Never delete the content-addressed object here. An overlapping request
+		// may still be committing the same key, while any failed retry is
+		// bounded to that one key and will overwrite it on its next attempt.
 		if currentErr == nil && workflowAttemptMatchesSubmission(
 			current,
 			attempt.ID,

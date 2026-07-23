@@ -34,6 +34,9 @@ func TestSubmitWorkflowBundleRetriesTransientFailureWithSameArtifact(t *testing.
 		if got := r.URL.Path; got != "/api/daemon/tasks/task-1/workflow-bundle" {
 			t.Errorf("path = %q, want workflow bundle endpoint", got)
 		}
+		if got := r.Header.Get("Expect"); got != "100-continue" {
+			t.Errorf("Expect = %q, want 100-continue", got)
+		}
 		if err := r.ParseMultipartForm(1 << 20); err != nil {
 			t.Errorf("parse multipart form: %v", err)
 			http.Error(w, "invalid test multipart form", http.StatusBadRequest)

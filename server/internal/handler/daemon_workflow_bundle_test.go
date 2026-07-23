@@ -10,7 +10,6 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 
@@ -44,7 +43,7 @@ func (s *workflowCommitOnUploadStorage) Upload(
 	return url, nil
 }
 
-func TestWorkflowBundleArtifactKeyIsUniquePerRequest(t *testing.T) {
+func TestWorkflowBundleArtifactKeyIsStablePerImmutableSubmission(t *testing.T) {
 	manifest := workflowBundleManifest{
 		RunID:     "run-1",
 		NodeID:    "node-1",
@@ -54,14 +53,12 @@ func TestWorkflowBundleArtifactKeyIsUniquePerRequest(t *testing.T) {
 	first := workflowBundleArtifactKey("workspace-1", manifest, "digest-1")
 	second := workflowBundleArtifactKey("workspace-1", manifest, "digest-1")
 
-	if first == second {
-		t.Fatalf("artifact keys must be request-unique: %q", first)
+	if first != second {
+		t.Fatalf("artifact keys must be retry-stable: %q != %q", first, second)
 	}
-	prefix := "workflows/workspace-1/run-1/node-1/attempt-1-digest-1-"
-	for _, key := range []string{first, second} {
-		if !strings.HasPrefix(key, prefix) || !strings.HasSuffix(key, ".bundle") {
-			t.Errorf("artifact key %q does not preserve the workflow scope", key)
-		}
+	want := "workflows/workspace-1/run-1/node-1/attempt-1-digest-1.bundle"
+	if first != want {
+		t.Fatalf("artifact key = %q, want %q", first, want)
 	}
 }
 
@@ -108,18 +105,10 @@ func TestWorkflowAttemptMatchesSubmission(t *testing.T) {
 }
 
 func TestSubmitWorkflowBundlePreservesArtifactWhenCommitAckIsLost(t *testing.T) {
-	testSubmitWorkflowBundleConvergence(t, true, true)
+	testSubmitWorkflowBundleConvergence(t)
 }
 
-func TestSubmitWorkflowBundleDeletesOnlyLosingRequestArtifact(t *testing.T) {
-	testSubmitWorkflowBundleConvergence(t, false, false)
-}
-
-func testSubmitWorkflowBundleConvergence(
-	t *testing.T,
-	commitRequestArtifact bool,
-	cancelRequestAfterCommit bool,
-) {
+func testSubmitWorkflowBundleConvergence(t *testing.T) {
 	ctx := context.Background()
 	daemonID := fmt.Sprintf("workflow-bundle-test-%d", time.Now().UnixNano())
 
@@ -269,18 +258,10 @@ func testSubmitWorkflowBundleConvergence(
 	}
 
 	storage := &workflowCommitOnUploadStorage{}
-	var requestArtifactKey string
 	var committedArtifactKey string
 	var cancelRequest context.CancelFunc
 	storage.onUpload = func(key string, data []byte) error {
-		requestArtifactKey = key
 		committedArtifactKey = key
-		if !commitRequestArtifact {
-			committedArtifactKey = key + "-concurrent-winner"
-			storage.mu.Lock()
-			storage.files[committedArtifactKey] = append([]byte(nil), data...)
-			storage.mu.Unlock()
-		}
 		_, err := testPool.Exec(context.Background(), `
 			UPDATE workflow_node_attempt
 			SET status = 'submitted',
@@ -294,7 +275,7 @@ func testSubmitWorkflowBundleConvergence(
 			    completed_at = now()
 			WHERE id = $1
 		`, attemptID, manifest.BaseCommit, manifest.ResultCommit, committedArtifactKey, digest, int64(len(data)), manifestRaw)
-		if err == nil && cancelRequestAfterCommit {
+		if err == nil {
 			cancelRequest()
 		}
 		return err
@@ -356,13 +337,9 @@ func testSubmitWorkflowBundleConvergence(
 	}
 	storage.mu.Lock()
 	_, preserved := storage.files[storedKey]
-	_, requestArtifactPreserved := storage.files[requestArtifactKey]
 	storage.mu.Unlock()
 	if !preserved {
 		t.Fatalf("committed artifact %q was deleted after convergence", storedKey)
-	}
-	if !commitRequestArtifact && requestArtifactPreserved {
-		t.Fatalf("losing request artifact %q was not deleted", requestArtifactKey)
 	}
 
 	replayBody := bytes.NewReader(requestPayload)
@@ -398,5 +375,44 @@ func testSubmitWorkflowBundleConvergence(
 	}
 	if replayBody.Len() != 0 {
 		t.Fatalf("replay returned before draining %d request bytes", replayBody.Len())
+	}
+
+	expectBody := bytes.NewReader(requestPayload)
+	expectRequest := httptest.NewRequest(
+		http.MethodPost,
+		"/api/daemon/tasks/"+taskID+"/workflow-bundle",
+		expectBody,
+	)
+	expectRequest.Header.Set("Content-Type", writer.FormDataContentType())
+	expectRequest.Header.Set("Expect", "100-continue")
+	expectRouteContext := chi.NewRouteContext()
+	expectRouteContext.URLParams.Add("taskId", taskID)
+	expectContext := context.WithValue(
+		expectRequest.Context(),
+		chi.RouteCtxKey,
+		expectRouteContext,
+	)
+	expectContext = middleware.WithDaemonContext(
+		expectContext,
+		testWorkspaceID,
+		daemonID,
+	)
+	expectRequest = expectRequest.WithContext(expectContext)
+	expectResponse := httptest.NewRecorder()
+
+	handler.SubmitWorkflowBundle(expectResponse, expectRequest)
+
+	if expectResponse.Code != http.StatusOK {
+		t.Fatalf(
+			"expect replay status = %d, want 200; body=%s",
+			expectResponse.Code,
+			expectResponse.Body.String(),
+		)
+	}
+	if expectBody.Len() != len(requestPayload) {
+		t.Fatalf(
+			"expect replay consumed %d bytes before early response",
+			len(requestPayload)-expectBody.Len(),
+		)
 	}
 }

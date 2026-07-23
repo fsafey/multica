@@ -506,6 +506,7 @@ func (c *Client) SubmitWorkflowBundle(
 			return err
 		}
 		req.Header.Set("Content-Type", contentType)
+		req.Header.Set("Expect", "100-continue")
 		if c.token != "" {
 			req.Header.Set("Authorization", "Bearer "+c.token)
 		}
