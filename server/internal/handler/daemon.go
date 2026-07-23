@@ -2971,6 +2971,12 @@ func (h *Handler) SubmitWorkflowBundle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if attempt.Status == "submitted" || attempt.Status == "integrated" {
+		// Consume a valid retry body before acknowledging an already durable
+		// submission. Returning early can otherwise close the connection while
+		// the daemon is still writing a bundle larger than net/http's automatic
+		// drain allowance, hiding this 200 behind a transport error.
+		r.Body = http.MaxBytesReader(w, r.Body, service.MaxWorkflowBundleSize+(2<<20))
+		_, _ = io.Copy(io.Discard, r.Body)
 		writeJSON(w, http.StatusOK, attempt)
 		return
 	}
@@ -3053,15 +3059,20 @@ func (h *Handler) SubmitWorkflowBundle(w http.ResponseWriter, r *http.Request) {
 		Manifest:       manifestRaw,
 	})
 	if err != nil {
-		current, currentErr := h.Queries.GetWorkflowAttemptByTask(r.Context(), task.ID)
+		cleanupCtx, cancelCleanup := context.WithTimeout(
+			context.WithoutCancel(r.Context()),
+			5*time.Second,
+		)
+		defer cancelCleanup()
+		current, currentErr := h.Queries.GetWorkflowAttemptByTask(cleanupCtx, task.ID)
 		// Preserve this upload when PostgreSQL committed the submission but the
 		// commit acknowledgement was lost. A different committed key means a
 		// concurrent request won, so this request can remove only its own
-		// request-unique object. On read failure, leak safely for storage GC
-		// rather than risk deleting the sole durable artifact.
+		// request-unique object. On read failure, retain the object rather than
+		// risk deleting the sole durable artifact.
 		if currentErr == nil &&
 			(!current.ArtifactKey.Valid || current.ArtifactKey.String != artifactKey) {
-			h.Storage.Delete(r.Context(), artifactKey)
+			h.Storage.Delete(cleanupCtx, artifactKey)
 		}
 		if currentErr == nil && workflowAttemptMatchesSubmission(
 			current,

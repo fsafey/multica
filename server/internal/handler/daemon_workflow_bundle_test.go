@@ -108,6 +108,18 @@ func TestWorkflowAttemptMatchesSubmission(t *testing.T) {
 }
 
 func TestSubmitWorkflowBundlePreservesArtifactWhenCommitAckIsLost(t *testing.T) {
+	testSubmitWorkflowBundleConvergence(t, true, true)
+}
+
+func TestSubmitWorkflowBundleDeletesOnlyLosingRequestArtifact(t *testing.T) {
+	testSubmitWorkflowBundleConvergence(t, false, false)
+}
+
+func testSubmitWorkflowBundleConvergence(
+	t *testing.T,
+	commitRequestArtifact bool,
+	cancelRequestAfterCommit bool,
+) {
 	ctx := context.Background()
 	daemonID := fmt.Sprintf("workflow-bundle-test-%d", time.Now().UnixNano())
 
@@ -257,7 +269,18 @@ func TestSubmitWorkflowBundlePreservesArtifactWhenCommitAckIsLost(t *testing.T) 
 	}
 
 	storage := &workflowCommitOnUploadStorage{}
+	var requestArtifactKey string
+	var committedArtifactKey string
+	var cancelRequest context.CancelFunc
 	storage.onUpload = func(key string, data []byte) error {
+		requestArtifactKey = key
+		committedArtifactKey = key
+		if !commitRequestArtifact {
+			committedArtifactKey = key + "-concurrent-winner"
+			storage.mu.Lock()
+			storage.files[committedArtifactKey] = append([]byte(nil), data...)
+			storage.mu.Unlock()
+		}
 		_, err := testPool.Exec(context.Background(), `
 			UPDATE workflow_node_attempt
 			SET status = 'submitted',
@@ -270,7 +293,10 @@ func TestSubmitWorkflowBundlePreservesArtifactWhenCommitAckIsLost(t *testing.T) 
 			    submitted_at = now(),
 			    completed_at = now()
 			WHERE id = $1
-		`, attemptID, manifest.BaseCommit, manifest.ResultCommit, key, digest, int64(len(data)), manifestRaw)
+		`, attemptID, manifest.BaseCommit, manifest.ResultCommit, committedArtifactKey, digest, int64(len(data)), manifestRaw)
+		if err == nil && cancelRequestAfterCommit {
+			cancelRequest()
+		}
 		return err
 	}
 	handler := *testHandler
@@ -294,16 +320,20 @@ func TestSubmitWorkflowBundlePreservesArtifactWhenCommitAckIsLost(t *testing.T) 
 	if err := writer.Close(); err != nil {
 		t.Fatalf("close multipart body: %v", err)
 	}
+	requestPayload := append([]byte(nil), body.Bytes()...)
 
 	request := httptest.NewRequest(
 		http.MethodPost,
 		"/api/daemon/tasks/"+taskID+"/workflow-bundle",
-		&body,
+		bytes.NewReader(requestPayload),
 	)
 	request.Header.Set("Content-Type", writer.FormDataContentType())
 	routeContext := chi.NewRouteContext()
 	routeContext.URLParams.Add("taskId", taskID)
-	requestContext := context.WithValue(request.Context(), chi.RouteCtxKey, routeContext)
+	requestContext, requestCancel := context.WithCancel(request.Context())
+	cancelRequest = requestCancel
+	defer requestCancel()
+	requestContext = context.WithValue(requestContext, chi.RouteCtxKey, routeContext)
 	requestContext = middleware.WithDaemonContext(
 		requestContext,
 		testWorkspaceID,
@@ -326,8 +356,47 @@ func TestSubmitWorkflowBundlePreservesArtifactWhenCommitAckIsLost(t *testing.T) 
 	}
 	storage.mu.Lock()
 	_, preserved := storage.files[storedKey]
+	_, requestArtifactPreserved := storage.files[requestArtifactKey]
 	storage.mu.Unlock()
 	if !preserved {
 		t.Fatalf("committed artifact %q was deleted after convergence", storedKey)
+	}
+	if !commitRequestArtifact && requestArtifactPreserved {
+		t.Fatalf("losing request artifact %q was not deleted", requestArtifactKey)
+	}
+
+	replayBody := bytes.NewReader(requestPayload)
+	replayRequest := httptest.NewRequest(
+		http.MethodPost,
+		"/api/daemon/tasks/"+taskID+"/workflow-bundle",
+		replayBody,
+	)
+	replayRequest.Header.Set("Content-Type", writer.FormDataContentType())
+	replayRouteContext := chi.NewRouteContext()
+	replayRouteContext.URLParams.Add("taskId", taskID)
+	replayContext := context.WithValue(
+		replayRequest.Context(),
+		chi.RouteCtxKey,
+		replayRouteContext,
+	)
+	replayContext = middleware.WithDaemonContext(
+		replayContext,
+		testWorkspaceID,
+		daemonID,
+	)
+	replayRequest = replayRequest.WithContext(replayContext)
+	replayResponse := httptest.NewRecorder()
+
+	handler.SubmitWorkflowBundle(replayResponse, replayRequest)
+
+	if replayResponse.Code != http.StatusOK {
+		t.Fatalf(
+			"replay status = %d, want 200; body=%s",
+			replayResponse.Code,
+			replayResponse.Body.String(),
+		)
+	}
+	if replayBody.Len() != 0 {
+		t.Fatalf("replay returned before draining %d request bytes", replayBody.Len())
 	}
 }
