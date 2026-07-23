@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
@@ -217,6 +218,39 @@ func TestWorkflowClaimFiftyWorkersCreateOneAttempt(t *testing.T) {
 	}
 	if attempts != 1 || claims != 1 || tasks != 1 {
 		t.Fatalf("attempts=%d claims=%d tasks=%d, want 1 each", attempts, claims, tasks)
+	}
+	var workflowTaskID string
+	if err := pool.QueryRow(ctx,
+		`SELECT id FROM agent_task_queue WHERE workflow_node_id = $1`,
+		nodeID,
+	).Scan(&workflowTaskID); err != nil {
+		t.Fatalf("load workflow task: %v", err)
+	}
+	taskService := NewTaskService(db.New(pool), pool, nil, events.New())
+	startedTask, err := taskService.StartTask(ctx, util.MustParseUUID(workflowTaskID))
+	if err != nil {
+		t.Fatalf("start materialized workflow task: %v", err)
+	}
+	if startedTask.Status != "running" {
+		t.Fatalf("started task status = %q, want running", startedTask.Status)
+	}
+	var attemptStatus, nodeState string
+	var attemptStarted bool
+	if err := pool.QueryRow(ctx, `
+		SELECT a.status, a.started_at IS NOT NULL, n.state
+		FROM workflow_node_attempt a
+		JOIN workflow_node n ON n.id = a.node_id
+		WHERE a.node_id = $1
+	`, nodeID).Scan(&attemptStatus, &attemptStarted, &nodeState); err != nil {
+		t.Fatalf("load started workflow state: %v", err)
+	}
+	if attemptStatus != "running" || !attemptStarted || nodeState != "running" {
+		t.Fatalf(
+			"attempt status=%q started=%t node state=%q, want running, true, running",
+			attemptStatus,
+			attemptStarted,
+			nodeState,
+		)
 	}
 	var preferredAtClaim *string
 	var affinityStolen bool

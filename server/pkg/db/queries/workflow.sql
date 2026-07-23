@@ -730,7 +730,7 @@ LIMIT 1;
 -- name: StartWorkflowAttemptByTask :one
 UPDATE workflow_node_attempt a
 SET status = 'running',
-    started_at = COALESCE(started_at, now()),
+    started_at = COALESCE(a.started_at, now()),
     lease_expires_at = now() + make_interval(secs => @lease_seconds::double precision)
 FROM workflow_node n
 WHERE a.task_id = @task_id
