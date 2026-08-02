@@ -411,6 +411,11 @@ func TestIssueProjectMoveDoesNotReplaceClaimTimeEvidence(t *testing.T) {
 		CustomEnvironmentNames: []string{},
 		MCPServerNames:         []string{},
 	}
+	snapshot.ProjectID = "11111111-1111-4111-8111-111111111111"
+	if w := recordEvidenceRequest(t, taskID, snapshot); w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "project does not match") {
+		t.Fatalf("projectless run-only evidence with a project = %d: %s", w.Code, w.Body.String())
+	}
+	snapshot.ProjectID = ""
 	if w := recordEvidenceRequest(t, taskID, snapshot); w.Code != http.StatusCreated {
 		t.Fatalf("claim-time project evidence: expected 201, got %d: %s", w.Code, w.Body.String())
 	}
@@ -554,6 +559,108 @@ func TestQuickCreateEvidenceUsesContextProject(t *testing.T) {
 	}
 	if w := recordEvidenceRequest(t, taskID, snapshot); w.Code != http.StatusCreated {
 		t.Fatalf("quick-create evidence write: expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestAutopilotRunOnlyEvidenceUsesAutopilotProject(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	runtimeID, agentID, _, taskID := createRunningEvidenceTask(t)
+
+	var projectID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO project (workspace_id, title) VALUES ($1, 'execution evidence autopilot project') RETURNING id
+	`, testWorkspaceID).Scan(&projectID); err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	var autopilotID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO autopilot (
+			workspace_id, project_id, title, description, assignee_id, execution_mode,
+			created_by_type, created_by_id
+		)
+		VALUES ($1, $2, 'execution evidence run only', 'project-bound run only', $3, 'run_only', 'member', $4)
+		RETURNING id
+	`, testWorkspaceID, projectID, agentID, testUserID).Scan(&autopilotID); err != nil {
+		t.Fatalf("create autopilot: %v", err)
+	}
+	var runID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO autopilot_run (autopilot_id, source, status)
+		VALUES ($1, 'manual', 'running')
+		RETURNING id
+	`, autopilotID).Scan(&runID); err != nil {
+		t.Fatalf("create autopilot run: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		UPDATE agent_task_queue SET issue_id = NULL, autopilot_run_id = $2 WHERE id = $1
+	`, taskID, runID); err != nil {
+		t.Fatalf("link running task to autopilot run: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `UPDATE agent_task_queue SET autopilot_run_id = NULL WHERE id = $1`, taskID)
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM autopilot_run WHERE id = $1`, runID)
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM autopilot WHERE id = $1`, autopilotID)
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM project WHERE id = $1`, projectID)
+	})
+
+	snapshot := executionevidence.Snapshot{
+		SchemaVersion:          executionevidence.CurrentSchemaVersion,
+		TaskID:                 taskID,
+		Provider:               "handler_test_runtime",
+		InvocationModel:        "claude-sonnet-5",
+		InvocationModelSource:  "agent",
+		ProviderCLIVersion:     "2.1.0",
+		MulticaCLIVersion:      "v0.4.3",
+		MulticaGitCommit:       "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		AgentID:                agentID,
+		RuntimeID:              runtimeID,
+		WorkspaceID:            testWorkspaceID,
+		ProjectID:              "11111111-1111-4111-8111-111111111111",
+		MountedSkills:          []executionevidence.MountedSkill{},
+		CustomArguments:        []string{},
+		CustomEnvironmentNames: []string{},
+		MCPServerNames:         []string{},
+	}
+	if w := recordEvidenceRequest(t, taskID, snapshot); w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "project does not match") {
+		t.Fatalf("mismatched autopilot project evidence = %d: %s", w.Code, w.Body.String())
+	}
+
+	snapshot.ProjectID = projectID
+	if w := recordEvidenceRequest(t, taskID, snapshot); w.Code != http.StatusCreated {
+		t.Fatalf("matching autopilot project evidence = %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestProjectlessRunOnlyEvidenceRequiresEmptyProject(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	runtimeID, agentID, _, taskID := createRunningEvidenceTask(t)
+	if _, err := testPool.Exec(context.Background(), `UPDATE agent_task_queue SET issue_id = NULL WHERE id = $1`, taskID); err != nil {
+		t.Fatalf("convert task to projectless run-only fixture: %v", err)
+	}
+	snapshot := executionevidence.Snapshot{
+		SchemaVersion:          executionevidence.CurrentSchemaVersion,
+		TaskID:                 taskID,
+		Provider:               "handler_test_runtime",
+		InvocationModel:        "claude-sonnet-5",
+		InvocationModelSource:  "agent",
+		ProviderCLIVersion:     "2.1.0",
+		MulticaCLIVersion:      "v0.4.3",
+		MulticaGitCommit:       "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		AgentID:                agentID,
+		RuntimeID:              runtimeID,
+		WorkspaceID:            testWorkspaceID,
+		MountedSkills:          []executionevidence.MountedSkill{},
+		CustomArguments:        []string{},
+		CustomEnvironmentNames: []string{},
+		MCPServerNames:         []string{},
+	}
+	if w := recordEvidenceRequest(t, taskID, snapshot); w.Code != http.StatusCreated {
+		t.Fatalf("projectless run-only evidence = %d: %s", w.Code, w.Body.String())
 	}
 }
 

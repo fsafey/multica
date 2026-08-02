@@ -2,6 +2,7 @@ package handler
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -93,15 +94,15 @@ func (h *Handler) RecordTaskExecutionEvidence(w http.ResponseWriter, r *http.Req
 	}
 	// Issue project membership is mutable after claim. The daemon snapshot is
 	// the claim-time record, so comparing it to the live issue would replace
-	// provenance with current state or fail a valid launch. Quick-create tasks
-	// carry their immutable project in task context and can still be checked.
+	// provenance with current state or fail a valid launch. Issue-less tasks
+	// have two immutable project sources: quick-create context and the
+	// autopilot that created a run_only task.
 	if !task.IssueID.Valid {
-		expectedProjectID := ""
-		if len(task.Context) > 0 {
-			var quickCreate service.QuickCreateContext
-			if json.Unmarshal(task.Context, &quickCreate) == nil && quickCreate.Type == service.QuickCreateContextType {
-				expectedProjectID = quickCreate.ProjectID
-			}
+		expectedProjectID, projectErr := h.issueLessTaskEvidenceProjectID(r.Context(), task, workspaceID)
+		if projectErr != nil {
+			slog.Error("failed to resolve execution evidence project", "task_id", taskID, "error", projectErr)
+			writeError(w, http.StatusInternalServerError, "failed to verify execution evidence project")
+			return
 		}
 		if req.Snapshot.ProjectID != expectedProjectID {
 			writeError(w, http.StatusBadRequest, "execution evidence project does not match task")
@@ -167,6 +168,36 @@ func (h *Handler) RecordTaskExecutionEvidence(w http.ResponseWriter, r *http.Req
 		"digest":         existing.PayloadHash,
 		"created_at":     timestampToString(existing.CreatedAt),
 	})
+}
+
+// issueLessTaskEvidenceProjectID returns the project source used to claim an
+// issue-less task. A run_only autopilot has no issue row, so its current
+// project binding is the fail-closed authority for both claim hydration and
+// execution evidence. Quick-create retains its immutable context-backed
+// project. Other issue-less tasks are projectless and must record an empty ID.
+func (h *Handler) issueLessTaskEvidenceProjectID(ctx context.Context, task db.AgentTaskQueue, workspaceID string) (string, error) {
+	if task.AutopilotRunID.Valid {
+		run, err := h.Queries.GetAutopilotRun(ctx, task.AutopilotRunID)
+		if err != nil {
+			return "", err
+		}
+		autopilot, err := h.Queries.GetAutopilotInWorkspace(ctx, db.GetAutopilotInWorkspaceParams{
+			ID:          run.AutopilotID,
+			WorkspaceID: parseUUID(workspaceID),
+		})
+		if err != nil {
+			return "", err
+		}
+		return uuidToString(autopilot.ProjectID), nil
+	}
+	if len(task.Context) == 0 {
+		return "", nil
+	}
+	var quickCreate service.QuickCreateContext
+	if json.Unmarshal(task.Context, &quickCreate) == nil && quickCreate.Type == service.QuickCreateContextType {
+		return quickCreate.ProjectID, nil
+	}
+	return "", nil
 }
 
 type TaskLifecycleEvidence struct {
