@@ -2657,6 +2657,9 @@ func TestClaimTask_AutopilotRunOnly_PopulatesWorkspaceID(t *testing.T) {
 	}
 
 	ctx := context.Background()
+	setHandlerTestWorkspaceRepos(t, []map[string]string{
+		{"url": "https://github.com/example/projectless-autopilot-fallback", "description": "workspace fallback"},
+	})
 
 	var agentID, runtimeID string
 	if err := testPool.QueryRow(ctx, `
@@ -2714,8 +2717,9 @@ func TestClaimTask_AutopilotRunOnly_PopulatesWorkspaceID(t *testing.T) {
 
 	var resp struct {
 		Task *struct {
-			WorkspaceID string `json:"workspace_id"`
-			ThreadName  string `json:"thread_name"`
+			WorkspaceID string     `json:"workspace_id"`
+			ThreadName  string     `json:"thread_name"`
+			Repos       []RepoData `json:"repos"`
 		} `json:"task"`
 	}
 	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
@@ -2732,6 +2736,124 @@ func TestClaimTask_AutopilotRunOnly_PopulatesWorkspaceID(t *testing.T) {
 	}
 	if resp.Task.ThreadName != "claim workspace fixture" {
 		t.Fatalf("autopilot task thread_name = %q, want autopilot title", resp.Task.ThreadName)
+	}
+	if len(resp.Task.Repos) != 1 || !strings.HasSuffix(resp.Task.Repos[0].URL, "projectless-autopilot-fallback") {
+		t.Fatalf("projectless run_only autopilot repos = %+v, want workspace fallback", resp.Task.Repos)
+	}
+}
+
+// A project-bound run_only autopilot has no issue row to carry its project
+// context. Its claim must therefore hydrate the project directly from the
+// autopilot so the daemon receives its repo and local_directory assignment.
+func TestClaimTask_AutopilotRunOnly_ProjectContext(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+
+	ctx := context.Background()
+	agentID, runtimeID, daemonID := createRuntimeGuardAgent(t, ctx)
+	setHandlerTestWorkspaceRepos(t, []map[string]string{
+		{"url": "https://github.com/example/workspace-repo-must-not-leak", "description": "workspace fallback"},
+	})
+
+	const projectTitle = "Drift audit control plane"
+	const projectDescription = "Run the declared release audit from the promoted manifest checkout."
+	var projectID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO project (workspace_id, title, description) VALUES ($1, $2, $3) RETURNING id
+	`, testWorkspaceID, projectTitle, projectDescription).Scan(&projectID); err != nil {
+		t.Fatalf("setup: create project: %v", err)
+	}
+	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM project WHERE id = $1`, projectID) })
+
+	const projectRepoURL = "https://github.com/example/project-autopilot-repo"
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO project_resource (project_id, workspace_id, resource_type, resource_ref, position)
+		VALUES
+			($1, $2, 'github_repo', $3::jsonb, 0),
+			($1, $2, 'local_directory', $4::jsonb, 1)
+	`, projectID, testWorkspaceID,
+		`{"url":"`+projectRepoURL+`","ref":"release/vwo-505"}`,
+		`{"local_path":"/Users/farieds/Project/multica-config-deploy","daemon_id":"`+daemonID+`"}`,
+	); err != nil {
+		t.Fatalf("setup: create project resources: %v", err)
+	}
+
+	var autopilotID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO autopilot (
+			workspace_id, project_id, title, description, assignee_id, execution_mode,
+			created_by_type, created_by_id
+		)
+		VALUES ($1, $2, 'project-bound run only', 'autopilot instructions', $3, 'run_only', 'member', $4)
+		RETURNING id
+	`, testWorkspaceID, projectID, agentID, testUserID).Scan(&autopilotID); err != nil {
+		t.Fatalf("setup: create autopilot: %v", err)
+	}
+	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM autopilot WHERE id = $1`, autopilotID) })
+
+	var runID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO autopilot_run (autopilot_id, source, status)
+		VALUES ($1, 'manual', 'running')
+		RETURNING id
+	`, autopilotID).Scan(&runID); err != nil {
+		t.Fatalf("setup: create autopilot_run: %v", err)
+	}
+
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO agent_task_queue (agent_id, runtime_id, status, priority, autopilot_run_id)
+		VALUES ($1, $2, 'queued', 0, $3)
+	`, agentID, runtimeID, runID); err != nil {
+		t.Fatalf("setup: create autopilot task: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	req := newDaemonTokenRequest(http.MethodPost, "/api/daemon/runtimes/"+runtimeID+"/claim", nil, testWorkspaceID, daemonID)
+	req = withURLParam(req, "runtimeId", runtimeID)
+	testHandler.ClaimTaskByRuntime(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("ClaimTaskByRuntime: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		Task *struct {
+			ProjectID          string                `json:"project_id"`
+			ProjectTitle       string                `json:"project_title"`
+			ProjectDescription string                `json:"project_description"`
+			Repos              []RepoData            `json:"repos"`
+			ProjectResources   []ProjectResourceData `json:"project_resources"`
+		} `json:"task"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Task == nil {
+		t.Fatal("expected a task in response, got nil")
+	}
+	if resp.Task.ProjectID != projectID {
+		t.Errorf("project_id = %q, want %q", resp.Task.ProjectID, projectID)
+	}
+	if resp.Task.ProjectTitle != projectTitle {
+		t.Errorf("project_title = %q, want %q", resp.Task.ProjectTitle, projectTitle)
+	}
+	if resp.Task.ProjectDescription != projectDescription {
+		t.Errorf("project_description = %q, want %q", resp.Task.ProjectDescription, projectDescription)
+	}
+	if len(resp.Task.Repos) != 1 || resp.Task.Repos[0].URL != projectRepoURL || resp.Task.Repos[0].Ref != "release/vwo-505" {
+		t.Fatalf("repos = %+v, want only project repo", resp.Task.Repos)
+	}
+	if len(resp.Task.ProjectResources) != 2 {
+		t.Fatalf("project_resources = %+v, want github_repo and local_directory", resp.Task.ProjectResources)
+	}
+	var localDirectory json.RawMessage
+	for _, resource := range resp.Task.ProjectResources {
+		if resource.ResourceType == "local_directory" {
+			localDirectory = resource.ResourceRef
+		}
+	}
+	if len(localDirectory) == 0 || !strings.Contains(string(localDirectory), `"local_path":"/Users/farieds/Project/multica-config-deploy"`) || !strings.Contains(string(localDirectory), `"daemon_id":"`+daemonID+`"`) {
+		t.Fatalf("local_directory resource = %s, want configured project resource", localDirectory)
 	}
 }
 
