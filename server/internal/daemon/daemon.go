@@ -1101,6 +1101,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 		return err
 	}
 
+	// Deregister runtimes on shutdown (uses a fresh context since ctx will be cancelled).
+	// Install this immediately after registration, before the compatibility
+	// gate. A version mismatch is discovered after initial registration, so it
+	// must withdraw those newly-created runtime rows before returning.
+	defer d.deregisterRuntimes()
+
 	// Fail loudly on a client/server version skew now, after the initial
 	// register learned the server_version but before any task is claimed —
 	// instead of leaving a newer daemon to 404-loop on routes an older server
@@ -1108,9 +1114,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if err := d.checkServerCompatibility(); err != nil {
 		return err
 	}
-
-	// Deregister runtimes on shutdown (uses a fresh context since ctx will be cancelled).
-	defer d.deregisterRuntimes()
 
 	// Start workspace sync loop to discover newly created workspaces.
 	go d.workspaceSyncLoop(ctx)

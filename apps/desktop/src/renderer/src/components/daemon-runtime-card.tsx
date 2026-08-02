@@ -179,7 +179,7 @@ export function DaemonRuntimeActions() {
           </>
         )}
 
-        {isStopped && (
+        {isStopped && !externallyManaged && (
           <Button size="sm" onClick={handleStart} disabled={actionLoading}>
             {actionLoading ? (
               <Activity className="size-3.5 mr-1.5 animate-pulse" />
@@ -188,6 +188,13 @@ export function DaemonRuntimeActions() {
             )}
             Start
           </Button>
+        )}
+
+        {isStopped && externallyManaged && (
+          <span className="inline-flex max-w-[28rem] items-center gap-1.5 truncate text-xs text-muted-foreground" title={status.reason}>
+            <Info className="size-3.5 shrink-0" />
+            {status.reason ?? "Managed outside the app"}
+          </span>
         )}
 
         {isCliMissing && (

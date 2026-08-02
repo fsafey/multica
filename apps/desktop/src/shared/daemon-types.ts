@@ -22,6 +22,8 @@ export interface DaemonStatus {
   profile?: string;
   /** Backend URL the daemon connects to. */
   serverUrl?: string;
+  /** CLI version reported by the running daemon. */
+  cliVersion?: string;
   /**
    * True when a daemon is running but in an environment the app can't control
    * — its reported OS differs from the desktop host's (e.g. a Linux daemon
@@ -29,9 +31,12 @@ export interface DaemonStatus {
    * forwarding). The app's start/stop CLI acts on the host process namespace,
    * so auto-start/auto-stop can't reach it; the UI disables those toggles
    * instead of silently no-op'ing. Only ever set on a running daemon, so it
-   * never disables the toggles for a normally-managed native daemon. See #3916.
+   * may also fail closed for a stopped state when a recorded owner cannot be
+   * verified safely. See #3916 and VWO-365.
    */
   externallyManaged?: boolean;
+  /** Why Desktop refused to take ownership or expose lifecycle controls. */
+  reason?: string;
 }
 
 export interface DaemonPrefs {

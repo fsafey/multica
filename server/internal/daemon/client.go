@@ -77,11 +77,10 @@ func isPrepareLeaseUnsupported(err error) bool {
 	if reqErr.StatusCode != http.StatusNotFound {
 		return false
 	}
-	body := strings.ToLower(reqErr.Body)
-	if strings.Contains(body, "task not found") || strings.Contains(body, "runtime not found") {
-		return false
-	}
-	return true
+	// Only the router's plain-text fallback proves the route is absent. Every
+	// registered handler writes JSON for its own 404s, including transient
+	// access-check failures, and those must remain retryable.
+	return strings.TrimSpace(reqErr.Body) == "404 page not found"
 }
 
 func isTaskMessageSequenceConflict(err error) bool {
