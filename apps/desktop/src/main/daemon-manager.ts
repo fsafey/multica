@@ -15,7 +15,7 @@ import {
   type StatsListener,
 } from "fs";
 import { join } from "path";
-import { homedir, hostname } from "os";
+import { homedir, hostname, uptime } from "os";
 import type {
   DaemonStatus,
   DaemonPrefs,
@@ -29,6 +29,11 @@ import {
   isDaemonExternallyManaged,
   normalizeHostOS,
 } from "./daemon-os";
+import {
+  decideExternalOwner,
+  ownershipRecordIsStale,
+  type OwnershipRecord,
+} from "./daemon-ownership";
 import {
   classifyAuthProbe,
   isAuthStatusError,
@@ -74,6 +79,7 @@ let cachedCliBinaryVersion: string | null | undefined = undefined;
 let pendingVersionRestart = false;
 let targetApiBaseUrl: string | null = null;
 let activeProfile: ActiveProfile | null = null;
+let sameProfileOwnerUnhealthySince: number | null = null;
 
 // Auth-probe state for the current start attempt. When a start fails to reach
 // "running", we probe the daemon's token once (after AUTH_PROBE_GRACE_MS) to
@@ -182,6 +188,11 @@ interface HealthPayload {
   workspaces?: unknown[];
 }
 
+interface ExternalOwnerStatus {
+  status: DaemonStatus;
+  adopted: boolean;
+}
+
 async function fetchHealthAtPort(
   port: number,
 ): Promise<HealthPayload | null> {
@@ -197,6 +208,176 @@ async function fetchHealthAtPort(
   } catch {
     return null;
   }
+}
+
+// The Go daemon keeps a machine-global advisory lock at this path and writes
+// diagnostic owner metadata into its body. The lock itself remains authoritative
+// on the Go side. Desktop reads the body only to discover a compatible daemon
+// launched under another profile and to fail closed when that owner cannot be
+// verified.
+function ownershipLockPath(): string {
+  return join(homedir(), ".multica", "daemon.lock");
+}
+
+function ownerProcessExists(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM means a live process we are not allowed to signal. Only ESRCH
+    // proves the PID is gone and therefore the advisory lock is releasable.
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
+async function externalOwnerStatus(
+  active: ActiveProfile,
+): Promise<ExternalOwnerStatus | null> {
+  const blockedRecord = (reason: string): ExternalOwnerStatus => ({
+    adopted: false,
+    status: {
+      state: "stopped",
+      profile: active.name,
+      externallyManaged: true,
+      reason,
+    },
+  });
+
+  let raw: string;
+  try {
+    raw = await readFile(ownershipLockPath(), "utf-8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    return blockedRecord(
+      "Desktop cannot read the daemon ownership record. Start is disabled until its permissions are repaired.",
+    );
+  }
+
+  let record: OwnershipRecord;
+  try {
+    record = JSON.parse(raw) as OwnershipRecord;
+  } catch {
+    return blockedRecord(
+      "The daemon ownership record is invalid. Start is disabled until the recorded owner is inspected.",
+    );
+  }
+
+  const bootStartedAtMs = Date.now() - uptime() * 1000;
+  if (
+    ownershipRecordIsStale(record, ownerProcessExists, bootStartedAtMs)
+  ) {
+    sameProfileOwnerUnhealthySince = null;
+    return null;
+  }
+
+  const ownerProfile =
+    record.profile === undefined
+      ? ""
+      : typeof record.profile === "string"
+        ? record.profile
+        : null;
+
+  // A healthy daemon on Desktop's own profile was already queried by
+  // fetchHealth. If the lock points back to it but that endpoint is absent,
+  // present an actionable safe stop instead of trying to start over the record.
+  if (ownerProfile === active.name) {
+    const now = Date.now();
+    sameProfileOwnerUnhealthySince ??= now;
+    if (now - sameProfileOwnerUnhealthySince < 45_000) {
+      return {
+        adopted: false,
+        status: { state: "stopping", profile: active.name },
+      };
+    }
+    return {
+      adopted: false,
+      status: {
+        state: "stopped",
+        profile: active.name,
+        externallyManaged: true,
+        reason:
+          "The recorded daemon owner is not healthy on Desktop's profile. Inspect or stop it before starting Desktop.",
+      },
+    };
+  }
+
+  const port = typeof record.health_port === "number" ? record.health_port : 0;
+  const health = port > 0 ? await fetchHealthAtPort(port) : null;
+  const bundledCLIVersion = await getCliBinaryVersion();
+  const identityMatches = await externalOwnerIdentityMatches(
+    ownerProfile ?? "",
+    active.name,
+  );
+  const decision = decideExternalOwner(
+    record,
+    health,
+    targetApiBaseUrl ? normalizeUrl(targetApiBaseUrl) : null,
+    bundledCLIVersion,
+    normalizeHostOS(process.platform),
+    identityMatches,
+  );
+  if (decision.kind === "block") {
+    return {
+      adopted: false,
+      status: {
+        state: "stopped",
+        profile: ownerProfile ?? active.name,
+        cliVersion: health?.cli_version,
+        externallyManaged: true,
+        reason: decision.reason,
+      },
+    };
+  }
+
+  return {
+    adopted: true,
+    status: {
+      state: "running",
+      pid: health?.pid,
+      uptime: health?.uptime,
+      daemonId: health?.daemon_id,
+      deviceName: health?.device_name,
+      agents: health?.agents ?? [],
+      workspaceCount: Array.isArray(health?.workspaces)
+        ? health.workspaces.length
+        : 0,
+      profile: decision.profile,
+      serverUrl: health?.server_url,
+      cliVersion: health?.cli_version,
+      // This owner is healthy, but lifecycle commands scoped to Desktop's
+      // dedicated profile cannot safely control it.
+      externallyManaged: true,
+      reason: `Desktop adopted the compatible daemon owner from profile ${decision.profile || "default"}.`,
+    },
+  };
+}
+
+async function profileTokenUserId(profile: string): Promise<string | null> {
+  if (!targetApiBaseUrl) return null;
+  const config = await readProfileConfig(profile);
+  if (typeof config.token !== "string" || config.token.length === 0) return null;
+  try {
+    const response = await fetch(
+      `${targetApiBaseUrl.replace(/\/+$/, "")}/api/me`,
+      { headers: { Authorization: `Bearer ${config.token}` } },
+    );
+    if (!response.ok) return null;
+    const me = (await response.json()) as { id?: unknown };
+    return typeof me.id === "string" ? me.id : null;
+  } catch {
+    return null;
+  }
+}
+
+async function externalOwnerIdentityMatches(
+  ownerProfile: string,
+  activeProfileName: string,
+): Promise<boolean> {
+  const activeUserId = await readProfileUserId(activeProfileName);
+  if (!activeUserId) return false;
+  const recordedOwnerUserId = await readProfileUserId(ownerProfile);
+  if (recordedOwnerUserId) return recordedOwnerUserId === activeUserId;
+  return (await profileTokenUserId(ownerProfile)) === activeUserId;
 }
 
 /**
@@ -303,6 +484,7 @@ async function ensureActiveProfile(): Promise<ActiveProfile> {
 
 function invalidateActiveProfile(): void {
   activeProfile = null;
+  sameProfileOwnerUnhealthySince = null;
 }
 
 async function fetchHealth(): Promise<DaemonStatus> {
@@ -317,6 +499,18 @@ async function fetchHealth(): Promise<DaemonStatus> {
   const data = await fetchHealthAtPort(active.port);
 
   if (!data || data.status !== "running") {
+    // A daemon booting or draining on Desktop's own profile is already the
+    // active lifecycle operation. Do not mistake its lock record for a stale
+    // external owner while it has not yet reached "running".
+    if (data?.status === "draining") {
+      return { state: "stopping", profile: active.name };
+    }
+    if (data?.status === "starting") {
+      return { state: "starting", profile: active.name };
+    }
+
+    const external = await externalOwnerStatus(active);
+    if (external) return external.status;
     // A start that never reaches "running" is the symptom; an expired/invalid
     // login is the most common cause and the one with no other signal (the
     // daemon exits before it can serve /health, so we can't read the reason
@@ -340,19 +534,6 @@ async function fetchHealth(): Promise<DaemonStatus> {
     if (authExpired) {
       return { state: "auth_expired", profile: active.name };
     }
-    // A maintenance drain is still a live daemon. Surface it as stopping so
-    // auto-start cannot race it with a replacement process while current work
-    // is finishing.
-    if (data?.status === "draining") {
-      return { state: "stopping", profile: active.name };
-    }
-    // The daemon binds /health before preflight finishes and self-reports
-    // "starting" until it is ready. Trust that over our own currentState, so a
-    // daemon booting on its own or started via the CLI surfaces as "starting"
-    // instead of "stopped".
-    if (data?.status === "starting") {
-      return { state: "starting", profile: active.name };
-    }
     return {
       state: currentState === "starting" ? "starting" : "stopped",
       profile: active.name,
@@ -363,6 +544,7 @@ async function fetchHealth(): Promise<DaemonStatus> {
   // re-login prompt disappears once the user reconnects.
   authExpired = false;
   startingSince = null;
+  sameProfileOwnerUnhealthySince = null;
 
   // A running daemon whose OS differs from this host's is one we can't drive
   // via the native lifecycle CLI (e.g. Linux-in-WSL2 behind a Windows desktop,
@@ -397,6 +579,7 @@ async function fetchHealth(): Promise<DaemonStatus> {
       : 0,
     profile: active.name,
     serverUrl: data.server_url,
+    cliVersion: data.cli_version,
     externallyManaged,
   };
 }
@@ -928,6 +1111,19 @@ async function startDaemon(): Promise<{ success: boolean; error?: string }> {
     return { success: true };
   }
 
+  const external = await externalOwnerStatus(active);
+  if (external) {
+    if (external.adopted) {
+      pollOnce();
+      return { success: true };
+    }
+    return {
+      success: false,
+      error:
+        external.status.reason ?? "Another daemon owner must be resolved first",
+    };
+  }
+
   currentState = "starting";
   // Begin a fresh auth-probe window for this attempt.
   startingSince = Date.now();
@@ -976,6 +1172,10 @@ async function lifecycleBlockedByForeignDaemon(): Promise<boolean> {
 }
 
 async function stopDaemon(): Promise<{ success: boolean; error?: string }> {
+  const active = await ensureActiveProfile();
+  const external = await externalOwnerStatus(active);
+  if (external?.status.externallyManaged) return { success: true };
+
   // Central lifecycle guard: a daemon running in an environment we can't drive
   // (e.g. Linux in WSL2 behind a Windows desktop) can't be stopped by the
   // native CLI — it would act on the host process namespace and no-op, while
@@ -988,7 +1188,6 @@ async function stopDaemon(): Promise<{ success: boolean; error?: string }> {
   const bin = await resolveCliBinary();
   if (!bin) return { success: false, error: "multica CLI is not installed" };
 
-  const active = await ensureActiveProfile();
   currentState = "stopping";
   // An explicit stop is a clean reset — drop any pending auth-failure verdict.
   authExpired = false;
@@ -1216,6 +1415,7 @@ export function setupDaemonManager(
     if (!bin) return;
     const health = await fetchHealth();
     if (health.state === "running") {
+      if (health.externallyManaged) return;
       // Daemon is up but may be running an older CLI than the one we just
       // bundled. Restart it so the new binary actually takes effect.
       await ensureRunningDaemonVersionMatches();

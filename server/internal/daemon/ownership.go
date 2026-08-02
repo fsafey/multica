@@ -58,10 +58,14 @@ type OwnershipConflict struct {
 
 func (e *OwnershipConflict) Error() string {
 	if e.HasInfo {
+		stopHint := "multica daemon stop"
+		if e.Incumbent.Profile != "" {
+			stopHint = fmt.Sprintf("multica daemon stop --profile %s", e.Incumbent.Profile)
+		}
 		return fmt.Sprintf(
-			"another Multica daemon already owns this machine (pid %d, version %s, profile %q, health port %d, since %s) via lock %s; stop it with `multica daemon stop` or take over with `multica daemon start --takeover`",
+			"another Multica daemon already owns this machine (pid %d, version %s, profile %q, health port %d, since %s) via lock %s; stop it with `%s` or take over with `multica daemon start --takeover`",
 			e.Incumbent.PID, orUnknown(e.Incumbent.Version), e.Incumbent.Profile, e.Incumbent.HealthPort,
-			e.Incumbent.StartedAt.Format(time.RFC3339), e.Path,
+			e.Incumbent.StartedAt.Format(time.RFC3339), e.Path, stopHint,
 		)
 	}
 	return fmt.Sprintf(

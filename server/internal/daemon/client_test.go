@@ -421,6 +421,37 @@ func TestIsIssueGCBatchUnsupported(t *testing.T) {
 	}
 }
 
+func TestIsPrepareLeaseUnsupported(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "router plain text 404",
+			err:  &requestError{StatusCode: http.StatusNotFound, Body: "404 page not found\n"},
+			want: true,
+		},
+		{
+			name: "handler JSON 404 remains retryable",
+			err:  &requestError{StatusCode: http.StatusNotFound, Body: `{"error":"task not found"}`},
+			want: false,
+		},
+		{
+			name: "plain text mention is not a router signature",
+			err:  &requestError{StatusCode: http.StatusNotFound, Body: "task route returned 404 page not found while handling request"},
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isPrepareLeaseUnsupported(tt.err); got != tt.want {
+				t.Fatalf("isPrepareLeaseUnsupported() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestPostJSONWithRetry_TransientThenSuccess(t *testing.T) {
 	defer noSleepRetry(t)()
 

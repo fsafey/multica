@@ -63,4 +63,16 @@ describe("DaemonRuntimeActions — externally managed daemon (#3916)", () => {
       screen.queryByText("Managed outside the app"),
     ).not.toBeInTheDocument();
   });
+
+  it("does not expose Start when a stale or incompatible owner blocks Desktop", async () => {
+    stubDaemonAPI({
+      state: "stopped",
+      externallyManaged: true,
+      reason: "The daemon owner is not compatible with this Desktop bundle.",
+    });
+    render(<DaemonRuntimeActions />);
+
+    expect(await screen.findByText(/not compatible/i)).toBeTruthy();
+    expect(screen.queryByText("Start")).toBeNull();
+  });
 });

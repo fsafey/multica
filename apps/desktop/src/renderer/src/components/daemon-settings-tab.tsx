@@ -123,11 +123,7 @@ export function DaemonSettingsTab() {
         <div className="mt-4 flex items-start gap-3 rounded-lg border bg-muted/30 px-4 py-3">
           <Info className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
           <p className="min-w-0 text-sm text-muted-foreground">
-            This device&apos;s daemon runs outside the app — for example inside
-            WSL2 — so the app can&apos;t start or stop it. Start or stop it from
-            that environment with{" "}
-            <code className="font-mono text-xs">multica daemon start</code> /{" "}
-            <code className="font-mono text-xs">multica daemon stop</code>.
+            {status.reason ?? "This device's daemon runs outside the app, so Desktop cannot safely start or stop it. Manage it from that environment with multica daemon start or multica daemon stop."}
           </p>
         </div>
       )}
