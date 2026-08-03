@@ -90,7 +90,12 @@ var daemonDiskUsageCmd = &cobra.Command{
 		"applies within each root and --workspaces-root is not allowed.\n\n" +
 		"Bytes are split into total and the artifact-cleanable subset (node_modules, .next, .turbo by default,\n" +
 		"overridable via MULTICA_GC_ARTIFACT_PATTERNS) so the report stays in sync with what the GC reclaims.\n" +
-		"The walk skips .git and never follows symlinks. The daemon does not need to be running.",
+		"A .git directory counts toward the total but never toward the artifact subset — the GC frees it only\n" +
+		"when it removes the whole task directory. Symlinks are never followed.\n\n" +
+		"The STATUS column shows the current status of the issue each directory belongs to, which requires\n" +
+		"contacting the server. When the machine is offline, logged out, or the request fails, the column is\n" +
+		"left blank and the rest of the report still prints. --by-workspace has no STATUS column and therefore\n" +
+		"makes no network request unless --output json is also set. The daemon does not need to be running.",
 	RunE: runDaemonDiskUsage,
 }
 
@@ -1652,7 +1657,7 @@ func runDaemonDiskUsage(cmd *cobra.Command, _ []string) error {
 	}
 
 	if allProfiles {
-		return runDaemonDiskUsageAggregate(byWorkspace, top, output)
+		return runDaemonDiskUsageAggregate(cmd, byWorkspace, top, output)
 	}
 
 	workspacesRoot, err := daemon.ResolveWorkspacesRoot(profile, rootOverride)
@@ -1663,6 +1668,11 @@ func runDaemonDiskUsage(cmd *cobra.Command, _ []string) error {
 	report, err := daemon.ScanDiskUsage(workspacesRoot, daemon.ArtifactPatternsFromEnv())
 	if err != nil {
 		return err
+	}
+	// Resolve before --top trims the slice: the batch endpoint costs the same
+	// either way, and the JSON consumer sees statuses for everything it gets.
+	if diskUsageNeedsParentStatus(byWorkspace, output) {
+		fillDiskUsageParentStatuses(cmd, profile, &report)
 	}
 
 	if top > 0 {
@@ -1689,11 +1699,79 @@ func runDaemonDiskUsage(cmd *cobra.Command, _ []string) error {
 	return nil
 }
 
+// diskUsageNeedsParentStatus reports whether this invocation renders per-task
+// rows at all. The --by-workspace table has no STATUS column, so resolving
+// statuses for it would spend a network round trip — and, against an
+// unreachable server, a full timeout — on data nothing displays, turning a
+// local diagnostic into a command that hangs offline. JSON output always
+// carries the task array, so it still needs them even with --by-workspace.
+func diskUsageNeedsParentStatus(byWorkspace bool, output string) bool {
+	return !byWorkspace || output == "json"
+}
+
+// fillDiskUsageParentStatuses populates the report's STATUS column in place.
+//
+// This is best-effort and never fails the command: `disk-usage` is a local
+// diagnostic that has to keep working when the machine is offline or logged
+// out. When statuses can't be resolved the column simply stays blank, and the
+// reason goes to stderr so `--output json` stdout stays machine-readable.
+func fillDiskUsageParentStatuses(cmd *cobra.Command, profile string, report *daemon.DiskUsageReport) {
+	fetch := newParentStatusFetcher(cmd, profile)
+	if fetch == nil {
+		return
+	}
+	ctx, cancel := cli.APIContext(cmd.Context())
+	defer cancel()
+	if err := daemon.ResolveParentStatuses(ctx, report, fetch); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not resolve issue statuses, STATUS column may be blank: %v\n", err)
+	}
+}
+
+// newParentStatusFetcher builds a fetcher backed by the same batch gc-check
+// endpoint the daemon's GC loop uses, so the STATUS column reports exactly the
+// status the GC would act on. The daemon authenticates with the profile's CLI
+// token (see Daemon.resolveAuth), so reusing it here needs no extra API
+// surface. Returns nil when this profile has no usable credentials — the
+// caller then leaves the column blank rather than erroring.
+func newParentStatusFetcher(cmd *cobra.Command, profile string) daemon.ParentStatusFetcher {
+	cfg, err := cli.LoadCLIConfigForProfile(profile)
+	if err != nil || strings.TrimSpace(cfg.Token) == "" {
+		return nil
+	}
+	rawURL := resolveDaemonServerURL(cmd, profile)
+	if rawURL == "" {
+		rawURL = daemon.DefaultServerURL
+	}
+	baseURL, err := daemon.NormalizeServerBaseURL(rawURL)
+	if err != nil {
+		return nil
+	}
+
+	client := daemon.NewClient(baseURL)
+	client.SetToken(cfg.Token)
+	return func(ctx context.Context, workspaceID string, issueIDs []string) (map[string]string, error) {
+		results, err := client.GetIssueGCChecks(ctx, workspaceID, issueIDs)
+		if err != nil {
+			return nil, err
+		}
+		statuses := make(map[string]string, len(results))
+		for id, result := range results {
+			// Skip per-issue failures and 404s: an unresolved id must stay
+			// blank so it reads as "unknown", not as a status.
+			if result.Err != nil || !result.Found {
+				continue
+			}
+			statuses[id] = result.Status
+		}
+		return statuses, nil
+	}
+}
+
 // runDaemonDiskUsageAggregate scans every workspace root (the default root plus
 // each ~/.multica/profiles/* root) and renders a per-root breakdown with a
 // combined grand total. This is the path that surfaces the Desktop app's
 // `desktop-<host>` root, which the default single-root scan never sees.
-func runDaemonDiskUsageAggregate(byWorkspace bool, top int, output string) error {
+func runDaemonDiskUsageAggregate(cmd *cobra.Command, byWorkspace bool, top int, output string) error {
 	roots, err := enumerateDiskUsageRoots()
 	if err != nil {
 		return err
@@ -1701,6 +1779,15 @@ func runDaemonDiskUsageAggregate(byWorkspace bool, top int, output string) error
 	agg, err := daemon.ScanDiskUsageRoots(roots, daemon.ArtifactPatternsFromEnv())
 	if err != nil {
 		return err
+	}
+	// Each root belongs to its own profile, so it needs that profile's token.
+	// Skipping the whole loop when nothing renders task rows matters most
+	// here: an unreachable server would otherwise burn one full timeout per
+	// root, serially.
+	if diskUsageNeedsParentStatus(byWorkspace, output) {
+		for i := range agg.Roots {
+			fillDiskUsageParentStatuses(cmd, agg.Roots[i].Profile, &agg.Roots[i].Report)
+		}
 	}
 
 	// --top trims each root's table independently — the grand total in the

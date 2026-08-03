@@ -150,7 +150,7 @@ export function DaemonRuntimeActions() {
               View logs
             </Button>
             {externallyManaged ? (
-              <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
+              <span className="inline-flex items-center gap-1.5 text-caption text-muted-foreground">
                 <Info className="size-3.5 shrink-0" />
                 Managed outside the app
               </span>
@@ -191,7 +191,7 @@ export function DaemonRuntimeActions() {
         )}
 
         {isStopped && externallyManaged && (
-          <span className="inline-flex max-w-[28rem] items-center gap-1.5 truncate text-xs text-muted-foreground" title={status.reason}>
+          <span className="inline-flex max-w-[28rem] items-center gap-1.5 truncate text-caption text-muted-foreground" title={status.reason}>
             <Info className="size-3.5 shrink-0" />
             {status.reason ?? "Managed outside the app"}
           </span>
@@ -211,7 +211,7 @@ export function DaemonRuntimeActions() {
 
         {isAuthExpired && (
           <>
-            <span className="inline-flex items-center gap-1.5 text-xs text-destructive">
+            <span className="inline-flex items-center gap-1.5 text-caption text-destructive">
               <AlertCircle className="size-3.5 shrink-0" />
               Sign-in expired
             </span>
@@ -278,10 +278,10 @@ function StopConfirmDialog({
             <AlertCircle className="h-5 w-5 text-destructive" />
           </div>
           <DialogHeader className="flex-1 gap-1">
-            <DialogTitle className="text-sm font-semibold">
+            <DialogTitle className="text-body font-semibold">
               Stop daemon with {affectedCount} active task{plural}?
             </DialogTitle>
-            <DialogDescription className="text-xs leading-relaxed">
+            <DialogDescription className="text-caption leading-relaxed">
               {affectedCount} task{plural} {verb} currently running on this
               device. Stopping now will interrupt {affectedCount === 1 ? "it" : "them"}{" "}
               — affected tasks get marked <strong>failed</strong> once the

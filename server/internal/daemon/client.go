@@ -446,7 +446,7 @@ func addTranscriptExpectation(body map[string]any, expectation TranscriptExpecta
 	body["transcript_delivery_confirmed"] = expectation.DeliveryConfirmed
 }
 
-func (c *Client) CompleteTask(ctx context.Context, taskID, output, branchName, sessionID, workDir string, transcriptExpectation TranscriptExpectation) error {
+func (c *Client) CompleteTask(ctx context.Context, taskID, output, branchName, sessionID, workDir string, transcriptExpectation TranscriptExpectation, sessionRolloutMissing bool, retiredSessionID string) error {
 	body := map[string]any{"output": output}
 	if branchName != "" {
 		body["branch_name"] = branchName
@@ -458,6 +458,12 @@ func (c *Client) CompleteTask(ctx context.Context, taskID, output, branchName, s
 		body["work_dir"] = workDir
 	}
 	addTranscriptExpectation(body, transcriptExpectation)
+	if sessionRolloutMissing {
+		body["session_rollout_missing"] = true
+	}
+	if retiredSessionID != "" {
+		body["retired_session_id"] = retiredSessionID
+	}
 	return c.postJSONWithRetry(ctx, fmt.Sprintf("/api/daemon/tasks/%s/complete", taskID), body, nil, defaultTerminalRetrySchedule)
 }
 
@@ -635,7 +641,7 @@ func (c *Client) ReportTaskUsage(ctx context.Context, taskID string, usage []Tas
 	}, nil)
 }
 
-func (c *Client) FailTask(ctx context.Context, taskID, errMsg, sessionID, workDir, failureReason string, transcriptExpectation TranscriptExpectation) error {
+func (c *Client) FailTask(ctx context.Context, taskID, errMsg, sessionID, workDir, failureReason string, transcriptExpectation TranscriptExpectation, sessionRolloutMissing bool, retiredSessionID string) error {
 	body := map[string]any{"error": errMsg}
 	if sessionID != "" {
 		body["session_id"] = sessionID
@@ -647,6 +653,12 @@ func (c *Client) FailTask(ctx context.Context, taskID, errMsg, sessionID, workDi
 		body["failure_reason"] = failureReason
 	}
 	addTranscriptExpectation(body, transcriptExpectation)
+	if sessionRolloutMissing {
+		body["session_rollout_missing"] = true
+	}
+	if retiredSessionID != "" {
+		body["retired_session_id"] = retiredSessionID
+	}
 	return c.postJSONWithRetry(ctx, fmt.Sprintf("/api/daemon/tasks/%s/fail", taskID), body, nil, defaultTerminalRetrySchedule)
 }
 

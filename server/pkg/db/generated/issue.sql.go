@@ -339,15 +339,19 @@ func (q *Queries) CreateIssueWithOrigin(ctx context.Context, arg CreateIssueWith
 }
 
 const deleteIssue = `-- name: DeleteIssue :exec
-WITH target_issues AS (
+WITH target AS (
     SELECT issue.id FROM issue WHERE issue.id = $1 AND issue.workspace_id = $2
-), cleared_task_execution_evidence AS (
+),
+cleared_task_execution_evidence AS (
     DELETE FROM task_execution_evidence
     WHERE task_id IN (
-        SELECT id FROM agent_task_queue WHERE issue_id IN (SELECT id FROM target_issues)
+        SELECT id FROM agent_task_queue WHERE issue_id IN (SELECT target.id FROM target)
     )
+),
+cleared_vcs_pr_links AS (
+    DELETE FROM issue_vcs_pull_request WHERE issue_id IN (SELECT target.id FROM target)
 )
-DELETE FROM issue WHERE id IN (SELECT id FROM target_issues)
+DELETE FROM issue WHERE issue.id IN (SELECT target.id FROM target)
 `
 
 type DeleteIssueParams struct {
@@ -360,6 +364,17 @@ type DeleteIssueParams struct {
 // (loadIssueForUser / GetIssueInWorkspace) already enforce membership today,
 // but a future loader bypass or a new caller skipping the loader would be
 // silently catastrophic without this guard. See incident #1661.
+//
+// issue_vcs_pull_request has no FK to issue, so the link rows
+// are not cascaded away. Sweep them here so they go atomically with the issue.
+// The mirrored PR rows themselves belong to the connection, not the issue, so
+// they persist (matching the GitHub link behaviour).
+//
+// The sweep MUST route through the same workspace-checked target as the issue
+// delete: deleting links by bare issue_id would drop another tenant's link rows
+// when a caller passes a foreign issue_id with its own workspace_id (the issue
+// itself is correctly untouched, but the links are already gone) — the exact
+// cross-tenant leak the #1661 guard above exists to prevent.
 func (q *Queries) DeleteIssue(ctx context.Context, arg DeleteIssueParams) error {
 	_, err := q.db.Exec(ctx, deleteIssue, arg.ID, arg.WorkspaceID)
 	return err
