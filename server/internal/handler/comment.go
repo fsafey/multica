@@ -1804,8 +1804,18 @@ func (h *Handler) CreateComment(w http.ResponseWriter, r *http.Request) {
 					if task.TriggerCommentID.Valid {
 						if !taskCoversReplyParent(task, parentID) {
 							// Keep this error actionable for agents (MUL-4417 / GH #5266).
-							writeError(w, http.StatusConflict,
-								"comment-triggered tasks cannot create top-level comments; set parent_id (--parent) to "+uuidToString(task.TriggerCommentID)+" or a coalesced comment id")
+							// The two rejections need different copy. A resumed
+							// session carrying a previous turn's --parent forward
+							// (GH #6264) did NOT ask for a top-level comment, and
+							// telling it that it did sends it looking for a
+							// new-thread opt-in instead of simply correcting the
+							// parent it already passed.
+							fix := "set parent_id (--parent) to " + uuidToString(task.TriggerCommentID) + " or a coalesced comment id"
+							msg := "comment-triggered tasks cannot create top-level comments; " + fix
+							if parentID.Valid {
+								msg = "parent_id " + uuidToString(parentID) + " is not a comment this task may reply under; " + fix
+							}
+							writeError(w, http.StatusConflict, msg)
 							return
 						}
 					}
