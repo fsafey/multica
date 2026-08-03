@@ -3544,17 +3544,22 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 	}
 
 	result, err := d.runner.run(runCtx, task, provider, slot, taskLog)
-	finalizePublishBack := func(publish bool) error {
-		if result.PublishBackWorktree == nil {
-			return nil
+	// Returns the finalizer's own account of where the task's work ended up
+	// alongside its error. The disposition is only knowable after finalization
+	// runs, so an operator comment must not assert a quarantine ref up front:
+	// the ref is created only when the task tip is unreachable from source HEAD.
+	finalizePublishBack := func(publish bool) (string, error) {
+		worktree := result.PublishBackWorktree
+		if worktree == nil {
+			return "", nil
 		}
-		finalizeErr := result.PublishBackWorktree.FinalizeSerialPublishBack(
+		finalizeErr := worktree.FinalizeSerialPublishBack(
 			publish,
 			result.PublishBackProvider,
 			taskLog,
 		)
 		result.PublishBackWorktree = nil
-		return finalizeErr
+		return worktree.RecoveryNote(), finalizeErr
 	}
 	finalizeWorkflowBundle := func(submitted bool) error {
 		if result.WorkflowBundleWorktree == nil {
@@ -3580,7 +3585,7 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 	select {
 	case <-cancelledByPoll:
 		taskLog.Info("task cancelled during execution, discarding result")
-		if finalizeErr := finalizePublishBack(false); finalizeErr != nil {
+		if _, finalizeErr := finalizePublishBack(false); finalizeErr != nil {
 			taskLog.Error("local_directory publish-back quarantine failed", "error", finalizeErr)
 		}
 		if finalizeErr := finalizeWorkflowBundle(false); finalizeErr != nil {
@@ -3598,7 +3603,7 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 
 	if err != nil {
 		taskLog.Error("task failed", "error", err)
-		if finalizeErr := finalizePublishBack(false); finalizeErr != nil {
+		if _, finalizeErr := finalizePublishBack(false); finalizeErr != nil {
 			taskLog.Error("local_directory publish-back quarantine failed", "error", finalizeErr)
 		}
 		if finalizeErr := finalizeWorkflowBundle(false); finalizeErr != nil {
@@ -3632,7 +3637,7 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 	finalStatus, finalStatusErr := d.client.GetTaskStatus(ctx, task.ID)
 	if shouldInterruptAgent(finalStatus, finalStatusErr) {
 		taskLog.Info("task cancelled during execution, discarding result", "status", finalStatus, "error", finalStatusErr)
-		if finalizeErr := finalizePublishBack(false); finalizeErr != nil {
+		if _, finalizeErr := finalizePublishBack(false); finalizeErr != nil {
 			taskLog.Error("local_directory publish-back quarantine failed", "error", finalizeErr)
 		}
 		if finalizeErr := finalizeWorkflowBundle(false); finalizeErr != nil {
@@ -3646,14 +3651,14 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 		return
 	}
 	if result.PublishBackWorktree != nil && result.Status == "completed" && (finalStatusErr != nil || finalStatus != "running") {
+		recoveryNote, finalizeErr := finalizePublishBack(false)
 		note := fmt.Sprintf(
-			"Publish-back did not advance the source because the daemon could not confirm that the task was still running (status=%q, error=%v). Recovery ref target: %s%s.",
+			"Publish-back did not advance the source because the daemon could not confirm that the task was still running (status=%q, error=%v). %s",
 			finalStatus,
 			finalStatusErr,
-			execenv.QuarantineRefPrefix,
-			task.ID,
+			publishBackRecovery(recoveryNote),
 		)
-		if finalizeErr := finalizePublishBack(false); finalizeErr != nil {
+		if finalizeErr != nil {
 			taskLog.Error("local_directory publish-back quarantine failed after unconfirmed task status", "error", finalizeErr)
 			note += " Finalizer error: " + finalizeErr.Error()
 		}
@@ -3680,8 +3685,8 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 
 	if result.PublishBackWorktree != nil {
 		publish := result.Status == "completed"
-		quarantineRef := execenv.QuarantineRefPrefix + task.ID
-		if finalizeErr := finalizePublishBack(publish); finalizeErr != nil {
+		recoveryNote, finalizeErr := finalizePublishBack(publish)
+		if finalizeErr != nil {
 			taskLog.Error("local_directory publish-back finalization failed", "publish_requested", publish, "error", finalizeErr)
 			if publish {
 				result.Status = "blocked"
@@ -3694,8 +3699,8 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 				} else {
 					result.FailureReason = "local_directory_publish_conflict"
 					result.Comment = appendTaskResultComment(result.Comment, fmt.Sprintf(
-						"Publish-back did not advance the source. Recovery ref target: %s. Finalizer error: %v",
-						quarantineRef,
+						"Publish-back did not advance the source. %s Finalizer error: %v",
+						publishBackRecovery(recoveryNote),
 						finalizeErr,
 					))
 				}
@@ -3796,6 +3801,19 @@ func taskRunFailureReason(err error) string {
 		return taskfailure.ReasonTimeout.String()
 	}
 	return taskfailure.Classify(err.Error()).String()
+}
+
+// publishBackRecovery renders the recovery sentence for a publish-back failure
+// comment. The finalizer reports its own disposition because only it knows
+// whether a quarantine ref was created: the ref is skipped when the task tip is
+// already reachable from source HEAD, and never reached at all when quarantine
+// itself failed. An empty note is that second case, where the worktree and
+// branch are deliberately left on disk.
+func publishBackRecovery(note string) string {
+	if note != "" {
+		return note
+	}
+	return "No quarantine ref was created; the task worktree and branch were preserved for manual recovery."
 }
 
 func appendTaskResultComment(comment, note string) string {

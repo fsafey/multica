@@ -89,6 +89,22 @@ func (w *IsolatedLocalWorktree) FinalizeSerialPublishBack(publish bool, provider
 		return nil
 	}
 
+	// A run that produced no commit has nothing to publish. The exact
+	// fast-forward would be a no-op, and the publish preconditions below have
+	// nothing left to protect: the committed diff is empty, so no daemon-managed
+	// material can have been committed, and uncommitted or untracked content is
+	// discarded by removeLocked's `git worktree remove --force` and can never
+	// reach the source. Running the clean-tree gate here refused a publication
+	// that was already a no-op and demoted a correct run to a publish conflict,
+	// which a run-only maintenance sweep, specified to make no commit, could
+	// never escape (VWO-511). Name whatever the disposable worktree is about to
+	// drop so lost work stays visible, then succeed.
+	if taskSHA == w.BaseCommit {
+		w.reportDiscardedWorkLocked(provider, logger)
+		w.removeLocked(logger)
+		return nil
+	}
+
 	if err := w.publishSerialFastForwardLocked(taskSHA, provider); err != nil {
 		if quarantineErr := w.quarantineAndRemoveLocked(taskSHA, logger); quarantineErr != nil {
 			return fmt.Errorf("%w; additionally failed to quarantine task commit: %v", err, quarantineErr)
@@ -314,10 +330,15 @@ func (w *IsolatedLocalWorktree) publishSerialFastForwardLocked(taskSHA, provider
 	if err := CleanupSidecars(filepath.Dir(w.WorkDir)); err != nil {
 		return fmt.Errorf("execenv: publish_back cleanup sidecars: %w", err)
 	}
-	if status, err := gitOutputBytes(w.WorkDir, "status", "--porcelain=v1", "-z", "--untracked-files=all"); err != nil {
+	dirty, err := worktreeDirtyEntries(w.WorkDir)
+	if err != nil {
 		return fmt.Errorf("execenv: publish_back inspect task worktree: %w", err)
-	} else if len(status) != 0 {
-		return errors.New("execenv: publish_back refused because the task worktree has staged or uncommitted changes after sidecar cleanup")
+	}
+	if len(dirty) != 0 {
+		return fmt.Errorf(
+			"execenv: publish_back refused because the task worktree has staged or uncommitted changes after sidecar cleanup: %s",
+			summarizeDirtyEntries(dirty),
+		)
 	}
 
 	sourceHEAD, err := gitOutput(w.SourceRepo, "rev-parse", "--verify", "HEAD^{commit}")
@@ -382,6 +403,82 @@ func (w *IsolatedLocalWorktree) publishSerialFastForwardLocked(taskSHA, provider
 	return nil
 }
 
+// worktreeDirtyEntries returns the sorted `git status --porcelain=v1` records
+// for workDir, untracked files included and ignored files excluded. The records
+// keep their two-character status prefix because that is what tells an operator
+// whether a path was modified, staged, or merely left lying around. Rename
+// records are returned verbatim rather than split, so no caller has to reason
+// about the arrow form.
+//
+// The NUL-delimited form is deliberately not used: the caller wants one
+// human-readable record per entry, and non-`-z` porcelain already quotes any
+// path containing a newline, so line splitting is safe here.
+func worktreeDirtyEntries(workDir string) ([]string, error) {
+	out, err := gitOutputBytes(workDir, "status", "--porcelain=v1", "--untracked-files=all")
+	if err != nil {
+		return nil, err
+	}
+	var entries []string
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.TrimSpace(line) != "" {
+			entries = append(entries, strings.TrimRight(line, "\r"))
+		}
+	}
+	sort.Strings(entries)
+	return entries, nil
+}
+
+// maxReportedDirtyEntries bounds how many worktree records reach an error
+// string or a log line. A task that left hundreds of files behind is fully
+// described by the first few plus a count; embedding the whole list would push
+// the actionable part of the message out of view.
+const maxReportedDirtyEntries = 10
+
+func summarizeDirtyEntries(entries []string) string {
+	if len(entries) <= maxReportedDirtyEntries {
+		return strings.Join(entries, "; ")
+	}
+	return fmt.Sprintf(
+		"%s; and %d more",
+		strings.Join(entries[:maxReportedDirtyEntries], "; "),
+		len(entries)-maxReportedDirtyEntries,
+	)
+}
+
+// reportDiscardedWorkLocked logs whatever the disposable worktree is about to
+// throw away when the task produced no commit. It runs the same daemon-material
+// cleanup the publish path uses first, so the report names only what the agent
+// itself left behind and never the injected runtime brief or the sidecar tree.
+// Otherwise every clean zero-commit sweep would log a phantom loss.
+//
+// Every step is diagnostic. The caller's disposition does not depend on it, so
+// failures are logged and swallowed rather than returned: a broken status read
+// must not turn a successful no-publication run back into a failure.
+func (w *IsolatedLocalWorktree) reportDiscardedWorkLocked(provider string, logger *slog.Logger) {
+	log := orDiscardLogger(logger)
+	if err := CleanupRuntimeConfig(w.WorkDir, provider); err != nil {
+		log.Warn("execenv: cleanup runtime config before discard report failed", "task_id", w.TaskID, "error", err)
+	}
+	if err := CleanupSidecars(filepath.Dir(w.WorkDir)); err != nil {
+		log.Warn("execenv: cleanup sidecars before discard report failed", "task_id", w.TaskID, "error", err)
+	}
+	dirty, err := worktreeDirtyEntries(w.WorkDir)
+	if err != nil {
+		log.Warn("execenv: inspect task worktree for discard report failed", "task_id", w.TaskID, "error", err)
+		return
+	}
+	if len(dirty) == 0 {
+		return
+	}
+	log.Warn(
+		"execenv: task produced no commit; discarding uncommitted worktree changes",
+		"task_id", w.TaskID,
+		"base_commit", w.BaseCommit,
+		"entry_count", len(dirty),
+		"entries", summarizeDirtyEntries(dirty),
+	)
+}
+
 func (w *IsolatedLocalWorktree) quarantineAndRemoveLocked(taskSHA string, logger *slog.Logger) error {
 	reachable, err := gitSuccess(w.SourceRepo, "merge-base", "--is-ancestor", taskSHA, "HEAD")
 	if err != nil {
@@ -391,6 +488,10 @@ func (w *IsolatedLocalWorktree) quarantineAndRemoveLocked(taskSHA string, logger
 		if logger != nil {
 			logger.Info("execenv: isolated local worktree has no unique task commit to quarantine", "task_id", w.TaskID, "task_commit", taskSHA)
 		}
+		w.recoveryNote = fmt.Sprintf(
+			"No quarantine ref was needed: task commit %s is already reachable from source HEAD.",
+			taskSHA,
+		)
 		w.removeLocked(logger)
 		return nil
 	}
@@ -406,6 +507,7 @@ func (w *IsolatedLocalWorktree) quarantineAndRemoveLocked(taskSHA string, logger
 	if logger != nil {
 		logger.Info("execenv: quarantined isolated local worktree commit", "task_id", w.TaskID, "commit", taskSHA, "ref", ref)
 	}
+	w.recoveryNote = fmt.Sprintf("Recovery ref: %s (task commit %s).", ref, taskSHA)
 	w.removeLocked(logger)
 	return nil
 }
