@@ -103,6 +103,24 @@ type IsolatedLocalWorktree struct {
 	// inside WorkDir. It deliberately does not rely on the on-disk sidecar
 	// manifest, which the task process can edit or delete before finalization.
 	managedPaths map[string]struct{}
+
+	// recoveryNote records what finalization actually did with the task tip, so
+	// the operator-facing failure comment can state the real recovery surface
+	// instead of asserting a quarantine ref that may never have been created.
+	// Empty means finalization never reached a disposition: the worktree and
+	// branch are still on disk for manual recovery.
+	recoveryNote string
+}
+
+// RecoveryNote describes where a finalized task's work can be found: a
+// quarantine ref, the source history it is already reachable from, or nothing
+// when finalization failed before it could decide. Read it after
+// FinalizeSerialPublishBack returns.
+func (w *IsolatedLocalWorktree) RecoveryNote() string {
+	if w == nil {
+		return ""
+	}
+	return w.recoveryNote
 }
 
 // PrepareIsolatedLocalWorktree cuts an isolated worktree for taskID at workDir,

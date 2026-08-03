@@ -1,10 +1,14 @@
 package execenv
 
 import (
+	"context"
+	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -277,7 +281,12 @@ func TestSerialPublishBack_OverlappingIgnoredSourceFileQuarantines(t *testing.T)
 	assertWorktreeRemoved(t, src, wt)
 }
 
-func TestSerialPublishBack_TaskStagingRefusesWithoutEmptyQuarantine(t *testing.T) {
+// A task that produced no commit has nothing to publish, so leftover dirt in the
+// disposable worktree must not be reported as a publish conflict. The dirt is
+// discarded with the worktree and can never reach the source either way; the
+// pre-VWO-511 refusal here made every run-only maintenance sweep unfailable-safe
+// only by accident, and any scratch at all turned a correct run into `blocked`.
+func TestSerialPublishBack_ZeroCommitStagingPublishesNothingAndSucceeds(t *testing.T) {
 	src := newSourceRepo(t)
 	base := git(t, src, "rev-parse", "HEAD")
 	wt, err := PrepareIsolatedLocalWorktree(src, isolatedWorkDir(t.TempDir()), "task-55555555", nil)
@@ -289,15 +298,205 @@ func TestSerialPublishBack_TaskStagingRefusesWithoutEmptyQuarantine(t *testing.T
 	}
 	git(t, wt.WorkDir, "add", "staged.txt")
 
-	err = wt.FinalizeSerialPublishBack(true, "claude", nil)
-	if err == nil || !strings.Contains(err.Error(), "staged or uncommitted") {
-		t.Fatalf("error = %v, want dirty task refusal", err)
+	if err := wt.FinalizeSerialPublishBack(true, "claude", testLogger()); err != nil {
+		t.Fatalf("error = %v, want a zero-commit run to succeed without publishing", err)
 	}
 	if got := git(t, src, "rev-parse", "HEAD"); got != base {
 		t.Fatalf("source HEAD changed: %s != %s", got, base)
 	}
 	assertNoQuarantine(t, src, wt.TaskID)
 	assertWorktreeRemoved(t, src, wt)
+}
+
+// The literal VWO-511 shape: a run-only sweep cloned the canonical repository
+// into its own task worktree, leaving one untracked directory and no commit.
+func TestSerialPublishBack_ZeroCommitUntrackedNestedCheckoutSucceeds(t *testing.T) {
+	src := newSourceRepo(t)
+	base := git(t, src, "rev-parse", "HEAD")
+	wt, err := PrepareIsolatedLocalWorktree(src, isolatedWorkDir(t.TempDir()), "task-55555556", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nested := filepath.Join(wt.WorkDir, "nested-checkout")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nested, "sweep-scratch.txt"), []byte("scratch\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := wt.FinalizeSerialPublishBack(true, "claude", testLogger()); err != nil {
+		t.Fatalf("error = %v, want a zero-commit sweep to succeed without publishing", err)
+	}
+	if got := git(t, src, "rev-parse", "HEAD"); got != base {
+		t.Fatalf("source HEAD changed: %s != %s", got, base)
+	}
+	assertNoQuarantine(t, src, wt.TaskID)
+	assertWorktreeRemoved(t, src, wt)
+}
+
+// The clean-tree gate still guards a real publication: once there IS a commit to
+// fast-forward, leftover dirt means daemon cleanup may have altered the tree the
+// commit was built from, so the publish is refused and the commit quarantined.
+// The refusal must also name what was dirty: every VWO-511 failure comment was
+// unactionable without reading the agent's rollout transcript.
+func TestSerialPublishBack_DirtyWorktreeAlongsideCommitRefusesAndNamesPaths(t *testing.T) {
+	src := newSourceRepo(t)
+	base := git(t, src, "rev-parse", "HEAD")
+	wt, err := PrepareIsolatedLocalWorktree(src, isolatedWorkDir(t.TempDir()), "task-55555557", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskSHA := commitTaskFile(t, wt, "published.txt", "published\n")
+	if err := os.WriteFile(filepath.Join(wt.WorkDir, "leftover.txt"), []byte("leftover\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git(t, wt.WorkDir, "add", "leftover.txt")
+
+	err = wt.FinalizeSerialPublishBack(true, "claude", testLogger())
+	if err == nil || !strings.Contains(err.Error(), "staged or uncommitted") {
+		t.Fatalf("error = %v, want dirty task refusal", err)
+	}
+	if !strings.Contains(err.Error(), "leftover.txt") {
+		t.Fatalf("error = %v, want the offending path named", err)
+	}
+	if got := git(t, src, "rev-parse", "HEAD"); got != base {
+		t.Fatalf("source HEAD changed: %s != %s", got, base)
+	}
+	assertQuarantine(t, src, wt.TaskID, taskSHA)
+	assertWorktreeRemoved(t, src, wt)
+	if note := wt.RecoveryNote(); !strings.Contains(note, QuarantineRefPrefix+wt.TaskID) {
+		t.Fatalf("recovery note = %q, want the quarantine ref that was actually created", note)
+	}
+}
+
+// The operator comment is built from the finalizer's own disposition, so a run
+// whose tip needs no quarantine must not claim a ref that was never created.
+func TestSerialPublishBack_RecoveryNoteReportsReachableTipInsteadOfMissingRef(t *testing.T) {
+	src := newSourceRepo(t)
+	wt, err := PrepareIsolatedLocalWorktree(src, isolatedWorkDir(t.TempDir()), "task-55555558", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := wt.FinalizeSerialPublishBack(false, "claude", testLogger()); err != nil {
+		t.Fatal(err)
+	}
+	assertNoQuarantine(t, src, wt.TaskID)
+	note := wt.RecoveryNote()
+	if strings.Contains(note, QuarantineRefPrefix) {
+		t.Fatalf("recovery note = %q, want no quarantine ref claim when none was created", note)
+	}
+	if !strings.Contains(note, "reachable from source HEAD") {
+		t.Fatalf("recovery note = %q, want the reachability disposition", note)
+	}
+}
+
+// Succeeding a zero-commit run makes the daemon log the only surviving trace of
+// anything the task left behind, so the warning must actually reach a real
+// logger on the production path, and it must name the agent's own leftovers
+// without the daemon sidecars and the injected brief drowning them out.
+func TestSerialPublishBack_ZeroCommitLogsDiscardedAgentWorkOnly(t *testing.T) {
+	src := newSourceRepo(t)
+	env, err := Prepare(PrepareParams{
+		WorkspacesRoot: t.TempDir(),
+		WorkspaceID:    "ws-publish-discard-report",
+		TaskID:         "task-discard-report",
+		Provider:       "claude",
+		LocalWorkDir:   src,
+		Isolate:        true,
+		PublishBack:    true,
+		Task:           TaskContextForEnv{IssueID: "issue-discard-report"},
+	}, testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt := env.IsolatedWorktree
+	if _, err := InjectRuntimeConfig(wt.WorkDir, "claude", TaskContextForEnv{IssueID: "issue-discard-report"}); err != nil {
+		t.Fatal(err)
+	}
+	// What the agent itself left behind, uncommitted, in a run that never committed.
+	if err := os.WriteFile(filepath.Join(wt.WorkDir, "regenerated-artifact.yaml"), []byte("resolved\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var (
+		mu      sync.Mutex
+		records []slog.Record
+	)
+	logger := slog.New(capturingHandler{mu: &mu, records: &records})
+
+	if err := wt.FinalizeSerialPublishBack(true, "claude", logger); err != nil {
+		t.Fatalf("error = %v, want a zero-commit run to succeed", err)
+	}
+
+	var discard *slog.Record
+	for i := range records {
+		if strings.Contains(records[i].Message, "discarding uncommitted worktree changes") {
+			discard = &records[i]
+			break
+		}
+	}
+	if discard == nil {
+		t.Fatalf("no discard warning reached the logger; records = %v", records)
+	}
+	var entries string
+	discard.Attrs(func(a slog.Attr) bool {
+		if a.Key == "entries" {
+			entries = a.Value.String()
+		}
+		return true
+	})
+	if !strings.Contains(entries, "regenerated-artifact.yaml") {
+		t.Fatalf("entries = %q, want the agent's discarded artifact named", entries)
+	}
+	// CLAUDE.md carries the injected brief and .agent_context/ is the sidecar
+	// tree. Cleanup runs before the report precisely so neither is reported as
+	// lost work; if either shows up the warning is noise on every clean sweep.
+	if strings.Contains(entries, "CLAUDE.md") || strings.Contains(entries, ".agent_context") {
+		t.Fatalf("entries = %q, want daemon-managed material excluded from the discard report", entries)
+	}
+	assertWorktreeRemoved(t, src, wt)
+}
+
+// capturingHandler records every slog record at or above Warn so a test can
+// assert on what an operator would actually see in the daemon log.
+type capturingHandler struct {
+	mu      *sync.Mutex
+	records *[]slog.Record
+}
+
+func (h capturingHandler) Enabled(_ context.Context, level slog.Level) bool {
+	return level >= slog.LevelWarn
+}
+
+func (h capturingHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	*h.records = append(*h.records, r.Clone())
+	return nil
+}
+
+func (h capturingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+
+func (h capturingHandler) WithGroup(string) slog.Handler { return h }
+
+func TestSummarizeDirtyEntriesCapsAndCounts(t *testing.T) {
+	var entries []string
+	for i := 0; i < maxReportedDirtyEntries+3; i++ {
+		entries = append(entries, fmt.Sprintf("?? scratch-%02d.txt", i))
+	}
+	got := summarizeDirtyEntries(entries)
+	if !strings.HasSuffix(got, "and 3 more") {
+		t.Fatalf("summary = %q, want a trailing overflow count", got)
+	}
+	if strings.Contains(got, "scratch-10.txt") {
+		t.Fatalf("summary = %q, want entries past the cap omitted", got)
+	}
+	short := summarizeDirtyEntries(entries[:2])
+	if short != "?? scratch-00.txt; ?? scratch-01.txt" {
+		t.Fatalf("summary = %q, want both entries joined without an overflow count", short)
+	}
 }
 
 func TestSerialPublishBack_CommittedDaemonSidecarsQuarantine(t *testing.T) {
