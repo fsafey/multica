@@ -118,6 +118,7 @@ export const RUNTIME_PROFILE_PROTOCOL_FAMILIES = [
   "kiro",
   "antigravity",
   "qoder",
+  "qoderclicn",
   "traecli",
   "grok",
   "qwen",
@@ -372,7 +373,16 @@ export interface AgentTask {
 export interface Agent {
   id: string;
   workspace_id: string;
+  /**
+   * Empty string when the agent is unbound: it kept its configuration, chats and
+   * task history when its runtime was deleted, and needs a new runtime before it
+   * can run again (MUL-5559). Use `isAgentRuntimeBound` so additive and legacy
+   * signals stay compatible, and do not confuse it with a bound-but-offline
+   * runtime — that one just needs the machine back.
+   */
   runtime_id: string;
+  /** False exactly when the agent has no runtime. Older backends omit it. */
+  runtime_bound?: boolean;
   name: string;
   description: string;
   instructions: string;
@@ -384,7 +394,7 @@ export interface Agent {
    * Coarse metadata signalling whether the agent has any custom env
    * vars configured, without exposing the keys or values. Reads of
    * the real map go through the dedicated `GET /api/agents/{id}/env`
-   * endpoint (owner/admin only, audited). MUL-2600.
+   * endpoint (agent owner or workspace owner/admin, audited). MUL-2600.
    *
    * Optional in the type so older backends (pre-MUL-2600) that omit
    * the field don't crash the renderer; downstream code should treat
@@ -649,8 +659,9 @@ export interface UpdateAgentRequest {
   /**
    * NOTE: `custom_env` is intentionally NOT updatable through this
    * request shape. Env edits flow through `client.updateAgentEnv` /
-   * `PUT /api/agents/{id}/env` — that path is owner/admin only,
-   * denies agent actors, and writes a persistent audit row. The
+   * `PUT /api/agents/{id}/env` — that path admits the agent owner or a
+   * workspace owner/admin, denies agent actors, and writes a
+   * persistent audit row. The
    * server REJECTS any `PUT /api/agents/{id}` body that includes
    * `custom_env` with a 400; do not put the field in this payload.
    * MUL-2600.
@@ -791,9 +802,27 @@ export interface IssueUsageSummary {
   total_output_tokens: number;
   total_cache_read_tokens: number;
   total_cache_write_tokens: number;
+  // Optional unlike the usage-row types: `getIssueUsage` returns this shape
+  // unvalidated (no zod schema), so nothing guarantees the field is present
+  // when the backend is older than the cost split.
+  cost_usd_ticks?: number;
+  uncosted_input_tokens?: number;
+  uncosted_output_tokens?: number;
+  uncosted_cache_read_tokens?: number;
+  uncosted_cache_write_tokens?: number;
   task_count: number;
 }
 
+// `cost_usd_ticks` + `uncosted_*`: the cost split every usage row carries.
+// All five are optional: a backend older than the split sends none of them,
+// and `undefined` has to stay distinguishable from a real 0 (see below).
+// The provider priced the rows behind `cost_usd_ticks` itself (1e-10 USD);
+// `uncosted_*` are the tokens it did not price, and are the only ones that
+// should go through the client's rate table. The `uncosted_*` fields are
+// optional because a backend older than the split omits them — `undefined`
+// there means "estimate from the full token counts", which is not the same as
+// a real 0 ("nothing left to estimate"). See estimateCost in
+// packages/views/runtimes/utils.ts.
 export interface RuntimeUsage {
   runtime_id: string;
   date: string;
@@ -803,6 +832,11 @@ export interface RuntimeUsage {
   output_tokens: number;
   cache_read_tokens: number;
   cache_write_tokens: number;
+  cost_usd_ticks?: number;
+  uncosted_input_tokens?: number;
+  uncosted_output_tokens?: number;
+  uncosted_cache_read_tokens?: number;
+  uncosted_cache_write_tokens?: number;
 }
 
 export interface RuntimeHourlyActivity {
@@ -823,6 +857,11 @@ export interface RuntimeUsageByAgent {
   output_tokens: number;
   cache_read_tokens: number;
   cache_write_tokens: number;
+  cost_usd_ticks?: number;
+  uncosted_input_tokens?: number;
+  uncosted_output_tokens?: number;
+  uncosted_cache_read_tokens?: number;
+  uncosted_cache_write_tokens?: number;
   task_count: number;
 }
 
@@ -836,6 +875,11 @@ export interface RuntimeUsageByHour {
   output_tokens: number;
   cache_read_tokens: number;
   cache_write_tokens: number;
+  cost_usd_ticks?: number;
+  uncosted_input_tokens?: number;
+  uncosted_output_tokens?: number;
+  uncosted_cache_read_tokens?: number;
+  uncosted_cache_write_tokens?: number;
   task_count: number;
 }
 
@@ -853,6 +897,11 @@ export interface DashboardUsageDaily {
   output_tokens: number;
   cache_read_tokens: number;
   cache_write_tokens: number;
+  cost_usd_ticks?: number;
+  uncosted_input_tokens?: number;
+  uncosted_output_tokens?: number;
+  uncosted_cache_read_tokens?: number;
+  uncosted_cache_write_tokens?: number;
   task_count: number;
 }
 
@@ -867,6 +916,11 @@ export interface DashboardUsageByAgent {
   output_tokens: number;
   cache_read_tokens: number;
   cache_write_tokens: number;
+  cost_usd_ticks?: number;
+  uncosted_input_tokens?: number;
+  uncosted_output_tokens?: number;
+  uncosted_cache_read_tokens?: number;
+  uncosted_cache_write_tokens?: number;
   task_count: number;
 }
 
@@ -890,6 +944,32 @@ export interface DashboardRunTimeDaily {
   total_seconds: number;
   task_count: number;
   failed_count: number;
+}
+
+// One (date, failure_reason) bucket of terminal-task counts for the workspace
+// dashboard's Errors metric.
+//
+// `failure_reason` carries the backend's canonical failure taxonomy (the 21
+// `taskfailure.Reason` values, plus `"unclassified"` for failed rows with an
+// empty column) — EXCEPT for the empty string, which is the *succeeded*
+// bucket. Shipping successes in the same series is deliberate: the error rate
+// then has a denominator built on exactly the same filters as its numerator.
+// `DashboardRunTimeDaily.task_count` is NOT a safe denominator here, because
+// it only counts tasks that actually started and a queue-expired task never
+// does.
+export interface DashboardFailureDaily {
+  date: string;
+  failure_reason: string;
+  task_count: number;
+}
+
+// Per-(agent, failure_reason) terminal-task counts. Same succeeded-bucket
+// convention as DashboardFailureDaily, so the client can rank agents by
+// failure rate rather than by raw failure count.
+export interface DashboardFailureByAgent {
+  agent_id: string;
+  failure_reason: string;
+  task_count: number;
 }
 
 export type RuntimeUpdateStatus =
@@ -972,6 +1052,15 @@ export interface RuntimeModelListRequest {
   error?: string;
   created_at: string;
   updated_at: string;
+  /**
+   * True when the server answered from its own catalog cache instead of a live
+   * daemon round trip (MUL-5444). Informational only: such a response already
+   * arrives with `status: "completed"` and a populated `models`, so callers
+   * that ignore this field behave exactly as before. `cached_at` is the
+   * snapshot's capture time.
+   */
+  cached?: boolean;
+  cached_at?: string;
 }
 
 // Result shape returned by resolveRuntimeModels — includes the
@@ -980,6 +1069,15 @@ export interface RuntimeModelListRequest {
 export interface RuntimeModelsResult {
   models: RuntimeModel[];
   supported: boolean;
+  /**
+   * True when the server answered from its catalog cache rather than a live
+   * daemon round trip (MUL-5444). Drives the query's freshness policy: a
+   * cached answer is immediately revalidatable so the client never extends the
+   * server's staleness window.
+   */
+  cached?: boolean;
+  /** Capture time of the served snapshot, when the answer was cached. */
+  cachedAt?: string;
 }
 
 export type RuntimeLocalSkillStatus =

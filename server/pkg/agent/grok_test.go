@@ -109,7 +109,7 @@ while IFS= read -r line; do
       if [ -n "$GROK_USAGE" ]; then
         # Match live Grok Build ACP (0.2.x): metering lives under result._meta,
         # not a top-level usage field or sessionUpdate=usage_update.
-        printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn","_meta":{"sessionId":"ses_new","modelId":"grok-4.5","inputTokens":120,"outputTokens":30,"cachedReadTokens":20,"usage":{"inputTokens":120,"outputTokens":30,"totalTokens":150,"cachedReadTokens":20,"modelCalls":1}}}}\n' "$id"
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn","_meta":{"sessionId":"ses_new","modelId":"grok-4.5","inputTokens":120,"outputTokens":30,"cachedReadTokens":20,"usage":{"inputTokens":120,"outputTokens":30,"totalTokens":150,"cachedReadTokens":20,"modelCalls":1,"costUsdTicks":98765}}}}\n' "$id"
       else
         printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
       fi
@@ -616,6 +616,60 @@ func TestGrokPropagatesMCPAndUsage(t *testing.T) {
 	if usage.InputTokens != 100 || usage.OutputTokens != 30 || usage.CacheReadTokens != 20 {
 		t.Fatalf("unexpected usage: %+v", usage)
 	}
+	// xAI's own price for the turn has to survive the whole backend, not just
+	// the parser: it is the only figure carrying the ≥200K prompt surcharge,
+	// and everything downstream falls back to a rate-table guess without it.
+	if usage.CostUSDTicks != 98765 {
+		t.Fatalf("cost ticks = %d, want 98765", usage.CostUSDTicks)
+	}
+}
+
+// TestGrokAttributesUsageOnResumeWithoutConfiguredModel pins the model
+// attribution on the resume path. `session/load` reports no model id (only
+// `session/new` does), so when neither the agent nor the runtime pins a model
+// the turn's own `_meta.modelId` is the only source left. Without it the whole
+// run buckets under "unknown", which matches no pricing row and reports $0
+// spend for the task.
+func TestGrokAttributesUsageOnResumeWithoutConfiguredModel(t *testing.T) {
+	t.Parallel()
+	tempDir := t.TempDir()
+	fakePath := filepath.Join(tempDir, "grok")
+	writeTestExecutable(t, fakePath, []byte(fakeGrokACPScript()))
+	backend, err := New("grok", Config{
+		ExecutablePath: fakePath,
+		Logger:         slog.Default(),
+		Env:            map[string]string{"GROK_USAGE": "1"},
+	})
+	if err != nil {
+		t.Fatalf("new grok backend: %v", err)
+	}
+	// No Model: the daemon leaves it empty whenever neither the agent nor
+	// MULTICA_GROK_MODEL pins one (see daemon.go resolveModel).
+	session, err := backend.Execute(context.Background(), "continue", ExecOptions{
+		ResumeSessionID: "ses_existing",
+		Timeout:         5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	go func() {
+		for range session.Messages {
+		}
+	}()
+	result := <-session.Result
+	if result.Status != "completed" {
+		t.Fatalf("expected completed, got status=%q error=%q", result.Status, result.Error)
+	}
+	if _, unknown := result.Usage["unknown"]; unknown {
+		t.Fatalf("resumed usage fell back to the unpriced \"unknown\" bucket: %+v", result.Usage)
+	}
+	usage, ok := result.Usage["grok-4.5"]
+	if !ok {
+		t.Fatalf("usage missing grok-4.5 key: %+v", result.Usage)
+	}
+	if usage.InputTokens != 100 || usage.OutputTokens != 30 || usage.CacheReadTokens != 20 {
+		t.Fatalf("unexpected usage: %+v", usage)
+	}
 }
 
 func TestGrokTimeoutAndCancellation(t *testing.T) {
@@ -689,12 +743,15 @@ func TestDiscoverGrokModelsWaitsForAdvertisedAuth(t *testing.T) {
 	t.Setenv("GROK_AUTH_METHODS", "api")
 	t.Setenv("XAI_API_KEY", "test-only-key")
 
-	models, err := discoverGrokModels(context.Background(), fakePath)
+	catalog, err := discoverGrokModels(context.Background(), fakePath)
 	if err != nil {
 		t.Fatalf("discover grok models: %v", err)
 	}
-	if len(models) != 2 || models[0].ID != "grok-4.5" {
-		t.Fatalf("unexpected models: %+v", models)
+	if len(catalog.Models) != 2 || catalog.Models[0].ID != "grok-4.5" {
+		t.Fatalf("unexpected models: %+v", catalog.Models)
+	}
+	if catalog.Fallback {
+		t.Error("a successful ACP discovery must not be marked Fallback")
 	}
 	raw, err := os.ReadFile(requestsFile)
 	if err != nil {
@@ -732,12 +789,15 @@ func TestDiscoverGrokModelsStopsOnAuthFailures(t *testing.T) {
 			t.Setenv("GROK_AUTH_FAIL", tc.authFail)
 			t.Setenv("XAI_API_KEY", "")
 
-			models, err := discoverGrokModels(context.Background(), fakePath)
+			catalog, err := discoverGrokModels(context.Background(), fakePath)
 			if err != nil {
 				t.Fatalf("discover grok models: %v", err)
 			}
-			if len(models) != 2 || models[0].ID != "grok-4.5" {
-				t.Fatalf("expected static fallback, got %+v", models)
+			if len(catalog.Models) != 2 || catalog.Models[0].ID != "grok-4.5" {
+				t.Fatalf("expected static fallback, got %+v", catalog.Models)
+			}
+			if !catalog.Fallback {
+				t.Error("static fallback must be marked Fallback so it is never cached as the real catalog")
 			}
 			raw, err := os.ReadFile(requestsFile)
 			if err != nil {

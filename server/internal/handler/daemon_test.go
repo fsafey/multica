@@ -2939,6 +2939,112 @@ func TestClaimTaskByRuntime_TaskWorkspaceMismatch_CancelsAndRejects(t *testing.T
 	}
 }
 
+func TestCompleteTask_PersistsEvidenceOutsidePublicResult(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+
+	ctx := context.Background()
+	var agentID, runtimeID string
+	if err := testPool.QueryRow(ctx, `
+		SELECT id, runtime_id
+		FROM agent
+		WHERE workspace_id = $1 AND runtime_id IS NOT NULL
+		LIMIT 1
+	`, testWorkspaceID).Scan(&agentID, &runtimeID); err != nil {
+		t.Fatalf("setup: get runnable agent: %v", err)
+	}
+
+	var issueID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO issue (workspace_id, title, status, priority, creator_id, creator_type, number, position)
+		VALUES (
+			$1, 'completion result boundary fixture', 'in_progress', 'none', $2, 'member',
+			(SELECT COALESCE(MAX(number), 90000) + 1 FROM issue WHERE workspace_id = $1),
+			0
+		)
+		RETURNING id
+	`, testWorkspaceID, testUserID).Scan(&issueID); err != nil {
+		t.Fatalf("setup: create issue: %v", err)
+	}
+	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, issueID) })
+
+	var taskID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, status, priority, started_at)
+		VALUES ($1, $2, $3, 'running', 0, now())
+		RETURNING id
+	`, agentID, runtimeID, issueID).Scan(&taskID); err != nil {
+		t.Fatalf("setup: create running task: %v", err)
+	}
+	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE id = $1`, taskID) })
+
+	w := httptest.NewRecorder()
+	req := newDaemonTokenRequest("POST", "/api/daemon/tasks/"+taskID+"/complete", map[string]any{
+		"pr_url":                        "https://example.test/pr/1",
+		"output":                        "completed",
+		"session_id":                    "session-new",
+		"work_dir":                      "/tmp/workdir",
+		"expected_message_count":        0,
+		"expected_last_sequence":        0,
+		"transcript_delivery_confirmed": true,
+		"session_rollout_missing":       true,
+		"retired_session_id":            "session-old",
+	}, testWorkspaceID, "legit-daemon")
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("taskId", taskID)
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+
+	testHandler.CompleteTask(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("CompleteTask: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var response AgentTaskResponse
+	if err := json.NewDecoder(w.Body).Decode(&response); err != nil {
+		t.Fatalf("decode completion response: %v", err)
+	}
+	result, ok := response.Result.(map[string]any)
+	if !ok {
+		t.Fatalf("completion result type = %T, want object", response.Result)
+	}
+	for _, key := range []string{"expected_message_count", "expected_last_sequence", "transcript_delivery_confirmed"} {
+		if _, exists := result[key]; exists {
+			t.Fatalf("completion result exposed transport field %q: %#v", key, result)
+		}
+	}
+	for key, want := range map[string]any{
+		"pr_url":                  "https://example.test/pr/1",
+		"output":                  "completed",
+		"session_id":              "session-new",
+		"work_dir":                "/tmp/workdir",
+		"session_rollout_missing": true,
+		"retired_session_id":      "session-old",
+	} {
+		if got := result[key]; got != want {
+			t.Fatalf("completion result[%q] = %#v, want %#v", key, got, want)
+		}
+	}
+
+	var expectedCount, expectedLastSequence int32
+	var deliveryConfirmed, rolloutMissing bool
+	var retiredSessionID string
+	if err := testPool.QueryRow(ctx, `
+		SELECT transcript_expected_message_count, transcript_expected_last_seq,
+		       transcript_delivery_confirmed, session_rollout_missing, retired_session_id
+		FROM agent_task_queue
+		WHERE id = $1
+	`, taskID).Scan(&expectedCount, &expectedLastSequence, &deliveryConfirmed, &rolloutMissing, &retiredSessionID); err != nil {
+		t.Fatalf("read canonical completion evidence: %v", err)
+	}
+	if expectedCount != 0 || expectedLastSequence != 0 || !deliveryConfirmed || !rolloutMissing || retiredSessionID != "session-old" {
+		t.Fatalf(
+			"canonical completion evidence = count:%d last:%d delivered:%t rollout_missing:%t retired:%q",
+			expectedCount, expectedLastSequence, deliveryConfirmed, rolloutMissing, retiredSessionID,
+		)
+	}
+}
+
 // Regression test for MUL-1198: comment-triggered tasks that finish without
 // the agent posting any comment must still deliver a synthesized result
 // comment, threaded under the trigger. Before the fix, CompleteTask exempted

@@ -411,11 +411,6 @@ func TestIssueProjectMoveDoesNotReplaceClaimTimeEvidence(t *testing.T) {
 		CustomEnvironmentNames: []string{},
 		MCPServerNames:         []string{},
 	}
-	snapshot.ProjectID = "11111111-1111-4111-8111-111111111111"
-	if w := recordEvidenceRequest(t, taskID, snapshot); w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "project does not match") {
-		t.Fatalf("projectless run-only evidence with a project = %d: %s", w.Code, w.Body.String())
-	}
-	snapshot.ProjectID = ""
 	if w := recordEvidenceRequest(t, taskID, snapshot); w.Code != http.StatusCreated {
 		t.Fatalf("claim-time project evidence: expected 201, got %d: %s", w.Code, w.Body.String())
 	}
@@ -638,10 +633,37 @@ func TestProjectlessRunOnlyEvidenceRequiresEmptyProject(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
 	}
+	ctx := context.Background()
 	runtimeID, agentID, _, taskID := createRunningEvidenceTask(t)
-	if _, err := testPool.Exec(context.Background(), `UPDATE agent_task_queue SET issue_id = NULL WHERE id = $1`, taskID); err != nil {
+	var autopilotID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO autopilot (
+			workspace_id, title, description, assignee_id, execution_mode,
+			created_by_type, created_by_id
+		)
+		VALUES ($1, 'projectless execution evidence', 'projectless run only', $2, 'run_only', 'member', $3)
+		RETURNING id
+	`, testWorkspaceID, agentID, testUserID).Scan(&autopilotID); err != nil {
+		t.Fatalf("create projectless autopilot: %v", err)
+	}
+	var runID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO autopilot_run (autopilot_id, source, status)
+		VALUES ($1, 'manual', 'running')
+		RETURNING id
+	`, autopilotID).Scan(&runID); err != nil {
+		t.Fatalf("create projectless autopilot run: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		UPDATE agent_task_queue SET issue_id = NULL, autopilot_run_id = $2 WHERE id = $1
+	`, taskID, runID); err != nil {
 		t.Fatalf("convert task to projectless run-only fixture: %v", err)
 	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `UPDATE agent_task_queue SET autopilot_run_id = NULL WHERE id = $1`, taskID)
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM autopilot_run WHERE id = $1`, runID)
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM autopilot WHERE id = $1`, autopilotID)
+	})
 	snapshot := executionevidence.Snapshot{
 		SchemaVersion:          executionevidence.CurrentSchemaVersion,
 		TaskID:                 taskID,
