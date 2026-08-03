@@ -1,11 +1,14 @@
 package execenv
 
 import (
+	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -388,6 +391,95 @@ func TestSerialPublishBack_RecoveryNoteReportsReachableTipInsteadOfMissingRef(t 
 		t.Fatalf("recovery note = %q, want the reachability disposition", note)
 	}
 }
+
+// Succeeding a zero-commit run makes the daemon log the only surviving trace of
+// anything the task left behind, so the warning must actually reach a real
+// logger on the production path, and it must name the agent's own leftovers
+// without the daemon sidecars and the injected brief drowning them out.
+func TestSerialPublishBack_ZeroCommitLogsDiscardedAgentWorkOnly(t *testing.T) {
+	src := newSourceRepo(t)
+	env, err := Prepare(PrepareParams{
+		WorkspacesRoot: t.TempDir(),
+		WorkspaceID:    "ws-publish-discard-report",
+		TaskID:         "task-discard-report",
+		Provider:       "claude",
+		LocalWorkDir:   src,
+		Isolate:        true,
+		PublishBack:    true,
+		Task:           TaskContextForEnv{IssueID: "issue-discard-report"},
+	}, testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt := env.IsolatedWorktree
+	if _, err := InjectRuntimeConfig(wt.WorkDir, "claude", TaskContextForEnv{IssueID: "issue-discard-report"}); err != nil {
+		t.Fatal(err)
+	}
+	// What the agent itself left behind, uncommitted, in a run that never committed.
+	if err := os.WriteFile(filepath.Join(wt.WorkDir, "regenerated-artifact.yaml"), []byte("resolved\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var (
+		mu      sync.Mutex
+		records []slog.Record
+	)
+	logger := slog.New(capturingHandler{mu: &mu, records: &records})
+
+	if err := wt.FinalizeSerialPublishBack(true, "claude", logger); err != nil {
+		t.Fatalf("error = %v, want a zero-commit run to succeed", err)
+	}
+
+	var discard *slog.Record
+	for i := range records {
+		if strings.Contains(records[i].Message, "discarding uncommitted worktree changes") {
+			discard = &records[i]
+			break
+		}
+	}
+	if discard == nil {
+		t.Fatalf("no discard warning reached the logger; records = %v", records)
+	}
+	var entries string
+	discard.Attrs(func(a slog.Attr) bool {
+		if a.Key == "entries" {
+			entries = a.Value.String()
+		}
+		return true
+	})
+	if !strings.Contains(entries, "regenerated-artifact.yaml") {
+		t.Fatalf("entries = %q, want the agent's discarded artifact named", entries)
+	}
+	// CLAUDE.md carries the injected brief and .agent_context/ is the sidecar
+	// tree. Cleanup runs before the report precisely so neither is reported as
+	// lost work; if either shows up the warning is noise on every clean sweep.
+	if strings.Contains(entries, "CLAUDE.md") || strings.Contains(entries, ".agent_context") {
+		t.Fatalf("entries = %q, want daemon-managed material excluded from the discard report", entries)
+	}
+	assertWorktreeRemoved(t, src, wt)
+}
+
+// capturingHandler records every slog record at or above Warn so a test can
+// assert on what an operator would actually see in the daemon log.
+type capturingHandler struct {
+	mu      *sync.Mutex
+	records *[]slog.Record
+}
+
+func (h capturingHandler) Enabled(_ context.Context, level slog.Level) bool {
+	return level >= slog.LevelWarn
+}
+
+func (h capturingHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	*h.records = append(*h.records, r.Clone())
+	return nil
+}
+
+func (h capturingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+
+func (h capturingHandler) WithGroup(string) slog.Handler { return h }
 
 func TestSummarizeDirtyEntriesCapsAndCounts(t *testing.T) {
 	var entries []string
