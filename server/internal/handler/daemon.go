@@ -2451,6 +2451,29 @@ func claimResponseAgentIdentityMatches(resp AgentTaskResponse) bool {
 func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQueue, runtime db.AgentRuntime, runtimeID, runtimeWorkspaceID string) (resp AgentTaskResponse, deliveredCommentIDs []pgtype.UUID, issueSnapshot []byte, agentSkillCount, builtinSkillCount int, failure *claimBuildFailure) {
 	// Build response with fresh agent data (name + skills + custom_env + custom_args).
 	resp = taskToResponse(*task, runtimeWorkspaceID)
+	if task.WorkflowNodeID.Valid {
+		node, err := h.Queries.GetWorkflowNodeForTask(r.Context(), task.ID)
+		if err != nil {
+			slog.Warn("load workflow task context failed", "task_id", uuidToString(task.ID), "error", err)
+			return resp, nil, nil, 0, 0, &claimBuildFailure{
+				outcome: "workflow_context_error",
+				status:  http.StatusInternalServerError,
+				message: "failed to load workflow task context",
+			}
+		}
+		resp.Workflow = &WorkflowTaskData{
+			RunID:          uuidToString(node.RunID),
+			NodeID:         uuidToString(node.ID),
+			AttemptID:      uuidToString(task.WorkflowAttemptID),
+			PassageKey:     node.PassageKey,
+			NodeKey:        node.NodeKey,
+			Generation:     node.Generation,
+			ClaimEpoch:     task.WorkflowClaimEpoch.Int64,
+			InputDigest:    task.WorkflowInputDigest.String,
+			LawDigest:      task.WorkflowLawDigest.String,
+			OutputContract: json.RawMessage(node.OutputContract),
+		}
+	}
 	if err := (&service.IssueWakeupService{Tasks: h.TaskService}).CheckClaim(r.Context(), *task); err != nil {
 		if !errors.Is(err, service.ErrWakeupForbidden) {
 			return resp, nil, nil, 0, 0, h.rejectClaimSourceLoad(r.Context(), task, err, "wakeup", resp.WakeupID)
@@ -4197,6 +4220,12 @@ func (h *Handler) RenewWorkflowTaskLease(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusNotFound, "task not found")
 		return
 	}
+	claim, err := h.Queries.GetWorkflowAttemptByTask(r.Context(), task.ID)
+	if err != nil || middleware.DaemonIDFromContext(r.Context()) == "" ||
+		middleware.DaemonIDFromContext(r.Context()) != claim.DaemonID {
+		writeError(w, http.StatusNotFound, "workflow task not found")
+		return
+	}
 	attempt, err := h.TaskService.RenewWorkflowTaskLease(r.Context(), parseUUID(taskID), parseUUID(runtimeID))
 	if err != nil {
 		writeError(w, http.StatusConflict, err.Error())
@@ -4278,7 +4307,7 @@ func (h *Handler) SubmitWorkflowBundle(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	if daemonID := middleware.DaemonIDFromContext(r.Context()); daemonID != "" && daemonID != attempt.DaemonID {
+	if daemonID := middleware.DaemonIDFromContext(r.Context()); daemonID == "" || daemonID != attempt.DaemonID {
 		writeError(w, http.StatusNotFound, "workflow task not found")
 		return
 	}
@@ -4428,7 +4457,7 @@ func (h *Handler) requireWorkflowIntegrationJob(
 	}
 	daemonID := middleware.DaemonIDFromContext(r.Context())
 	if job.Status != "processing" ||
-		(job.ClaimedDaemonID.Valid && daemonID != "" && job.ClaimedDaemonID.String != daemonID) {
+		!job.ClaimedDaemonID.Valid || daemonID == "" || job.ClaimedDaemonID.String != daemonID {
 		writeError(w, http.StatusConflict, "workflow integration lease is not active")
 		return db.GetWorkflowIntegrationJobRow{}, false
 	}

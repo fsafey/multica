@@ -282,6 +282,58 @@ func testSubmitWorkflowBundleConvergence(t *testing.T) {
 	}
 	handler := *testHandler
 	handler.Storage = storage
+	claimedTask, err := handler.Queries.GetAgentTask(ctx, parseUUID(taskID))
+	if err != nil {
+		t.Fatalf("load workflow task for claim response: %v", err)
+	}
+	claimedRuntime, err := handler.Queries.GetAgentRuntime(ctx, parseUUID(testRuntimeID))
+	if err != nil {
+		t.Fatalf("load workflow runtime for claim response: %v", err)
+	}
+	claimRequest := newRequest(http.MethodPost, "/api/daemon/tasks/claim", nil)
+	claimRequest = claimRequest.WithContext(middleware.WithDaemonContext(claimRequest.Context(), testWorkspaceID, daemonID))
+	claimResponse, _, _, _, _, claimFailure := handler.buildClaimedTaskResponse(claimRequest, &claimedTask, claimedRuntime, testRuntimeID, testWorkspaceID)
+	if claimFailure != nil {
+		t.Fatalf("workflow claim response failed: %+v", claimFailure)
+	}
+	if claimResponse.Workflow == nil || claimResponse.Workflow.RunID != runID ||
+		claimResponse.Workflow.NodeID != nodeID || claimResponse.Workflow.AttemptID != attemptID ||
+		claimResponse.Workflow.ClaimEpoch != 1 {
+		t.Fatalf("workflow claim context = %+v, want run/node/attempt/epoch", claimResponse.Workflow)
+	}
+
+	memberBundleRequest := withURLParam(newRequest(http.MethodPost, "/api/daemon/tasks/"+taskID+"/workflow-bundle", nil), "taskId", taskID)
+	memberBundleResponse := httptest.NewRecorder()
+	handler.SubmitWorkflowBundle(memberBundleResponse, memberBundleRequest)
+	if memberBundleResponse.Code != http.StatusNotFound {
+		t.Fatalf("member workflow bundle submission status = %d, want 404", memberBundleResponse.Code)
+	}
+
+	var integrationEventID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO workflow_outbox (
+			run_id, node_id, event_type, payload, status,
+			claimed_runtime_id, claimed_daemon_id, lease_expires_at
+		)
+		VALUES ($1, $2, 'workflow.artifact_submitted', '{}'::jsonb, 'processing', $3, $4, now() + interval '5 minutes')
+		RETURNING id
+	`, runID, nodeID, testRuntimeID, daemonID).Scan(&integrationEventID); err != nil {
+		t.Fatalf("create claimed workflow integration event: %v", err)
+	}
+	memberIntegrationRequest := newRequest(http.MethodGet, "/api/daemon/workflow-integrations/"+integrationEventID+"/bundle", nil)
+	memberIntegrationResponse := httptest.NewRecorder()
+	if _, ok := handler.requireWorkflowIntegrationJob(memberIntegrationResponse, memberIntegrationRequest, integrationEventID); ok || memberIntegrationResponse.Code != http.StatusConflict {
+		t.Fatalf("member workflow integration access = %t/%d, want false/409", ok, memberIntegrationResponse.Code)
+	}
+	daemonIntegrationRequest := newRequest(http.MethodGet, "/api/daemon/workflow-integrations/"+integrationEventID+"/bundle", nil)
+	daemonIntegrationRequest = daemonIntegrationRequest.WithContext(middleware.WithDaemonContext(daemonIntegrationRequest.Context(), testWorkspaceID, daemonID))
+	daemonIntegrationResponse := httptest.NewRecorder()
+	if _, ok := handler.requireWorkflowIntegrationJob(daemonIntegrationResponse, daemonIntegrationRequest, integrationEventID); !ok {
+		t.Fatalf("claimed daemon workflow integration access refused: %s", daemonIntegrationResponse.Body.String())
+	}
+	if _, err := testPool.Exec(ctx, `DELETE FROM workflow_outbox WHERE id = $1`, integrationEventID); err != nil {
+		t.Fatalf("remove integration access fixture: %v", err)
+	}
 
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)

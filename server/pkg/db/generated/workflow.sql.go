@@ -417,7 +417,7 @@ func (q *Queries) CancelWorkflowRunOutbox(ctx context.Context, arg CancelWorkflo
 	return result.RowsAffected(), nil
 }
 
-const cancelWorkflowRunTasks = `-- name: CancelWorkflowRunTasks :execrows
+const cancelWorkflowRunTasks = `-- name: CancelWorkflowRunTasks :many
 UPDATE agent_task_queue task
 SET status = 'cancelled',
     error = $1,
@@ -426,6 +426,7 @@ FROM workflow_node node
 WHERE task.workflow_node_id = node.id
   AND node.run_id = $2
   AND task.status IN ('queued', 'dispatched', 'waiting_local_directory', 'running')
+RETURNING task.id, task.agent_id, task.issue_id, task.status, task.priority, task.dispatched_at, task.started_at, task.completed_at, task.result, task.error, task.created_at, task.context, task.runtime_id, task.session_id, task.work_dir, task.trigger_comment_id, task.chat_session_id, task.autopilot_run_id, task.attempt, task.max_attempts, task.parent_task_id, task.failure_reason, task.trigger_summary, task.force_fresh_session, task.is_leader_task, task.wait_reason, task.initiator_user_id, task.handoff_note, task.prepare_lease_expires_at, task.squad_id, task.runtime_mcp_overlay, task.escalation_for_task_id, task.fire_at, task.originator_user_id, task.runtime_connected_apps, task.coalesced_comment_ids, task.delivered_comment_ids, task.chat_input_task_id, task.chat_finalize_deferred_at, task.originator_source, task.delegated_from_task_id, task.retry_of_task_id, task.rerun_of_task_id, task.rule_version_id, task.trigger_evidence_kind, task.trigger_evidence_ref_id, task.accountable_user_id, task.transcript_expected_message_count, task.transcript_expected_last_seq, task.transcript_delivery_confirmed, task.workflow_node_id, task.workflow_attempt_id, task.workflow_claim_epoch, task.workflow_input_digest, task.workflow_law_digest, task.session_rollout_missing, task.retired_session_id, task.quick_actions_disabled, task.regenerate_quick_actions_for, task.branch_name, task.durable_work_dir, task.channel_context_revision, task.comment_thread_id, task.cancelled_by_type, task.cancelled_by_id, task.cancelled_by_name, task.issue_snapshot
 `
 
 type CancelWorkflowRunTasksParams struct {
@@ -433,21 +434,102 @@ type CancelWorkflowRunTasksParams struct {
 	RunID pgtype.UUID `json:"run_id"`
 }
 
-func (q *Queries) CancelWorkflowRunTasks(ctx context.Context, arg CancelWorkflowRunTasksParams) (int64, error) {
-	result, err := q.db.Exec(ctx, cancelWorkflowRunTasks, arg.Error, arg.RunID)
+func (q *Queries) CancelWorkflowRunTasks(ctx context.Context, arg CancelWorkflowRunTasksParams) ([]AgentTaskQueue, error) {
+	rows, err := q.db.Query(ctx, cancelWorkflowRunTasks, arg.Error, arg.RunID)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	return result.RowsAffected(), nil
+	defer rows.Close()
+	items := []AgentTaskQueue{}
+	for rows.Next() {
+		var i AgentTaskQueue
+		if err := rows.Scan(
+			&i.ID,
+			&i.AgentID,
+			&i.IssueID,
+			&i.Status,
+			&i.Priority,
+			&i.DispatchedAt,
+			&i.StartedAt,
+			&i.CompletedAt,
+			&i.Result,
+			&i.Error,
+			&i.CreatedAt,
+			&i.Context,
+			&i.RuntimeID,
+			&i.SessionID,
+			&i.WorkDir,
+			&i.TriggerCommentID,
+			&i.ChatSessionID,
+			&i.AutopilotRunID,
+			&i.Attempt,
+			&i.MaxAttempts,
+			&i.ParentTaskID,
+			&i.FailureReason,
+			&i.TriggerSummary,
+			&i.ForceFreshSession,
+			&i.IsLeaderTask,
+			&i.WaitReason,
+			&i.InitiatorUserID,
+			&i.HandoffNote,
+			&i.PrepareLeaseExpiresAt,
+			&i.SquadID,
+			&i.RuntimeMcpOverlay,
+			&i.EscalationForTaskID,
+			&i.FireAt,
+			&i.OriginatorUserID,
+			&i.RuntimeConnectedApps,
+			&i.CoalescedCommentIds,
+			&i.DeliveredCommentIds,
+			&i.ChatInputTaskID,
+			&i.ChatFinalizeDeferredAt,
+			&i.OriginatorSource,
+			&i.DelegatedFromTaskID,
+			&i.RetryOfTaskID,
+			&i.RerunOfTaskID,
+			&i.RuleVersionID,
+			&i.TriggerEvidenceKind,
+			&i.TriggerEvidenceRefID,
+			&i.AccountableUserID,
+			&i.TranscriptExpectedMessageCount,
+			&i.TranscriptExpectedLastSeq,
+			&i.TranscriptDeliveryConfirmed,
+			&i.WorkflowNodeID,
+			&i.WorkflowAttemptID,
+			&i.WorkflowClaimEpoch,
+			&i.WorkflowInputDigest,
+			&i.WorkflowLawDigest,
+			&i.SessionRolloutMissing,
+			&i.RetiredSessionID,
+			&i.QuickActionsDisabled,
+			&i.RegenerateQuickActionsFor,
+			&i.BranchName,
+			&i.DurableWorkDir,
+			&i.ChannelContextRevision,
+			&i.CommentThreadID,
+			&i.CancelledByType,
+			&i.CancelledByID,
+			&i.CancelledByName,
+			&i.IssueSnapshot,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
-const cancelWorkflowTaskForAttempt = `-- name: CancelWorkflowTaskForAttempt :execrows
+const cancelWorkflowTaskForAttempt = `-- name: CancelWorkflowTaskForAttempt :many
 UPDATE agent_task_queue
 SET status = 'cancelled',
     error = $1,
     completed_at = now()
 WHERE workflow_attempt_id = $2
   AND status IN ('queued', 'dispatched', 'waiting_local_directory', 'running')
+RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, trigger_summary, force_fresh_session, is_leader_task, wait_reason, initiator_user_id, handoff_note, prepare_lease_expires_at, squad_id, runtime_mcp_overlay, escalation_for_task_id, fire_at, originator_user_id, runtime_connected_apps, coalesced_comment_ids, delivered_comment_ids, chat_input_task_id, chat_finalize_deferred_at, originator_source, delegated_from_task_id, retry_of_task_id, rerun_of_task_id, rule_version_id, trigger_evidence_kind, trigger_evidence_ref_id, accountable_user_id, transcript_expected_message_count, transcript_expected_last_seq, transcript_delivery_confirmed, workflow_node_id, workflow_attempt_id, workflow_claim_epoch, workflow_input_digest, workflow_law_digest, session_rollout_missing, retired_session_id, quick_actions_disabled, regenerate_quick_actions_for, branch_name, durable_work_dir, channel_context_revision, comment_thread_id, cancelled_by_type, cancelled_by_id, cancelled_by_name, issue_snapshot
 `
 
 type CancelWorkflowTaskForAttemptParams struct {
@@ -455,12 +537,92 @@ type CancelWorkflowTaskForAttemptParams struct {
 	AttemptID pgtype.UUID `json:"attempt_id"`
 }
 
-func (q *Queries) CancelWorkflowTaskForAttempt(ctx context.Context, arg CancelWorkflowTaskForAttemptParams) (int64, error) {
-	result, err := q.db.Exec(ctx, cancelWorkflowTaskForAttempt, arg.Error, arg.AttemptID)
+func (q *Queries) CancelWorkflowTaskForAttempt(ctx context.Context, arg CancelWorkflowTaskForAttemptParams) ([]AgentTaskQueue, error) {
+	rows, err := q.db.Query(ctx, cancelWorkflowTaskForAttempt, arg.Error, arg.AttemptID)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	return result.RowsAffected(), nil
+	defer rows.Close()
+	items := []AgentTaskQueue{}
+	for rows.Next() {
+		var i AgentTaskQueue
+		if err := rows.Scan(
+			&i.ID,
+			&i.AgentID,
+			&i.IssueID,
+			&i.Status,
+			&i.Priority,
+			&i.DispatchedAt,
+			&i.StartedAt,
+			&i.CompletedAt,
+			&i.Result,
+			&i.Error,
+			&i.CreatedAt,
+			&i.Context,
+			&i.RuntimeID,
+			&i.SessionID,
+			&i.WorkDir,
+			&i.TriggerCommentID,
+			&i.ChatSessionID,
+			&i.AutopilotRunID,
+			&i.Attempt,
+			&i.MaxAttempts,
+			&i.ParentTaskID,
+			&i.FailureReason,
+			&i.TriggerSummary,
+			&i.ForceFreshSession,
+			&i.IsLeaderTask,
+			&i.WaitReason,
+			&i.InitiatorUserID,
+			&i.HandoffNote,
+			&i.PrepareLeaseExpiresAt,
+			&i.SquadID,
+			&i.RuntimeMcpOverlay,
+			&i.EscalationForTaskID,
+			&i.FireAt,
+			&i.OriginatorUserID,
+			&i.RuntimeConnectedApps,
+			&i.CoalescedCommentIds,
+			&i.DeliveredCommentIds,
+			&i.ChatInputTaskID,
+			&i.ChatFinalizeDeferredAt,
+			&i.OriginatorSource,
+			&i.DelegatedFromTaskID,
+			&i.RetryOfTaskID,
+			&i.RerunOfTaskID,
+			&i.RuleVersionID,
+			&i.TriggerEvidenceKind,
+			&i.TriggerEvidenceRefID,
+			&i.AccountableUserID,
+			&i.TranscriptExpectedMessageCount,
+			&i.TranscriptExpectedLastSeq,
+			&i.TranscriptDeliveryConfirmed,
+			&i.WorkflowNodeID,
+			&i.WorkflowAttemptID,
+			&i.WorkflowClaimEpoch,
+			&i.WorkflowInputDigest,
+			&i.WorkflowLawDigest,
+			&i.SessionRolloutMissing,
+			&i.RetiredSessionID,
+			&i.QuickActionsDisabled,
+			&i.RegenerateQuickActionsFor,
+			&i.BranchName,
+			&i.DurableWorkDir,
+			&i.ChannelContextRevision,
+			&i.CommentThreadID,
+			&i.CancelledByType,
+			&i.CancelledByID,
+			&i.CancelledByName,
+			&i.IssueSnapshot,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const claimDeterministicWorkflowNode = `-- name: ClaimDeterministicWorkflowNode :one
@@ -1911,7 +2073,7 @@ func (q *Queries) DeleteRuntimePool(ctx context.Context, arg DeleteRuntimePoolPa
 	return result.RowsAffected(), nil
 }
 
-const expireWorkflowTask = `-- name: ExpireWorkflowTask :execrows
+const expireWorkflowTask = `-- name: ExpireWorkflowTask :many
 UPDATE agent_task_queue
 SET status = 'failed',
     error = 'workflow lease expired',
@@ -1919,14 +2081,95 @@ SET status = 'failed',
     completed_at = now()
 WHERE workflow_attempt_id = $1
   AND status IN ('queued', 'dispatched', 'waiting_local_directory', 'running')
+RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, trigger_summary, force_fresh_session, is_leader_task, wait_reason, initiator_user_id, handoff_note, prepare_lease_expires_at, squad_id, runtime_mcp_overlay, escalation_for_task_id, fire_at, originator_user_id, runtime_connected_apps, coalesced_comment_ids, delivered_comment_ids, chat_input_task_id, chat_finalize_deferred_at, originator_source, delegated_from_task_id, retry_of_task_id, rerun_of_task_id, rule_version_id, trigger_evidence_kind, trigger_evidence_ref_id, accountable_user_id, transcript_expected_message_count, transcript_expected_last_seq, transcript_delivery_confirmed, workflow_node_id, workflow_attempt_id, workflow_claim_epoch, workflow_input_digest, workflow_law_digest, session_rollout_missing, retired_session_id, quick_actions_disabled, regenerate_quick_actions_for, branch_name, durable_work_dir, channel_context_revision, comment_thread_id, cancelled_by_type, cancelled_by_id, cancelled_by_name, issue_snapshot
 `
 
-func (q *Queries) ExpireWorkflowTask(ctx context.Context, attemptID pgtype.UUID) (int64, error) {
-	result, err := q.db.Exec(ctx, expireWorkflowTask, attemptID)
+func (q *Queries) ExpireWorkflowTask(ctx context.Context, attemptID pgtype.UUID) ([]AgentTaskQueue, error) {
+	rows, err := q.db.Query(ctx, expireWorkflowTask, attemptID)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	return result.RowsAffected(), nil
+	defer rows.Close()
+	items := []AgentTaskQueue{}
+	for rows.Next() {
+		var i AgentTaskQueue
+		if err := rows.Scan(
+			&i.ID,
+			&i.AgentID,
+			&i.IssueID,
+			&i.Status,
+			&i.Priority,
+			&i.DispatchedAt,
+			&i.StartedAt,
+			&i.CompletedAt,
+			&i.Result,
+			&i.Error,
+			&i.CreatedAt,
+			&i.Context,
+			&i.RuntimeID,
+			&i.SessionID,
+			&i.WorkDir,
+			&i.TriggerCommentID,
+			&i.ChatSessionID,
+			&i.AutopilotRunID,
+			&i.Attempt,
+			&i.MaxAttempts,
+			&i.ParentTaskID,
+			&i.FailureReason,
+			&i.TriggerSummary,
+			&i.ForceFreshSession,
+			&i.IsLeaderTask,
+			&i.WaitReason,
+			&i.InitiatorUserID,
+			&i.HandoffNote,
+			&i.PrepareLeaseExpiresAt,
+			&i.SquadID,
+			&i.RuntimeMcpOverlay,
+			&i.EscalationForTaskID,
+			&i.FireAt,
+			&i.OriginatorUserID,
+			&i.RuntimeConnectedApps,
+			&i.CoalescedCommentIds,
+			&i.DeliveredCommentIds,
+			&i.ChatInputTaskID,
+			&i.ChatFinalizeDeferredAt,
+			&i.OriginatorSource,
+			&i.DelegatedFromTaskID,
+			&i.RetryOfTaskID,
+			&i.RerunOfTaskID,
+			&i.RuleVersionID,
+			&i.TriggerEvidenceKind,
+			&i.TriggerEvidenceRefID,
+			&i.AccountableUserID,
+			&i.TranscriptExpectedMessageCount,
+			&i.TranscriptExpectedLastSeq,
+			&i.TranscriptDeliveryConfirmed,
+			&i.WorkflowNodeID,
+			&i.WorkflowAttemptID,
+			&i.WorkflowClaimEpoch,
+			&i.WorkflowInputDigest,
+			&i.WorkflowLawDigest,
+			&i.SessionRolloutMissing,
+			&i.RetiredSessionID,
+			&i.QuickActionsDisabled,
+			&i.RegenerateQuickActionsFor,
+			&i.BranchName,
+			&i.DurableWorkDir,
+			&i.ChannelContextRevision,
+			&i.CommentThreadID,
+			&i.CancelledByType,
+			&i.CancelledByID,
+			&i.CancelledByName,
+			&i.IssueSnapshot,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const failWorkflowAttempt = `-- name: FailWorkflowAttempt :one

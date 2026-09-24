@@ -162,7 +162,7 @@ WHERE run_id = @run_id
   AND status = 'processing'
   AND event_type IN ('workflow.artifact_submitted', 'workflow.deterministic_ready');
 
--- name: CancelWorkflowRunTasks :execrows
+-- name: CancelWorkflowRunTasks :many
 UPDATE agent_task_queue task
 SET status = 'cancelled',
     error = @error,
@@ -170,7 +170,8 @@ SET status = 'cancelled',
 FROM workflow_node node
 WHERE task.workflow_node_id = node.id
   AND node.run_id = @run_id
-  AND task.status IN ('queued', 'dispatched', 'waiting_local_directory', 'running');
+  AND task.status IN ('queued', 'dispatched', 'waiting_local_directory', 'running')
+RETURNING task.*;
 
 -- name: ReleaseWorkflowRunResources :execrows
 DELETE FROM workflow_resource_claim claim
@@ -834,14 +835,15 @@ RETURNING *;
 DELETE FROM workflow_resource_claim
 WHERE attempt_id = @attempt_id;
 
--- name: ExpireWorkflowTask :execrows
+-- name: ExpireWorkflowTask :many
 UPDATE agent_task_queue
 SET status = 'failed',
     error = 'workflow lease expired',
     failure_reason = 'workflow_lease_expired',
     completed_at = now()
 WHERE workflow_attempt_id = @attempt_id
-  AND status IN ('queued', 'dispatched', 'waiting_local_directory', 'running');
+  AND status IN ('queued', 'dispatched', 'waiting_local_directory', 'running')
+RETURNING *;
 
 -- name: ListExpiredWorkflowAttempts :many
 SELECT a.*
@@ -1308,13 +1310,14 @@ SET status = 'cancelled',
 WHERE id = @attempt_id
   AND status IN ('claimed', 'running', 'submitted');
 
--- name: CancelWorkflowTaskForAttempt :execrows
+-- name: CancelWorkflowTaskForAttempt :many
 UPDATE agent_task_queue
 SET status = 'cancelled',
     error = @error,
     completed_at = now()
 WHERE workflow_attempt_id = @attempt_id
-  AND status IN ('queued', 'dispatched', 'waiting_local_directory', 'running');
+  AND status IN ('queued', 'dispatched', 'waiting_local_directory', 'running')
+RETURNING *;
 
 -- name: CancelWorkflowOutboxForNode :execrows
 UPDATE workflow_outbox

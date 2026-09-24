@@ -1714,6 +1714,9 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					// are admin-gated below).
 					r.Get("/runtime-profiles", h.ListRuntimeProfiles)
 					r.Get("/runtime-profiles/{profileId}", h.GetRuntimeProfile)
+					r.Get("/runtime-pools", h.ListRuntimePools)
+					r.Get("/workflow-runs", h.ListWorkflowRuns)
+					r.Get("/workflow-runs/{runId}", h.GetWorkflowRun)
 					// The workspace MCP library — member-visible so an agent
 					// owner can see what is available to add to their agent.
 					// The payload is names and transports only; the stored
@@ -1753,6 +1756,16 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Patch("/runtime-profiles/{profileId}", h.UpdateRuntimeProfile)
 					r.Put("/runtime-profiles/{profileId}", h.UpdateRuntimeProfile)
 					r.Delete("/runtime-profiles/{profileId}", h.DeleteRuntimeProfile)
+					r.Post("/runtime-pools", h.CreateRuntimePool)
+					r.Post("/runtime-pools/{poolId}/runtimes", h.AddRuntimePoolMember)
+					r.Post("/runtime-pools/{poolId}/agents", h.BindAgentRuntimePool)
+					r.Post("/workflow-runs", h.CreateWorkflowRun)
+					r.Post("/workflow-runs/{runId}/pause", h.PauseWorkflowRun)
+					r.Post("/workflow-runs/{runId}/resume", h.ResumeWorkflowRun)
+					r.Post("/workflow-runs/{runId}/cancel", h.CancelWorkflowRun)
+					r.Post("/workflow-runs/{runId}/nodes/{nodeId}/gate-complete", h.CompleteWorkflowGate)
+					r.Post("/workflow-runs/{runId}/nodes/{nodeId}/retry", h.RetryWorkflowNode)
+					r.Post("/workflow-runs/{runId}/nodes/{nodeId}/cancel", h.CancelWorkflowNode)
 					// Publishing. The author uploads an artifact bundle and we
 					// store it; a version is immutable once published, so
 					// there is no update route here by design.

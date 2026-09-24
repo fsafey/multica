@@ -1273,6 +1273,9 @@ func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue
 	if err := guardIssueNotInTriage(ctx, s.Queries, issue.ID, origin); err != nil {
 		return db.AgentTaskQueue{}, err
 	}
+	if err := s.refuseWorkflowManagedDispatch(ctx, issue, issue.AssigneeID); err != nil {
+		return db.AgentTaskQueue{}, err
+	}
 
 	agent, err := s.Queries.GetAgent(ctx, issue.AssigneeID)
 	if err != nil {
@@ -1444,6 +1447,9 @@ func (s *TaskService) enqueueMentionTask(ctx context.Context, issue db.Issue, ag
 
 func (s *TaskService) enqueueMentionTaskWithCommentPlan(ctx context.Context, issue db.Issue, agentID pgtype.UUID, triggerCommentID pgtype.UUID, coalescedCommentIDs []pgtype.UUID, isLeader bool, squadID pgtype.UUID, forceFreshSession bool, handoffNote string, actorUserID pgtype.UUID, rerunOfTaskID pgtype.UUID, origin RunOrigin) (db.AgentTaskQueue, error) {
 	if err := guardIssueNotInTriage(ctx, s.Queries, issue.ID, origin); err != nil {
+		return db.AgentTaskQueue{}, err
+	}
+	if err := s.refuseWorkflowManagedDispatch(ctx, issue, agentID); err != nil {
 		return db.AgentTaskQueue{}, err
 	}
 	agent, err := s.Queries.GetAgent(ctx, agentID)
@@ -4470,6 +4476,19 @@ func (s *TaskService) CompleteTaskWithTransition(ctx context.Context, taskID pgt
 		if err := lockChatSessionForTaskWrite(ctx, qtx, taskID); err != nil {
 			return err
 		}
+		existing, err := qtx.GetAgentTask(ctx, taskID)
+		if err != nil {
+			return err
+		}
+		if existing.Status == "running" && existing.WorkflowAttemptID.Valid {
+			attempt, err := qtx.GetWorkflowAttemptByTask(ctx, taskID)
+			if err != nil {
+				return fmt.Errorf("load workflow attempt before task completion: %w", err)
+			}
+			if attempt.Status != "submitted" && attempt.Status != "integrated" {
+				return fmt.Errorf("workflow task result must be submitted before completion, current attempt status is %q", attempt.Status)
+			}
+		}
 		t, err := qtx.CompleteAgentTask(ctx, db.CompleteAgentTaskParams{
 			ID:                    taskID,
 			Result:                result,
@@ -4989,6 +5008,32 @@ func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.
 		// never looked at the covering task's status either.
 		if err := SettleTerminalTaskState(ctx, qtx, t); err != nil {
 			return err
+		}
+		if t.WorkflowAttemptID.Valid {
+			attempt, err := qtx.GetWorkflowAttemptByTask(ctx, taskID)
+			if err != nil {
+				return fmt.Errorf("load failed workflow attempt: %w", err)
+			}
+			if attempt.Status == "claimed" || attempt.Status == "running" {
+				if _, err := qtx.FailWorkflowAttempt(ctx, db.FailWorkflowAttemptParams{
+					Status:     "failed",
+					Error:      pgtype.Text{String: errMsg, Valid: errMsg != ""},
+					AttemptID:  attempt.ID,
+					ClaimEpoch: attempt.ClaimEpoch,
+				}); err != nil {
+					return fmt.Errorf("fail workflow attempt: %w", err)
+				}
+				if _, err := qtx.RequeueWorkflowNodeAfterAttempt(ctx, db.RequeueWorkflowNodeAfterAttemptParams{
+					NodeID:     attempt.NodeID,
+					AttemptID:  attempt.ID,
+					ClaimEpoch: attempt.ClaimEpoch,
+				}); err != nil {
+					return fmt.Errorf("requeue failed workflow node: %w", err)
+				}
+				if _, err := qtx.ReleaseWorkflowAttemptResources(ctx, attempt.ID); err != nil {
+					return fmt.Errorf("release failed workflow resources: %w", err)
+				}
+			}
 		}
 
 		// Keep resume-unsafe sessions on the task row for observability, but
