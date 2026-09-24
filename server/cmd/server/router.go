@@ -1758,6 +1758,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Delete("/runtime-profiles/{profileId}", h.DeleteRuntimeProfile)
 					r.Post("/runtime-pools", h.CreateRuntimePool)
 					r.Post("/runtime-pools/{poolId}/runtimes", h.AddRuntimePoolMember)
+					r.Delete("/runtime-pools/{poolId}/runtimes/{runtimeId}", h.PruneStaleRuntimePoolMember)
 					r.Post("/runtime-pools/{poolId}/agents", h.BindAgentRuntimePool)
 					r.Post("/workflow-runs", h.CreateWorkflowRun)
 					r.Post("/workflow-runs/{runId}/pause", h.PauseWorkflowRun)

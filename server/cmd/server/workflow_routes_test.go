@@ -19,6 +19,7 @@ func TestWorkflowRoutesRemainMounted(t *testing.T) {
 		"GET " + base + "/workflow-runs/{runId}":                               false,
 		"POST " + base + "/runtime-pools":                                      false,
 		"POST " + base + "/runtime-pools/{poolId}/runtimes":                    false,
+		"DELETE " + base + "/runtime-pools/{poolId}/runtimes/{runtimeId}":      false,
 		"POST " + base + "/runtime-pools/{poolId}/agents":                      false,
 		"POST " + base + "/workflow-runs":                                      false,
 		"POST " + base + "/workflow-runs/{runId}/pause":                        false,

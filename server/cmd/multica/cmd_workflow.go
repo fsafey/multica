@@ -104,6 +104,13 @@ var runtimePoolAddRuntimeCmd = &cobra.Command{
 	RunE:  runRuntimePoolAddRuntime,
 }
 
+var runtimePoolPruneStaleRuntimeCmd = &cobra.Command{
+	Use:   "prune-stale-runtime <pool-id> <runtime-id>",
+	Short: "Remove a pool membership whose runtime no longer exists",
+	Args:  exactArgs(2),
+	RunE:  runRuntimePoolPruneStaleRuntime,
+}
+
 var runtimePoolBindAgentCmd = &cobra.Command{
 	Use:   "bind-agent <pool-id> <agent-id>",
 	Short: "Opt an agent into graph dispatch through a runtime pool",
@@ -135,6 +142,7 @@ func init() {
 	runtimePoolCmd.AddCommand(runtimePoolListCmd)
 	runtimePoolCmd.AddCommand(runtimePoolCreateCmd)
 	runtimePoolCmd.AddCommand(runtimePoolAddRuntimeCmd)
+	runtimePoolCmd.AddCommand(runtimePoolPruneStaleRuntimeCmd)
 	runtimePoolCmd.AddCommand(runtimePoolBindAgentCmd)
 	runtimePoolListCmd.Flags().String("output", "table", "Output format: table or json")
 	runtimePoolCreateCmd.Flags().Int32("max-inflight", 1, "Maximum active nodes in the pool")
@@ -396,6 +404,22 @@ func runRuntimePoolAddRuntime(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("add runtime to pool: %w", err)
 	}
 	return cli.PrintJSON(os.Stdout, member)
+}
+
+func runRuntimePoolPruneStaleRuntime(cmd *cobra.Command, args []string) error {
+	client, err := workflowAPIClient(cmd)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := cli.APIContext(context.Background())
+	defer cancel()
+	var result map[string]any
+	path := "/api/workspaces/" + url.PathEscape(client.WorkspaceID) +
+		"/runtime-pools/" + url.PathEscape(args[0]) + "/runtimes/" + url.PathEscape(args[1])
+	if err := client.DeleteJSONResponse(ctx, path, &result); err != nil {
+		return fmt.Errorf("prune stale runtime from pool: %w", err)
+	}
+	return cli.PrintJSON(os.Stdout, result)
 }
 
 func runRuntimePoolBindAgent(cmd *cobra.Command, args []string) error {

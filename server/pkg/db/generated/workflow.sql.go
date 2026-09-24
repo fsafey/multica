@@ -69,7 +69,10 @@ func (q *Queries) AcquireWorkflowClaimLock(ctx context.Context) error {
 
 const addRuntimeToPool = `-- name: AddRuntimeToPool :one
 INSERT INTO runtime_pool_runtime (pool_id, runtime_id, priority, enabled)
-VALUES ($1, $2, $3, $4)
+SELECT $1, runtime.id, $2, $3
+FROM agent_runtime AS runtime
+WHERE runtime.id = $4
+FOR KEY SHARE OF runtime
 ON CONFLICT (pool_id, runtime_id)
 DO UPDATE SET priority = EXCLUDED.priority, enabled = EXCLUDED.enabled
 RETURNING pool_id, runtime_id, priority, enabled, created_at
@@ -77,17 +80,17 @@ RETURNING pool_id, runtime_id, priority, enabled, created_at
 
 type AddRuntimeToPoolParams struct {
 	PoolID    pgtype.UUID `json:"pool_id"`
-	RuntimeID pgtype.UUID `json:"runtime_id"`
 	Priority  int32       `json:"priority"`
 	Enabled   bool        `json:"enabled"`
+	RuntimeID pgtype.UUID `json:"runtime_id"`
 }
 
 func (q *Queries) AddRuntimeToPool(ctx context.Context, arg AddRuntimeToPoolParams) (RuntimePoolRuntime, error) {
 	row := q.db.QueryRow(ctx, addRuntimeToPool,
 		arg.PoolID,
-		arg.RuntimeID,
 		arg.Priority,
 		arg.Enabled,
+		arg.RuntimeID,
 	)
 	var i RuntimePoolRuntime
 	err := row.Scan(
@@ -3683,6 +3686,24 @@ func (q *Queries) MarkWorkflowNodeSubmitted(ctx context.Context, arg MarkWorkflo
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const moveRuntimePoolMemberships = `-- name: MoveRuntimePoolMemberships :exec
+INSERT INTO runtime_pool_runtime (pool_id, runtime_id, priority, enabled)
+SELECT member.pool_id, $1, member.priority, member.enabled
+FROM runtime_pool_runtime AS member
+WHERE member.runtime_id = $2
+ON CONFLICT (pool_id, runtime_id) DO NOTHING
+`
+
+type MoveRuntimePoolMembershipsParams struct {
+	NewRuntimeID pgtype.UUID `json:"new_runtime_id"`
+	OldRuntimeID pgtype.UUID `json:"old_runtime_id"`
+}
+
+func (q *Queries) MoveRuntimePoolMemberships(ctx context.Context, arg MoveRuntimePoolMembershipsParams) error {
+	_, err := q.db.Exec(ctx, moveRuntimePoolMemberships, arg.NewRuntimeID, arg.OldRuntimeID)
+	return err
 }
 
 const pauseWorkflowRun = `-- name: PauseWorkflowRun :one

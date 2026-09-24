@@ -39,10 +39,20 @@ WHERE id = @id AND workspace_id = @workspace_id;
 
 -- name: AddRuntimeToPool :one
 INSERT INTO runtime_pool_runtime (pool_id, runtime_id, priority, enabled)
-VALUES (@pool_id, @runtime_id, @priority, @enabled)
+SELECT @pool_id, runtime.id, @priority, @enabled
+FROM agent_runtime AS runtime
+WHERE runtime.id = @runtime_id
+FOR KEY SHARE OF runtime
 ON CONFLICT (pool_id, runtime_id)
 DO UPDATE SET priority = EXCLUDED.priority, enabled = EXCLUDED.enabled
 RETURNING *;
+
+-- name: MoveRuntimePoolMemberships :exec
+INSERT INTO runtime_pool_runtime (pool_id, runtime_id, priority, enabled)
+SELECT member.pool_id, @new_runtime_id, member.priority, member.enabled
+FROM runtime_pool_runtime AS member
+WHERE member.runtime_id = @old_runtime_id
+ON CONFLICT (pool_id, runtime_id) DO NOTHING;
 
 -- name: RemoveRuntimeFromPool :execrows
 DELETE FROM runtime_pool_runtime
