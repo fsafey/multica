@@ -12,6 +12,11 @@ together and what must be delivered when you redistribute.
 
                        Part I — Additional Conditions
 
+In this Multica License, "the producer" means Index Labs (Hong Kong)
+Limited, the company that develops and distributes Multica. Commercial
+licenses and branding waivers may be requested at
+https://www.multica.ai/contact-sales.
+
 1. Multica may be utilized commercially, including as a backend service for
    other applications or as a task management platform for enterprises,
    subject to the following conditions:
@@ -25,8 +30,21 @@ together and what must be delivered when you redistribute.
       - This restriction applies to offering Multica (in whole or
         substantial part) as a SaaS platform, a managed service, or as
         an integrated component within another commercial offering.
+      - Providing a hosted service to third parties is restricted whether
+        or not you charge for it. A publicly accessible instance operated
+        for users outside your own organization requires a commercial
+        license even when it is offered free of charge, carries no
+        advertising, and sells no paid tier.
       - Internal use within a single organization (including multiple
         workspaces) does not require a commercial license.
+      - Making the source code available, including publishing the source
+        code of a fork in a public repository, is not itself a hosted
+        service and does not require a commercial license. Any such
+        distribution remains subject to all applicable terms of this
+        Multica License, including conditions (b) and (c) below and
+        condition 3. Source distribution does not grant recipients the
+        right to operate a hosted service; each operator must obtain its
+        own commercial license.
 
    b. Branding and copyright information: Unless the producer has granted
       you a written branding waiver, you may not remove or modify the
@@ -99,7 +117,7 @@ together and what must be delivered when you redistribute.
       deliver this complete file. Delivering Part II alone does not
       satisfy the Multica License or section 4(a) of Part II.
 
-© 2025-2026 Multica, Inc.
+© 2025-2026 Index Labs (Hong Kong) Limited
 
 ------------------------------------------------------------------------
 

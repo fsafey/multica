@@ -12,6 +12,7 @@ import {
   Lock,
   Pencil,
   Plus,
+  RotateCw,
   Save,
   Trash2,
   UserPlus,
@@ -66,22 +67,96 @@ import {
 import { cn } from "@multica/ui/lib/utils";
 import { AppLink, useNavigation } from "../../navigation";
 import { BreadcrumbHeader } from "../../layout/breadcrumb-header";
+import { PAGE_GUTTER, PAGE_RAIL } from "../../layout/page-header";
 import { useCanEditSkill } from "../hooks/use-can-edit-skill";
 import { useSkillPermissions } from "@multica/core/permissions";
 import { CapabilityBanner } from "@multica/ui/components/common/capability-banner";
-import { readOrigin, totalFileCount, type OriginInfo } from "../lib/origin";
+import {
+  isRefreshableOrigin,
+  originSourceUrl,
+  readOrigin,
+  totalFileCount,
+  type OriginInfo,
+} from "../lib/origin";
 import { FileTree } from "./file-tree";
 import { FileViewer, isMarkdownPath, type FileMode } from "./file-viewer";
 import {
   AddToAgentDialog,
   type SkillActionsContext,
 } from "./skill-list-actions";
+import { RefreshSkillDialog } from "./refresh-skill-dialog";
 import { useT } from "../../i18n";
 import { ResourceLabelPicker } from "../../labels/resource-label-picker";
 
 const SKILL_MD = "SKILL.md";
 
 type DraftFile = { id?: string; path: string; content: string };
+
+/** The four editable fields, as one snapshot. */
+type SkillDraft = {
+  name: string;
+  description: string;
+  content: string;
+  files: DraftFile[];
+};
+
+/**
+ * Server skill -> editable draft.
+ *
+ * `name` and `description` are trimmed here because Save trims them too:
+ * normalizing once, at the single seam where server data becomes a draft, is
+ * what lets every later comparison be plain equality. Trimming at comparison
+ * time instead is how the two sides drifted apart in the first place — the
+ * dirty check trimmed one operand and not the other, so a description ending
+ * in a newline (what `description: |` frontmatter yields) never compared equal
+ * to itself and the page opened permanently dirty.
+ *
+ * `content` and file bodies are deliberately NOT normalized: leading and
+ * trailing whitespace in a SKILL.md body is content, not formatting.
+ */
+function toDraft(s: Skill): SkillDraft {
+  return {
+    name: s.name.trim(),
+    description: s.description.trim(),
+    content: s.content,
+    files: (s.files ?? []).map((f: SkillFile) => ({
+      id: f.id,
+      path: f.path,
+      content: f.content,
+    })),
+  };
+}
+
+/**
+ * Order-insensitive snapshot of a file set. The two endpoints that return
+ * files disagree on order — GET sorts by path, PUT echoes request order — and
+ * an order difference is not a content difference.
+ */
+function fileSignature(files: DraftFile[]): string {
+  return JSON.stringify(
+    files
+      .map((f) => ({ path: f.path, content: f.content }))
+      .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0)),
+  );
+}
+
+/**
+ * Did the USER change anything, measured against the draft we handed them?
+ *
+ * Deliberately not "does the draft differ from the latest server skill": that
+ * question conflates two independent causes — the user typed something, or the
+ * server moved underneath us — and answering it as if only the first existed
+ * is what made every remote update look like a local edit.
+ */
+function hasLocalEdits(draft: SkillDraft, baseline: SkillDraft | null): boolean {
+  if (!baseline) return false;
+  return (
+    draft.name.trim() !== baseline.name ||
+    draft.description.trim() !== baseline.description ||
+    draft.content !== baseline.content ||
+    fileSignature(draft.files) !== fileSignature(baseline.files)
+  );
+}
 
 /**
  * Two tabs, not three. A skill has no settings axis to speak of:
@@ -234,10 +309,17 @@ function SkillIdentity({
   const timeAgo = useTimeAgo();
   const originLabel = useOriginLabel(origin, originRuntime);
   const isRuntimeOrigin = origin?.type === "runtime_local";
+  const sourceUrl = originSourceUrl(origin);
 
   return (
-    <div className="shrink-0 border-b px-4 py-3 sm:px-6">
-      <div className="mx-auto flex max-w-[1440px] flex-wrap items-center gap-x-4 gap-y-1.5">
+    <div className="shrink-0 border-b py-3">
+      <div
+        className={cn(
+          PAGE_RAIL,
+          PAGE_GUTTER,
+          "flex flex-wrap items-center gap-x-4 gap-y-1.5",
+        )}
+      >
         <div className="flex min-w-0 items-center gap-2.5">
           <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border bg-muted text-muted-foreground">
             <SkillIcon className="h-4 w-4" aria-hidden="true" />
@@ -259,7 +341,25 @@ function SkillIdentity({
               ) : (
                 <Download className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
               )}
-              <span className="truncate">{originLabel}</span>
+              {sourceUrl ? (
+                <Tooltip>
+                  <TooltipTrigger
+                    render={
+                      <a
+                        href={sourceUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="truncate hover:underline"
+                      >
+                        {originLabel}
+                      </a>
+                    }
+                  />
+                  <TooltipContent side="top">{sourceUrl}</TooltipContent>
+                </Tooltip>
+              ) : (
+                <span className="truncate">{originLabel}</span>
+              )}
             </span>
           )}
           <span className="inline-flex items-center gap-1.5">
@@ -369,84 +469,90 @@ function OverviewTab({
   const { t } = useT("skills");
 
   return (
-    <div className="mx-auto w-full max-w-3xl p-4 sm:p-6 md:p-8">
-      <section>
-        <h2 className="text-title-sm font-medium">{t(($) => $.detail.overview.properties)}</h2>
-        <p className="mt-1 text-caption text-muted-foreground">
-          {t(($) => $.detail.overview.properties_hint)}
+    <div className={cn(PAGE_RAIL, PAGE_GUTTER, "py-4 sm:py-6 md:py-8")}>
+      <div className="w-full max-w-3xl">
+        <section>
+          <h2 className="text-title-sm font-medium">{t(($) => $.detail.overview.properties)}</h2>
+          <details className="mt-1 text-caption text-muted-foreground">
+            <summary className="cursor-pointer rounded-sm py-2 focus-visible:outline-2 focus-visible:outline-ring">
+              {t(($) => $.detail.overview.properties_help)}
+            </summary>
+            <p className="mt-1">{t(($) => $.detail.overview.properties_hint)}</p>
+          </details>
+          <div className="mt-4 divide-y">
+            <PropertyRow label={t(($) => $.detail.overview.name)} htmlFor="skill-name">
+              <Input
+                id="skill-name"
+                value={name}
+                readOnly={!canEdit}
+                onChange={(e) => onNameChange(e.target.value)}
+                placeholder={t(($) => $.detail.name_placeholder)}
+                className="font-mono text-body read-only:cursor-default"
+              />
+            </PropertyRow>
+
+            <PropertyRow
+              label={t(($) => $.detail.overview.description)}
+              htmlFor="skill-description"
+            >
+              {/* Real descriptions run 500–900 characters (they carry the
+                  trigger vocabulary an agent matches on), so this field is
+                  sized for the data rather than the two rows it had before. */}
+              <Textarea
+                id="skill-description"
+                value={description}
+                readOnly={!canEdit}
+                onChange={(e) => onDescriptionChange(e.target.value)}
+                placeholder={t(($) => $.detail.description_placeholder)}
+                rows={6}
+                className="text-body leading-relaxed read-only:cursor-default"
+              />
+              <div className="mt-1.5 flex flex-wrap justify-between gap-x-4 gap-y-1 text-caption text-muted-foreground">
+                <p>{t(($) => $.detail.overview.description_hint)}</p>
+                <span className="tabular-nums">
+                  {t(($) => $.detail.overview.character_count, { count: description.length })}
+                </span>
+              </div>
+            </PropertyRow>
+
+            <PropertyRow label={t(($) => $.detail.overview.labels)}>
+              <ResourceLabelPicker
+                resourceType="skill"
+                resourceId={skill.id}
+                canEdit={canEdit}
+              />
+            </PropertyRow>
+          </div>
+        </section>
+
+        <section className="mt-10">
+          <div className="flex items-center justify-between gap-3">
+            <h2 className="min-w-0 text-title-sm font-medium">
+              {t(($) => $.detail.overview.used_by, { count: skillAgents.length })}
+            </h2>
+            <Button
+              variant="outline"
+              size="xs"
+              className="shrink-0 gap-1"
+              onClick={onAddToAgents}
+            >
+              <UserPlus className="h-3 w-3" />
+              {t(($) => $.actions.add_to_agent)}
+            </Button>
+          </div>
+          <div className="mt-3">
+            <UsedByList agents={skillAgents} />
+          </div>
+        </section>
+
+        <p className="mt-10 rounded-lg bg-muted px-3 py-2.5 text-caption leading-relaxed text-muted-foreground">
+          {canEdit
+            ? t(($) => $.detail.overview.permissions_owner)
+            : creatorName
+              ? t(($) => $.detail.overview.permissions_locked_creator, { name: creatorName })
+              : t(($) => $.detail.overview.permissions_locked)}
         </p>
-        <div className="mt-4 divide-y">
-          <PropertyRow label={t(($) => $.detail.overview.name)} htmlFor="skill-name">
-            <Input
-              id="skill-name"
-              value={name}
-              readOnly={!canEdit}
-              onChange={(e) => onNameChange(e.target.value)}
-              placeholder={t(($) => $.detail.name_placeholder)}
-              className="font-mono text-body read-only:cursor-default"
-            />
-          </PropertyRow>
-
-          <PropertyRow
-            label={t(($) => $.detail.overview.description)}
-            htmlFor="skill-description"
-          >
-            {/* Real descriptions run 500–900 characters (they carry the
-                trigger vocabulary an agent matches on), so this field is
-                sized for the data rather than the two rows it had before. */}
-            <Textarea
-              id="skill-description"
-              value={description}
-              readOnly={!canEdit}
-              onChange={(e) => onDescriptionChange(e.target.value)}
-              placeholder={t(($) => $.detail.description_placeholder)}
-              rows={6}
-              className="text-body leading-relaxed read-only:cursor-default"
-            />
-            <p className="mt-1.5 text-caption text-muted-foreground">
-              {t(($) => $.detail.overview.description_hint, {
-                count: description.length,
-              })}
-            </p>
-          </PropertyRow>
-
-          <PropertyRow label={t(($) => $.detail.overview.labels)}>
-            <ResourceLabelPicker
-              resourceType="skill"
-              resourceId={skill.id}
-              canEdit={canEdit}
-            />
-          </PropertyRow>
-        </div>
-      </section>
-
-      <section className="mt-10">
-        <div className="flex items-center justify-between gap-3">
-          <h2 className="min-w-0 text-title-sm font-medium">
-            {t(($) => $.detail.overview.used_by, { count: skillAgents.length })}
-          </h2>
-          <Button
-            variant="outline"
-            size="xs"
-            className="shrink-0 gap-1"
-            onClick={onAddToAgents}
-          >
-            <UserPlus className="h-3 w-3" />
-            {t(($) => $.actions.add_to_agent)}
-          </Button>
-        </div>
-        <div className="mt-3">
-          <UsedByList agents={skillAgents} />
-        </div>
-      </section>
-
-      <p className="mt-10 rounded-lg bg-muted px-3 py-2.5 text-caption leading-relaxed text-muted-foreground">
-        {canEdit
-          ? t(($) => $.detail.overview.permissions_owner)
-          : creatorName
-            ? t(($) => $.detail.overview.permissions_locked_creator, { name: creatorName })
-            : t(($) => $.detail.overview.permissions_locked)}
-      </p>
+      </div>
     </div>
   );
 }
@@ -462,6 +568,7 @@ function FilesTab({
   mode,
   canEdit,
   addingFile,
+  focusEditor,
   onSelectPath,
   onModeChange,
   onStartAddFile,
@@ -469,7 +576,9 @@ function FilesTab({
   onCancelAddFile,
   onDeleteFile,
   onRenameFile,
+  onEditFile,
   onContentChange,
+  onFocusHandled,
 }: {
   filePaths: string[];
   selectedPath: string;
@@ -477,6 +586,7 @@ function FilesTab({
   mode: FileMode;
   canEdit: boolean;
   addingFile: boolean;
+  focusEditor: boolean;
   onSelectPath: (path: string) => void;
   onModeChange: (mode: FileMode) => void;
   onStartAddFile: () => void;
@@ -484,16 +594,20 @@ function FilesTab({
   onCancelAddFile: () => void;
   onDeleteFile: (path?: string) => void;
   onRenameFile: (from: string, to: string) => void;
+  onEditFile: (path: string) => void;
   onContentChange: (content: string) => void;
+  onFocusHandled: () => void;
 }) {
   const { t } = useT("skills");
   const validatePath = useValidateNewFilePath();
   const supportingPaths = filePaths.filter((p) => p !== SKILL_MD);
   const isMd = isMarkdownPath(selectedPath);
   // Absent for read-only viewers so the tree never offers an action it would
-  // then refuse. SKILL.md is excluded inside the tree by reservedPath.
+  // then refuse. Both rails get the same object: SKILL.md keeps Edit and loses
+  // rename/delete, which the tree derives from reservedPath.
   const treeActions = canEdit
     ? {
+        onEdit: onEditFile,
         validatePath,
         onRename: onRenameFile,
         onDelete: onDeleteFile,
@@ -502,7 +616,7 @@ function FilesTab({
     : undefined;
 
   return (
-    <div className="flex min-h-full flex-col md:h-full md:flex-row">
+    <div className={cn(PAGE_RAIL, "flex min-h-full flex-col md:h-full md:flex-row")}>
       {/* The file list IS the second-level navigation, so it uses the same
           rail treatment as the agent detail page's capability/settings nav
           instead of inventing a third sidebar style. */}
@@ -510,12 +624,16 @@ function FilesTab({
         role="tablist"
         aria-orientation="vertical"
         aria-label={t(($) => $.detail.files.list_aria)}
-        className="shrink-0 border-b border-surface-border p-3 md:w-52 md:overflow-y-auto md:border-b-0 md:border-r md:p-4"
+        className={cn(
+          "shrink-0 border-b border-surface-border py-3 md:w-52 md:overflow-y-auto md:border-b-0 md:border-r md:py-4",
+          PAGE_GUTTER,
+        )}
       >
         <p className="px-2.5 pb-1 text-micro font-semibold uppercase tracking-wider text-muted-foreground">
           {t(($) => $.detail.files.main)}
         </p>
         <FileTree
+          actions={treeActions}
           filePaths={[SKILL_MD]}
           selectedPath={selectedPath}
           onSelect={onSelectPath}
@@ -567,6 +685,11 @@ function FilesTab({
           </span>
           <div className="ml-auto flex shrink-0 items-center gap-1">
             {isMd && (
+              // The second segment is named for what it does for THIS viewer:
+              // "Edit" when the pane it opens accepts typing, "Plain text"
+              // when the same pane is read-only. Same mode either way — only
+              // the promise differs, and offering an edit the page would
+              // refuse is the thing this rail is careful not to do.
               <div
                 role="group"
                 aria-label={t(($) => $.detail.files.mode_aria)}
@@ -579,7 +702,7 @@ function FilesTab({
                     aria-pressed={mode === value}
                     onClick={() => onModeChange(value)}
                     className={cn(
-                      "h-6 rounded px-2 text-caption font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                      "h-6 rounded-xs px-2 text-caption font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
                       mode === value
                         ? "bg-surface text-foreground shadow-sm"
                         : "text-muted-foreground hover:text-foreground",
@@ -587,7 +710,9 @@ function FilesTab({
                   >
                     {value === "preview"
                       ? t(($) => $.detail.files.mode_preview)
-                      : t(($) => $.detail.files.mode_raw)}
+                      : canEdit
+                        ? t(($) => $.detail.files.mode_edit)
+                        : t(($) => $.detail.files.mode_raw)}
                   </button>
                 ))}
               </div>
@@ -621,7 +746,9 @@ function FilesTab({
             content={selectedContent}
             mode={mode}
             readOnly={!canEdit}
+            autoFocus={focusEditor}
             onChange={onContentChange}
+            onFocusHandled={onFocusHandled}
           />
         </div>
       </section>
@@ -682,6 +809,7 @@ export function SkillDetailPage({ skillId }: { skillId: string }) {
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [confirmRefresh, setConfirmRefresh] = useState(false);
   const [showAddToAgents, setShowAddToAgents] = useState(false);
   const [addingFile, setAddingFile] = useState(false);
   const [conflictPending, setConflictPending] = useState(false);
@@ -690,6 +818,10 @@ export function SkillDetailPage({ skillId }: { skillId: string }) {
   // and survives switching files. It used to live inside FileViewer, which the
   // per-file `key` remounted — every file switch silently snapped back.
   const [fileMode, setFileMode] = useState<FileMode>("preview");
+  // Which file's editor is waiting for the caret. A path rather than a boolean
+  // so a request raised for one row cannot land in another row's editor if the
+  // selection moves before the effect runs.
+  const [focusPath, setFocusPath] = useState<string | null>(null);
 
   const urlView = navigation.searchParams.get("view");
   const [activeView, setActiveView] = useState<DetailView>(() =>
@@ -720,48 +852,69 @@ export function SkillDetailPage({ skillId }: { skillId: string }) {
 
   const seededKeyRef = useRef<string | null>(null);
 
+  /**
+   * The draft this page last handed the user, normalized by `toDraft`. Dirty
+   * state is measured against THIS, never against the latest server skill.
+   *
+   * INVARIANT: `seedFromSkill` is the only writer, and it always writes the
+   * same snapshot it pushes into state. `dirtySummary` is a `useMemo` keyed on
+   * those state values, so every baseline write is paired with the state
+   * change that recomputes it. Assigning this ref anywhere else breaks that
+   * pairing and silently re-opens MUL-5645.
+   */
+  const baselineRef = useRef<SkillDraft | null>(null);
+
+  const seedFromSkill = useCallback((s: Skill) => {
+    const seeded = toDraft(s);
+    setName(seeded.name);
+    setDescription(seeded.description);
+    setContent(seeded.content);
+    setFiles(seeded.files);
+    baselineRef.current = seeded;
+  }, []);
+
+  /**
+   * Adopt a server version wholesale: draft, baseline, seeded key and conflict
+   * flag all move together. Every path that accepts a server version goes
+   * through here — first load, silent refresh, Save, Discard — so the four
+   * pieces can never drift apart.
+   */
+  const adoptServerVersion = useCallback(
+    (s: Skill, resetSelection = false) => {
+      seededKeyRef.current = `${wsId}:${s.id}@${s.updated_at}`;
+      setConflictPending(false);
+      seedFromSkill(s);
+      if (resetSelection) setSelectedPath(SKILL_MD);
+    },
+    [wsId, seedFromSkill],
+  );
+
   useEffect(() => {
     if (!skill) return;
-    const key = `${wsId}:${skill.id}@${skill.updated_at}`;
-    if (seededKeyRef.current === key) return;
+    if (seededKeyRef.current === `${wsId}:${skill.id}@${skill.updated_at}`) {
+      return;
+    }
 
     const sameSkill =
       seededKeyRef.current !== null &&
       seededKeyRef.current.startsWith(`${wsId}:${skill.id}@`);
 
-    if (sameSkill) {
-      const d = draftRef.current;
-      const serverFilesJson = JSON.stringify(
-        (skill.files ?? []).map((f) => ({ path: f.path, content: f.content })),
-      );
-      const draftFilesJson = JSON.stringify(
-        d.files.map((f) => ({ path: f.path, content: f.content })),
-      );
-      const hasEdits =
-        d.name.trim() !== skill.name ||
-        d.description.trim() !== skill.description ||
-        d.content !== skill.content ||
-        draftFilesJson !== serverFilesJson;
-      if (hasEdits) {
-        setConflictPending(true);
-        return;
-      }
+    // Same skill, newer server version. Whether that is a conflict depends on
+    // the local draft alone: with no local edits the user is simply reading
+    // the page, so pull the new version in silently instead of accusing them
+    // of an edit they never made and freezing the editor on stale text.
+    //
+    // Re-run on draft changes, not just on new server versions: a conflict the
+    // user resolves by reverting their own edits has to release the page. The
+    // save bar is dirty-gated, so holding the conflict past that point would
+    // leave the banner above stale text with no Discard left to press.
+    if (sameSkill && hasLocalEdits(draftRef.current, baselineRef.current)) {
+      setConflictPending(true);
+      return;
     }
 
-    seededKeyRef.current = key;
-    setConflictPending(false);
-    setName(skill.name);
-    setDescription(skill.description);
-    setContent(skill.content);
-    setFiles(
-      (skill.files ?? []).map((f: SkillFile) => ({
-        id: f.id,
-        path: f.path,
-        content: f.content,
-      })),
-    );
-    if (!sameSkill) setSelectedPath(SKILL_MD);
-  }, [skill, wsId]);
+    adoptServerVersion(skill, !sameSkill);
+  }, [skill, wsId, adoptServerVersion, name, description, content, files]);
 
   const creator = useMemo<MemberWithUser | null>(
     () =>
@@ -798,48 +951,41 @@ export function SkillDetailPage({ skillId }: { skillId: string }) {
     }
   }, [fileMap, selectedPath]);
 
-  // Files are matched by id so a rename counts as one changed file, not a
-  // delete plus an add; SKILL.md is its own entry since it lives in `content`.
+  // Compared against the seeded baseline, not against the latest server skill,
+  // so a remote update can never read as a local edit. Files are matched by id
+  // so a rename counts as one changed file, not a delete plus an add; SKILL.md
+  // is its own entry since it lives in `content`.
   const dirtySummary = useMemo(() => {
-    if (!skill) return { nameChanged: false, descChanged: false, changedFileCount: 0 };
-    const serverFiles: SkillFile[] = skill.files ?? [];
-    const serverById = new Map(serverFiles.map((f) => [f.id, f]));
-    let changedFileCount = content !== skill.content ? 1 : 0;
+    const baseline = baselineRef.current;
+    if (!baseline) {
+      return { nameChanged: false, descChanged: false, changedFileCount: 0 };
+    }
+    const baselineById = new Map(
+      baseline.files.flatMap((f) => (f.id ? [[f.id, f] as const] : [])),
+    );
+    let changedFileCount = content !== baseline.content ? 1 : 0;
     const draftIds = new Set<string>();
     for (const f of files) {
       if (f.id) draftIds.add(f.id);
-      const server = f.id ? serverById.get(f.id) : undefined;
-      if (!server || server.path !== f.path || server.content !== f.content) {
+      const base = f.id ? baselineById.get(f.id) : undefined;
+      if (!base || base.path !== f.path || base.content !== f.content) {
         changedFileCount += 1;
       }
     }
-    for (const f of serverFiles) {
-      if (!draftIds.has(f.id)) changedFileCount += 1;
+    for (const f of baseline.files) {
+      if (f.id && !draftIds.has(f.id)) changedFileCount += 1;
     }
     return {
-      nameChanged: name.trim() !== skill.name,
-      descChanged: description.trim() !== skill.description,
+      nameChanged: name.trim() !== baseline.name,
+      descChanged: description.trim() !== baseline.description,
       changedFileCount,
     };
-  }, [skill, name, description, content, files]);
+  }, [name, description, content, files]);
 
   const isDirty =
     dirtySummary.nameChanged ||
     dirtySummary.descChanged ||
     dirtySummary.changedFileCount > 0;
-
-  const seedFromSkill = (s: Skill) => {
-    setName(s.name);
-    setDescription(s.description);
-    setContent(s.content);
-    setFiles(
-      (s.files ?? []).map((f: SkillFile) => ({
-        id: f.id,
-        path: f.path,
-        content: f.content,
-      })),
-    );
-  };
 
   const handleSave = async () => {
     if (!skill || !canEdit) return;
@@ -855,9 +1001,7 @@ export function SkillDetailPage({ skillId }: { skillId: string }) {
       };
       const updated = await api.updateSkill(skill.id, payload);
       qc.setQueryData(skillDetailOptions(wsId, skill.id).queryKey, updated);
-      seedFromSkill(updated);
-      seededKeyRef.current = `${wsId}:${updated.id}@${updated.updated_at}`;
-      setConflictPending(false);
+      adoptServerVersion(updated);
       qc.invalidateQueries({
         queryKey: workspaceKeys.skills(wsId),
         exact: true,
@@ -873,9 +1017,7 @@ export function SkillDetailPage({ skillId }: { skillId: string }) {
 
   const handleDiscard = () => {
     if (!skill) return;
-    seedFromSkill(skill);
-    seededKeyRef.current = `${wsId}:${skill.id}@${skill.updated_at}`;
-    setConflictPending(false);
+    adoptServerVersion(skill);
   };
 
   const handleDelete = async () => {
@@ -913,6 +1055,22 @@ export function SkillDetailPage({ skillId }: { skillId: string }) {
     if (path === selectedPath) setSelectedPath(SKILL_MD);
   };
 
+  // "Edit" from a row menu is one gesture that owes three things: the file is
+  // open, the pane is the editor rather than the preview, and the caret is in
+  // it. Doing fewer would leave the user another click away from typing, which
+  // is the whole reason the entry exists.
+  const handleEditFile = useCallback(
+    (path: string) => {
+      if (!canEdit) return;
+      setSelectedPath(path);
+      setFileMode("raw");
+      setFocusPath(path);
+    },
+    [canEdit],
+  );
+
+  const handleFocusHandled = useCallback(() => setFocusPath(null), []);
+
   const handleRenameFile = (from: string, to: string) => {
     if (from === SKILL_MD) return;
     setFiles((prev) =>
@@ -943,10 +1101,10 @@ export function SkillDetailPage({ skillId }: { skillId: string }) {
       <div className="flex flex-1 min-h-0 flex-col">
         <div className="flex h-12 shrink-0 items-center gap-2 border-b px-4">
           <Skeleton className="h-4 w-16" />
-          <Skeleton className="h-3 w-3 rounded" />
+          <Skeleton className="h-3 w-3 rounded-xs" />
           <Skeleton className="h-4 w-40" />
         </div>
-        <div className="space-y-3 p-6">
+        <div className={cn(PAGE_RAIL, PAGE_GUTTER, "space-y-3 py-6")}>
           <Skeleton className="h-4 w-full" />
           <Skeleton className="h-4 w-5/6" />
           <Skeleton className="h-4 w-3/4" />
@@ -1024,6 +1182,26 @@ export function SkillDetailPage({ skillId }: { skillId: string }) {
                 {t(($) => $.detail.read_only)}
               </span>
             )}
+            {canEdit && origin && isRefreshableOrigin(origin) && (
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <Button
+                      variant="outline"
+                      size="xs"
+                      className="gap-1"
+                      onClick={() => setConfirmRefresh(true)}
+                    >
+                      <RotateCw className="h-3 w-3" />
+                      {t(($) => $.detail.refresh.button)}
+                    </Button>
+                  }
+                />
+                <TooltipContent>
+                  {t(($) => $.detail.refresh.tooltip)}
+                </TooltipContent>
+              </Tooltip>
+            )}
             <Button
               variant="outline"
               size="xs"
@@ -1056,7 +1234,7 @@ export function SkillDetailPage({ skillId }: { skillId: string }) {
       />
 
       {!canEdit && (
-        <div className="px-4 pt-3 sm:px-6">
+        <div className={cn(PAGE_RAIL, PAGE_GUTTER, "pt-3")}>
           <CapabilityBanner
             reason={skillPermissions.canEdit.reason}
             resource="skill"
@@ -1068,10 +1246,12 @@ export function SkillDetailPage({ skillId }: { skillId: string }) {
       {supportingQueryDown && (
         <div
           role="status"
-          className="flex shrink-0 items-start gap-2 border-b bg-warning/10 px-4 py-2 text-caption text-muted-foreground sm:px-6"
+          className="shrink-0 border-b bg-warning/10 py-2 text-caption text-muted-foreground"
         >
-          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-warning" />
-          <span>{t(($) => $.detail.supporting_data_warning)}</span>
+          <div className={cn(PAGE_RAIL, PAGE_GUTTER, "flex items-start gap-2")}>
+            <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-warning" />
+            <span>{t(($) => $.detail.supporting_data_warning)}</span>
+          </div>
         </div>
       )}
 
@@ -1084,11 +1264,11 @@ export function SkillDetailPage({ skillId }: { skillId: string }) {
       />
 
       <div
-        className="shrink-0 overflow-x-auto border-b px-4 sm:px-6"
+        className="shrink-0 overflow-x-auto border-b"
         role="tablist"
         aria-label={t(($) => $.detail.tabs.aria)}
       >
-        <div className="mx-auto flex max-w-[1440px] items-center gap-6">
+        <div className={cn(PAGE_RAIL, PAGE_GUTTER, "flex items-center gap-6")}>
           {TABS.map((tab) => (
             <button
               key={tab.id}
@@ -1113,15 +1293,17 @@ export function SkillDetailPage({ skillId }: { skillId: string }) {
         <div
           role="status"
           aria-live="polite"
-          className="flex shrink-0 items-start gap-2 border-b border-warning/30 bg-warning/10 px-4 py-2 text-caption sm:px-6"
+          className="shrink-0 border-b border-warning/30 bg-warning/10 py-2 text-caption"
         >
-          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-warning" />
-          <div className="flex-1">
-            <div className="font-medium text-foreground">
-              {t(($) => $.detail.conflict_banner.title)}
-            </div>
-            <div className="mt-0.5 text-muted-foreground">
-              {t(($) => $.detail.conflict_banner.body)}
+          <div className={cn(PAGE_RAIL, PAGE_GUTTER, "flex items-start gap-2")}>
+            <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-warning" />
+            <div className="flex-1">
+              <div className="font-medium text-foreground">
+                {t(($) => $.detail.conflict_banner.title)}
+              </div>
+              <div className="mt-0.5 text-muted-foreground">
+                {t(($) => $.detail.conflict_banner.body)}
+              </div>
             </div>
           </div>
         </div>
@@ -1153,6 +1335,7 @@ export function SkillDetailPage({ skillId }: { skillId: string }) {
             mode={fileMode}
             canEdit={canEdit}
             addingFile={addingFile}
+            focusEditor={focusPath === selectedPath}
             onSelectPath={setSelectedPath}
             onModeChange={setFileMode}
             onStartAddFile={() => setAddingFile(true)}
@@ -1160,7 +1343,9 @@ export function SkillDetailPage({ skillId }: { skillId: string }) {
             onCancelAddFile={() => setAddingFile(false)}
             onDeleteFile={handleDeleteFile}
             onRenameFile={handleRenameFile}
+            onEditFile={handleEditFile}
             onContentChange={handleFileContentChange}
+            onFocusHandled={handleFocusHandled}
           />
         )}
       </div>
@@ -1172,7 +1357,7 @@ export function SkillDetailPage({ skillId }: { skillId: string }) {
         <div
           role="status"
           aria-live="polite"
-          className="absolute bottom-6 left-1/2 z-50 flex -translate-x-1/2 animate-in items-center gap-1 rounded-lg border bg-background px-2 py-1.5 fade-in slide-in-from-bottom-2 shadow-lg"
+          className="absolute bottom-6 left-1/2 z-50 flex -translate-x-1/2 animate-in items-center gap-1 rounded-lg border bg-background px-2 py-1.5 fade-in slide-in-from-bottom-2 shadow-lg max-md:above-chat-launcher"
         >
           <div className="mr-1 flex items-center border-r pl-1 pr-2">
             <span className="whitespace-nowrap text-caption text-muted-foreground">
@@ -1271,6 +1456,17 @@ export function SkillDetailPage({ skillId }: { skillId: string }) {
         ctx={actionsCtx}
         open={showAddToAgents}
         onOpenChange={setShowAddToAgents}
+      />
+
+      <RefreshSkillDialog
+        skill={skill}
+        origin={origin}
+        wsId={wsId}
+        open={confirmRefresh}
+        onOpenChange={setConfirmRefresh}
+        // Adopt explicitly: the user just confirmed the overwrite, so a dirty
+        // draft must be replaced instead of tripping the conflict banner.
+        onRefreshed={(updated) => adoptServerVersion(updated)}
       />
     </div>
   );

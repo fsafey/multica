@@ -62,6 +62,13 @@ type DiskUsageReport struct {
 	TotalSizeBytes          int64                `json:"total_size_bytes"`
 	TotalArtifactSizeBytes  int64                `json:"total_artifact_size_bytes"`
 	TotalArtifactRatio      float64              `json:"total_artifact_ratio"`
+	// RepoCacheSizeBytes is the bare-repo cache (.repos) footprint. It is a
+	// sibling of the task directories, not one of them, so it is reported
+	// separately and deliberately excluded from Total*: those totals describe
+	// task dirs, and folding a shared cache into them would double-count it
+	// against per-task numbers that do not contain it.
+	RepoCacheSizeBytes int64 `json:"repo_cache_size_bytes"`
+	RepoCacheCount     int   `json:"repo_cache_count"`
 }
 
 // DiskUsageRoot pairs a workspaces root with the profile it was derived from
@@ -93,6 +100,8 @@ type AggregateDiskUsageReport struct {
 	TotalSizeBytes          int64           `json:"total_size_bytes"`
 	TotalArtifactSizeBytes  int64           `json:"total_artifact_size_bytes"`
 	TotalArtifactRatio      float64         `json:"total_artifact_ratio"`
+	TotalRepoCacheSizeBytes int64           `json:"total_repo_cache_size_bytes"`
+	TotalRepoCacheCount     int             `json:"total_repo_cache_count"`
 }
 
 // ScanDiskUsageRoots scans every root in order and returns the combined report.
@@ -116,6 +125,8 @@ func ScanDiskUsageRoots(roots []DiskUsageRoot, artifactPatterns []string) (Aggre
 		agg.TotalWorkspaceCount += report.TotalWorkspaceCount
 		agg.TotalSizeBytes += report.TotalSizeBytes
 		agg.TotalArtifactSizeBytes += report.TotalArtifactSizeBytes
+		agg.TotalRepoCacheSizeBytes += report.RepoCacheSizeBytes
+		agg.TotalRepoCacheCount += report.RepoCacheCount
 	}
 	agg.TotalArtifactRatio = ratio(agg.TotalArtifactSizeBytes, agg.TotalSizeBytes)
 	return agg, nil
@@ -162,14 +173,25 @@ func ScanDiskUsage(workspacesRoot string, artifactPatterns []string) (DiskUsageR
 	wsAgg := map[string]*WorkspaceDiskUsage{}
 
 	for _, wsEntry := range wsEntries {
-		// Skip the bare-repo cache and any non-directory entries; the GC loop
-		// applies the same exclusions, so the disk-usage report stays in sync
-		// with what the GC actually walks.
-		if !wsEntry.IsDir() || wsEntry.Name() == ".repos" {
+		if !wsEntry.IsDir() {
 			continue
 		}
-		wsID := wsEntry.Name()
-		wsDir := filepath.Join(workspacesRoot, wsID)
+		// The bare-repo cache is not a workspace. Measure it separately rather
+		// than skipping it outright: it is reclaimed on its own schedule
+		// (GCRepoTTL) and used to be invisible here, which made the reported
+		// total disagree with the user's file manager for no stated reason.
+		if wsEntry.Name() == reposDirName {
+			report.RepoCacheSizeBytes, report.RepoCacheCount = repoCacheSize(filepath.Join(workspacesRoot, wsEntry.Name()))
+			continue
+		}
+		// Other dot-directories are daemon-internal caches (skill bundles and
+		// friends), never workspaces. Counting them as workspaces put rows like
+		// ".skillca" in the per-workspace table.
+		if strings.HasPrefix(wsEntry.Name(), ".") {
+			continue
+		}
+		physicalWorkspace := wsEntry.Name()
+		wsDir := filepath.Join(workspacesRoot, physicalWorkspace)
 		taskEntries, err := os.ReadDir(wsDir)
 		if err != nil {
 			continue
@@ -179,19 +201,20 @@ func ScanDiskUsage(workspacesRoot string, artifactPatterns []string) (DiskUsageR
 				continue
 			}
 			taskDir := filepath.Join(wsDir, t.Name())
-			usage := buildTaskUsage(taskDir, wsID, t.Name(), matcher)
+			usage := buildTaskUsage(taskDir, physicalWorkspace, t.Name(), matcher)
 
 			report.Tasks = append(report.Tasks, usage)
 			report.TotalSizeBytes += usage.SizeBytes
 			report.TotalArtifactSizeBytes += usage.ArtifactSizeBytes
 
-			ws, ok := wsAgg[wsID]
+			workspaceID := usage.WorkspaceID
+			ws, ok := wsAgg[workspaceID]
 			if !ok {
 				ws = &WorkspaceDiskUsage{
-					WorkspaceID:    wsID,
-					WorkspaceShort: ShortID(wsID),
+					WorkspaceID:    workspaceID,
+					WorkspaceShort: usage.WorkspaceShort,
 				}
-				wsAgg[wsID] = ws
+				wsAgg[workspaceID] = ws
 			}
 			ws.TaskCount++
 			ws.SizeBytes += usage.SizeBytes
@@ -220,6 +243,34 @@ func ScanDiskUsage(workspacesRoot string, artifactPatterns []string) (DiskUsageR
 	report.TotalArtifactRatio = ratio(report.TotalArtifactSizeBytes, report.TotalSizeBytes)
 
 	return report, nil
+}
+
+// repoCacheSize measures the bare-repo cache and counts the repos in it.
+// Layout is .repos/<workspace-id>/<repo-dir>, so the count is the number of
+// second-level directories — the unit the GC evicts.
+func repoCacheSize(reposRoot string) (sizeBytes int64, repoCount int) {
+	wsEntries, err := os.ReadDir(reposRoot)
+	if err != nil {
+		return 0, 0
+	}
+	for _, wsEntry := range wsEntries {
+		if !wsEntry.IsDir() {
+			continue
+		}
+		wsDir := filepath.Join(reposRoot, wsEntry.Name())
+		repoEntries, err := os.ReadDir(wsDir)
+		if err != nil {
+			continue
+		}
+		for _, repoEntry := range repoEntries {
+			if !repoEntry.IsDir() {
+				continue
+			}
+			repoCount++
+			sizeBytes += dirSize(filepath.Join(wsDir, repoEntry.Name()))
+		}
+	}
+	return sizeBytes, repoCount
 }
 
 // ratio returns numerator / denominator, mapping 0/0 (and any 0 denominator)
@@ -263,8 +314,24 @@ func buildTaskUsage(taskDir, wsID, taskShort string, matcher artifactMatcher) Ta
 	}
 
 	metaPresent := false
+	if provenance, err := execenv.ReadManagedEnvProvenance(taskDir); err == nil && provenance != nil {
+		if workspaceID := strings.TrimSpace(provenance.WorkspaceID); workspaceID != "" {
+			usage.WorkspaceID = workspaceID
+			usage.WorkspaceShort = ShortID(workspaceID)
+		}
+	}
+	if owner, err := execenv.ReadEnvRootOwner(taskDir); err == nil && owner != nil {
+		if workspaceID := strings.TrimSpace(owner.WorkspaceID); workspaceID != "" {
+			usage.WorkspaceID = workspaceID
+			usage.WorkspaceShort = ShortID(workspaceID)
+		}
+	}
 	if meta, err := execenv.ReadGCMeta(taskDir); err == nil && meta != nil {
 		metaPresent = true
+		if workspaceID := strings.TrimSpace(meta.WorkspaceID); workspaceID != "" {
+			usage.WorkspaceID = workspaceID
+			usage.WorkspaceShort = ShortID(workspaceID)
+		}
 		usage.Kind = string(meta.Kind)
 		usage.ParentID = parentIDForMeta(meta)
 		if !meta.CompletedAt.IsZero() {
@@ -412,11 +479,19 @@ func taskSize(taskDir string, matcher artifactMatcher) (totalBytes int64, artifa
 		if path == absRoot {
 			return nil
 		}
-		// Symlinks: never followed, never counted. WalkDir already refuses to
-		// descend through them, but a symlinked file would otherwise show up
-		// here as a non-dir entry — drop it explicitly so the size stays
-		// consistent with cleanTaskArtifacts' refusal to touch link targets.
-		if entry.Type()&os.ModeSymlink != 0 {
+		// Links: never followed, never counted. WalkDir already refuses to
+		// descend through a symlink, but a symlinked file would otherwise show
+		// up here as a non-dir entry, and a Windows junction is reported as a
+		// directory WalkDir does descend (see linkedDirModes) — drop both
+		// explicitly so the size stays consistent with cleanTaskArtifacts'
+		// refusal to touch link targets.
+		if entry.Type()&linkedDirModes != 0 {
+			if entry.IsDir() {
+				// A junction: WalkDir would descend into the link target.
+				// SkipDir is safe here only because the entry is a directory —
+				// returning it for a file would skip the remaining siblings.
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		if entry.IsDir() {

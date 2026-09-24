@@ -2,6 +2,7 @@
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Skill } from "@multica/core/types";
 import { I18nProvider } from "@multica/core/i18n/react";
@@ -10,6 +11,19 @@ import enSkills from "../../locales/en/skills.json";
 import { NavigationProvider, type NavigationAdapter } from "../../navigation";
 
 const TEST_RESOURCES = { en: { common: enCommon, skills: enSkills } };
+
+// MUL-7107: every band of a detail page reads the shared rail. The read-only
+// capability banner was the one left behind, so a viewer without edit rights
+// saw a near-full-width card above centred content on a wide window. The
+// constants are overridden with sentinels because their real values are
+// ordinary Tailwind classes a hand-written element could match by accident.
+const RAIL_SENTINEL = "rail-sentinel";
+const GUTTER_SENTINEL = "gutter-sentinel";
+vi.mock("../../layout/page-header", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../layout/page-header")>()),
+  PAGE_RAIL: "rail-sentinel",
+  PAGE_GUTTER: "gutter-sentinel",
+}));
 
 const skillRef = vi.hoisted(() => ({ current: null as unknown }));
 const agentsRef = vi.hoisted(() => ({ current: [] as unknown[] }));
@@ -122,6 +136,7 @@ function renderPage(searchParams = new URLSearchParams()) {
     back: vi.fn(),
     pathname: "/acme/skills/skill-1",
     searchParams,
+    hash: "",
     getShareableUrl: (path) => path,
   };
   render(
@@ -133,7 +148,18 @@ function renderPage(searchParams = new URLSearchParams()) {
       </NavigationProvider>
     </I18nProvider>,
   );
-  return { replace };
+  return { replace, queryClient };
+}
+
+/** Publishes a new server version of the skill, as a `skill:updated` event would. */
+async function remoteUpdate(queryClient: QueryClient, next: Partial<Skill>) {
+  skillRef.current = {
+    ...(skillRef.current as Skill),
+    updated_at: "2026-07-29T10:00:00Z",
+    ...next,
+  };
+  await queryClient.invalidateQueries({ queryKey: ["skill", "ws-1", "skill-1"] });
+  await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 beforeEach(() => {
@@ -157,11 +183,6 @@ describe("SkillDetailPage tabs", () => {
     ).toBe("true");
   });
 
-  it("shows resource labels in Overview without a release flag", async () => {
-    renderPage();
-    expect(await screen.findByTestId("labels")).toBeTruthy();
-  });
-
   it("mirrors the active tab into ?view= so the pane survives a reload", async () => {
     const { replace } = renderPage();
     fireEvent.click(await screen.findByRole("tab", { name: "Files 2" }));
@@ -182,7 +203,7 @@ describe("SkillDetailPage file mode", () => {
   it("keeps plain-text mode when switching files", async () => {
     renderPage(new URLSearchParams("view=files"));
 
-    fireEvent.click(await screen.findByRole("button", { name: "Plain text" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
     expect(screen.getByRole("textbox", { name: /SKILL\.md/ })).toBeTruthy();
 
     // Mode used to live inside FileViewer, which the per-path `key`
@@ -197,6 +218,69 @@ describe("SkillDetailPage file mode", () => {
     const preview = await screen.findByTestId("preview");
     expect(preview.textContent).toContain("# Interface Animations");
     expect(preview.textContent).not.toContain("name: aiforui-animations");
+  });
+});
+
+describe("SkillDetailPage edit action (MUL-5654)", () => {
+  /** Opens a file row's action menu the way the rail exposes it. */
+  async function openRowMenu(path: string | RegExp) {
+    // The file-name button carries role="tab", so a "button" match on the row
+    // is the trailing "..." trigger.
+    await userEvent.click(await screen.findByRole("button", { name: path }));
+  }
+
+  it("opens a supporting file in a focused editor", async () => {
+    renderPage(new URLSearchParams("view=files"));
+
+    await openRowMenu(/patterns\.md/);
+    await userEvent.click(
+      await screen.findByRole("menuitem", { name: "Edit" }),
+    );
+
+    // One gesture owes all three: the file is open, the pane is the editor
+    // rather than the preview, and the caret is already in it.
+    const editor = screen.getByRole("textbox", { name: /patterns\.md/ });
+    expect(screen.queryByTestId("preview")).toBeNull();
+    expect(document.activeElement).toBe(editor);
+  });
+
+  it("focuses the editor for the file that is already open", async () => {
+    renderPage(new URLSearchParams("view=files"));
+
+    // SKILL.md opens selected, so this path mounts nothing new. A mount-only
+    // autoFocus would silently do nothing here.
+    await openRowMenu(/SKILL\.md/);
+    await userEvent.click(
+      await screen.findByRole("menuitem", { name: "Edit" }),
+    );
+
+    expect(document.activeElement).toBe(
+      screen.getByRole("textbox", { name: /SKILL\.md/ }),
+    );
+  });
+
+  it("leaves the caret at the top rather than the end of the file", async () => {
+    renderPage(new URLSearchParams("view=files"));
+
+    await openRowMenu(/patterns\.md/);
+    await userEvent.click(
+      await screen.findByRole("menuitem", { name: "Edit" }),
+    );
+
+    const editor = screen.getByRole("textbox", {
+      name: /patterns\.md/,
+    }) as HTMLTextAreaElement;
+    expect([editor.selectionStart, editor.selectionEnd]).toEqual([0, 0]);
+  });
+
+  it("offers read-only viewers a plain-text view, not an edit they cannot make", async () => {
+    canEditRef.current = false;
+    renderPage(new URLSearchParams("view=files"));
+
+    expect(await screen.findByRole("button", { name: "Plain text" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
+    // No row menus either — the tree offers no action the page would refuse.
+    expect(screen.queryByRole("button", { name: /Actions for/ })).toBeNull();
   });
 });
 
@@ -229,7 +313,7 @@ describe("SkillDetailPage save pill", () => {
   it("counts a supporting-file edit as one changed file", async () => {
     renderPage(new URLSearchParams("view=files"));
     fireEvent.click(await screen.findByRole("tab", { name: "patterns.md" }));
-    fireEvent.click(screen.getByRole("button", { name: "Plain text" }));
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
     fireEvent.change(screen.getByRole("textbox", { name: /patterns\.md/ }), {
       target: { value: "edited content" },
     });
@@ -251,7 +335,171 @@ describe("SkillDetailPage properties", () => {
     expect(field.value).toBe(LONG_DESCRIPTION);
     expect(Number(field.rows)).toBeGreaterThanOrEqual(4);
     expect(
-      screen.getByText(`${LONG_DESCRIPTION.length} characters.`, { exact: false }),
+      screen.getByText(`${LONG_DESCRIPTION.length} characters`, { exact: false }),
     ).toBeTruthy();
+  });
+});
+
+/**
+ * MUL-5645. Dirty state is measured against the seeded baseline, not against
+ * the latest server skill. The two failures that rule prevents:
+ *
+ * 1. A description carrying trailing whitespace — what `description: |`
+ *    frontmatter yields, so every imported skill — used to compare unequal to
+ *    itself because only one side of the check was trimmed. The page opened
+ *    permanently dirty and Discard reseeded the same value, so it never cleared.
+ * 2. A remote update read as a local edit, because the check compared the draft
+ *    against the NEW server skill. Any agent edit froze the editor on stale
+ *    text behind a conflict banner, whatever the description looked like.
+ */
+describe("SkillDetailPage draft baseline (MUL-5645)", () => {
+  const CONFLICT_BANNER = "Someone else updated this skill";
+
+  it("opens clean when the description carries a trailing newline", async () => {
+    skillRef.current = { ...baseSkill, description: `${LONG_DESCRIPTION}\n` };
+    renderPage();
+    await screen.findAllByRole("tab", { name: /Overview|Files/ });
+    expect(screen.queryByText(/^Changed:/)).toBeNull();
+  });
+
+  it("stays clean after Discard on a trailing-newline description", async () => {
+    skillRef.current = { ...baseSkill, description: `${LONG_DESCRIPTION}\n` };
+    renderPage();
+    const field = (await screen.findByLabelText(
+      "Description",
+    )) as HTMLTextAreaElement;
+    fireEvent.change(field, { target: { value: "edited" } });
+    fireEvent.click(await screen.findByRole("button", { name: "Discard" }));
+    expect(screen.queryByText(/^Changed:/)).toBeNull();
+  });
+
+  it("pulls a remote edit in silently while the draft is untouched", async () => {
+    const { queryClient } = renderPage();
+    await screen.findAllByRole("tab", { name: /Overview|Files/ });
+
+    await remoteUpdate(queryClient, { description: "Rewritten by the agent" });
+
+    // The new text reaching the field IS the fix: the old code left the editor
+    // frozen on the pre-update value behind a conflict banner.
+    expect(await screen.findByDisplayValue("Rewritten by the agent")).toBeTruthy();
+    expect(screen.queryByText(CONFLICT_BANNER)).toBeNull();
+    expect(screen.queryByText(/^Changed:/)).toBeNull();
+  });
+
+  it("pulls a remote SKILL.md edit in silently too", async () => {
+    const { queryClient } = renderPage(new URLSearchParams("view=files"));
+    await screen.findAllByRole("tab", { name: /Overview|Files/ });
+
+    await remoteUpdate(queryClient, {
+      content: `${baseSkill.content}\n## Added remotely\n`,
+    });
+
+    const preview = await screen.findByTestId("preview");
+    expect(preview.textContent).toContain("Added remotely");
+    expect(screen.queryByText(CONFLICT_BANNER)).toBeNull();
+    expect(screen.queryByText(/^Changed:/)).toBeNull();
+  });
+
+  it("releases the conflict once the user reverts their own edits", async () => {
+    const { queryClient } = renderPage();
+    const field = (await screen.findByLabelText(
+      "Description",
+    )) as HTMLTextAreaElement;
+    fireEvent.change(field, { target: { value: "my unsaved edit" } });
+
+    await remoteUpdate(queryClient, { description: "Rewritten by the agent" });
+    expect(await screen.findByText(CONFLICT_BANNER)).toBeTruthy();
+
+    // Reverting by hand leaves nothing to protect. The save bar is dirty-gated,
+    // so if the page held the conflict here the banner would sit above stale
+    // text with no Discard left to press — a dead end short of a reload.
+    fireEvent.change(field, { target: { value: LONG_DESCRIPTION } });
+
+    expect(await screen.findByDisplayValue("Rewritten by the agent")).toBeTruthy();
+    expect(screen.queryByText(CONFLICT_BANNER)).toBeNull();
+  });
+
+  it("keeps the draft and warns when a remote edit lands on real local edits", async () => {
+    const { queryClient } = renderPage();
+    const field = (await screen.findByLabelText(
+      "Description",
+    )) as HTMLTextAreaElement;
+    fireEvent.change(field, { target: { value: "my unsaved edit" } });
+
+    await remoteUpdate(queryClient, { description: "Rewritten by the agent" });
+
+    expect(await screen.findByText(CONFLICT_BANNER)).toBeTruthy();
+    expect(
+      (screen.getByLabelText("Description") as HTMLTextAreaElement).value,
+    ).toBe("my unsaved edit");
+  });
+});
+
+describe("SkillDetailPage origin link", () => {
+  const SOURCE_URL = "https://github.com/anthropics/skills/tree/main/animations";
+
+  it("links the imported-origin chip to its source", async () => {
+    skillRef.current = {
+      ...baseSkill,
+      config: { origin: { type: "github", source_url: SOURCE_URL } },
+    };
+    renderPage();
+    const link = (await screen.findByRole("link", {
+      name: "Imported · GitHub",
+    })) as HTMLAnchorElement;
+    expect(link.getAttribute("href")).toBe(SOURCE_URL);
+    expect(link.getAttribute("target")).toBe("_blank");
+    expect(link.getAttribute("rel")).toContain("noopener");
+  });
+
+  it("keeps manual origins as plain text", async () => {
+    renderPage();
+    expect(await screen.findByText("Created manually")).toBeTruthy();
+    expect(
+      screen.queryByRole("link", { name: "Created manually" }),
+    ).toBeNull();
+  });
+
+  // Which source_urls are linkable is originSourceUrl's contract; its full
+  // matrix lives in ../lib/origin.test.ts. What belongs here is the chip's
+  // behaviour when the helper refuses: it degrades to plain text, still
+  // naming the origin, rather than dropping the label along with the href.
+  it("degrades a refused source_url to plain text, keeping the chip", async () => {
+    skillRef.current = {
+      ...baseSkill,
+      config: {
+        origin: { type: "github", source_url: "https://evil.example/skills" },
+      },
+    };
+    renderPage();
+    expect(await screen.findByText("Imported · GitHub")).toBeTruthy();
+    expect(
+      screen.queryByRole("link", { name: "Imported · GitHub" }),
+    ).toBeNull();
+  });
+});
+
+
+describe("SkillDetailPage rail", () => {
+  it("keeps the read-only capability banner on the shared rail", async () => {
+    canEditRef.current = false;
+    renderPage();
+    await screen.findAllByRole("tab", { name: /Overview|Files/ });
+
+    const banner = document.body.querySelector(
+      `.${RAIL_SENTINEL}.${GUTTER_SENTINEL}.pt-3`,
+    );
+    expect(banner).toBeTruthy();
+  });
+
+  it("puts the identity strip and the tab row on that same rail", async () => {
+    renderPage();
+    await screen.findAllByRole("tab", { name: /Overview|Files/ });
+
+    const railed = document.body.querySelectorAll(
+      `.${RAIL_SENTINEL}.${GUTTER_SENTINEL}`,
+    );
+    // Identity strip, tab row and the Overview panel at minimum.
+    expect(railed.length).toBeGreaterThanOrEqual(3);
   });
 });

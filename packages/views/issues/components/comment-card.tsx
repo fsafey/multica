@@ -1,10 +1,11 @@
 "use client";
 
-import { memo, useCallback, useEffect, useRef, useState, type ReactNode } from "react";
-import { CheckCircle2, ChevronRight, ListChevronsDownUp, Copy, Loader2, MoreHorizontal, Pencil, RotateCcw, Trash2 } from "lucide-react";
+import { Fragment, memo, useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { CheckCircle2, ChevronRight, CornerUpLeft, ListChevronsDownUp, Copy, Link2, Loader2, MessageSquarePlus, MoreHorizontal, Pencil, RotateCcw, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { Card } from "@multica/ui/components/ui/card";
-import { Button } from "@multica/ui/components/ui/button";
+import { Button, buttonVariants } from "@multica/ui/components/ui/button";
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -25,23 +26,38 @@ import {
 } from "@multica/ui/components/ui/alert-dialog";
 import { ActorAvatar } from "../../common/actor-avatar";
 import { ReactionBar } from "@multica/ui/components/common/reaction-bar";
+import { QuickEmojiPicker } from "@multica/ui/components/common/quick-emoji-picker";
 import { cn } from "@multica/ui/lib/utils";
 import { copyText } from "@multica/ui/lib/clipboard";
 import { useActorName } from "@multica/core/workspace/hooks";
-import { useTimeAgo } from "../../i18n";
+import { useLocale, useTimeAgo } from "../../i18n";
 import { ContentEditor, type ContentEditorRef, ReadonlyContent, useFileDropZone, FileDropOverlay, Attachment as AttachmentRenderer, AttachmentDownloadProvider, useUploadGate, useComposerSubmit } from "../../editor";
 import { useCommentUploads } from "./use-comment-uploads";
 import { FileUploadButton } from "@multica/ui/components/common/file-upload-button";
-import { api, dispatchReasonCode } from "@multica/core/api";
+import { api, dispatchReasonCode, errorCode } from "@multica/core/api";
 import { ReplyInput } from "./reply-input";
 import { CommentTriggerChips } from "./comment-trigger-chips";
 import { useCommentTriggerPreview } from "../hooks/use-comment-trigger-preview";
 import type { TimelineEntry, Attachment } from "@multica/core/types";
 import { contentReferencesAttachment } from "@multica/core/types";
+import { isDeletedComment } from "@multica/core/issues/comment-deletion";
+import { useRetryTaskSupplement } from "@multica/core/issues/mutations";
+import { issueTasksOptions } from "@multica/core/issues/queries";
+import { useConfigStore } from "@multica/core/config";
+import { selectStandaloneAttachments } from "@multica/core/attachments/image-sequence";
 import { useCommentCollapseStore, useCommentDraftStore } from "@multica/core/issues/stores";
 import { useT } from "../../i18n";
 import { CommentsFoldBar } from "./resolved-thread-bar";
 import { deriveThreadResolution } from "./thread-utils";
+import { RevisionConflictCompare } from "./revision-conflict-compare";
+import { InlineCommentRun, PlacedInlineCommentRun, useInlineCommentRunState, type InlineCommentRunState } from "./inline-comment-run";
+import { EMPTY_COMMENT_RUNS, orderThreadWithRuns, type CommentRun, type ThreadRunSlot } from "./comment-runs";
+import { descriptionPreview } from "./description-preview";
+import { useCommentAnnotations } from "./use-comment-annotations";
+import { useRunCommentMotion } from "./use-run-comment-motion";
+
+const commentActionClassName =
+  "text-muted-foreground aria-expanded:bg-transparent aria-expanded:hover:bg-muted dark:aria-expanded:hover:bg-muted/50";
 
 const highlightedCommentBackgroundClass =
   "bg-[color-mix(in_srgb,var(--card)_95%,var(--brand)_5%)]";
@@ -87,6 +103,9 @@ function StickyHeaderShell({
 
 interface CommentCardProps {
   issueId: string;
+  runs?: CommentRun[];
+  runViewState?: InlineCommentRunState;
+  enteringRunIds?: ReadonlySet<string>;
   entry: TimelineEntry;
   /**
    * Flat list of every nested reply under this thread root, in render order.
@@ -105,12 +124,18 @@ interface CommentCardProps {
    * `CommentRow` has to rerun the rule per row.
    */
   canModerate?: boolean;
-  onReply: (parentId: string, content: string, attachmentIds?: string[], suppressAgentIds?: string[]) => Promise<boolean>;
-  onEdit: (commentId: string, content: string, attachmentIds: string[], suppressAgentIds?: string[]) => Promise<void>;
+  onReply: (parentId: string, content: string, attachmentIds?: string[], suppressAgentIds?: string[]) => Promise<string | boolean>;
+  onReplyAccepted?: (commentId: string) => void;
+  onEdit: (commentId: string, content: string, attachmentIds: string[], suppressAgentIds?: string[], contentBase?: string) => Promise<void>;
   onDelete: (commentId: string) => void;
   onToggleReaction: (commentId: string, emoji: string) => void;
+  onCreateSubIssue?: (commentId: string) => void;
   /** Resolve/unresolve any comment in this thread (commentId = the target row). */
   onResolveToggle?: (commentId: string, resolved: boolean) => void;
+  /** Copy a deep link (`#comment-…`) to a single comment in this thread. */
+  onCopyLink?: (commentId: string) => void;
+  /** Scroll to and flash a comment in this thread. */
+  onJumpToComment?: (commentId: string) => void;
   /**
    * When non-null, the thread root is currently rendered as a resolved-but-
    * expanded card. Pass a "Collapse" affordance into the header so the user
@@ -144,15 +169,20 @@ function DeleteCommentDialog({
   hasReplies?: boolean;
 }) {
   const { t } = useT("issues");
+  // Only a server that declares it keeps the replies (#8296); an older one
+  // deletes them with the comment, and the copy must say so.
+  const keepsReplies = useConfigStore((s) => s.commentDeleteKeepRepliesSupported);
   return (
     <AlertDialog open={open} onOpenChange={onOpenChange}>
       <AlertDialogContent>
         <AlertDialogHeader>
           <AlertDialogTitle>{t(($) => $.comment.delete_title)}</AlertDialogTitle>
           <AlertDialogDescription>
-            {hasReplies
-              ? t(($) => $.comment.delete_desc_with_replies)
-              : t(($) => $.comment.delete_desc)}
+            {!hasReplies
+              ? t(($) => $.comment.delete_desc)
+              : keepsReplies
+                ? t(($) => $.comment.delete_desc_replies_kept)
+                : t(($) => $.comment.delete_desc_with_replies)}
           </AlertDialogDescription>
         </AlertDialogHeader>
         <AlertDialogFooter>
@@ -182,28 +212,11 @@ export function AttachmentList({
   onRemove?: (attachmentId: string) => void;
 }) {
   if (!attachments?.length) return null;
-  // Skip attachments whose URL (stable or legacy) is already referenced
-  // in the markdown content, and duplicates of the same file (same
-  // name/type/size) that are referenced. The dual-shape match is the
-  // MUL-3130 follow-through — a comment can mix the new
-  // /api/attachments/<id>/download URL and the legacy att.url shape.
-  const standalone = content
-    ? attachments.filter((a) => {
-        if (contentReferencesAttachment(content, a)) return false;
-        // Dedup: if another attachment with the same file identity is already
-        // inline in the content, this is a duplicate upload — skip it.
-        const hasSiblingInContent = attachments.some(
-          (other) =>
-            other.id !== a.id &&
-            other.filename === a.filename &&
-            other.content_type === a.content_type &&
-            other.size_bytes === a.size_bytes &&
-            contentReferencesAttachment(content, other),
-        );
-        if (hasSiblingInContent) return false;
-        return true;
-      })
-    : attachments;
+  // Skip attachments whose URL (stable or legacy) is already referenced in the
+  // markdown content, and duplicates of the same file that are referenced.
+  // Shared with the image-sequence builder (MUL-5752) so the cards rendered
+  // here and the images the viewer pages through can't disagree.
+  const standalone = selectStandaloneAttachments(content, attachments);
   if (!standalone.length) return null;
 
   return (
@@ -319,12 +332,14 @@ function TaskCommentRetryButton({
 function useEditAttachmentState(
   issueId: string,
   entry: TimelineEntry,
-  onEdit: (commentId: string, content: string, attachmentIds: string[], suppressAgentIds?: string[]) => Promise<void>,
+  onEdit: (commentId: string, content: string, attachmentIds: string[], suppressAgentIds?: string[], contentBase?: string) => Promise<void>,
 ) {
   const { t } = useT("issues");
   const { t: tEditor } = useT("editor");
   const [editing, setEditing] = useState(false);
   const [initialValue, setInitialValue] = useState(entry.content ?? "");
+  const [initialContentBase, setInitialContentBase] = useState(entry.content ?? "");
+  const [revisionConflict, setRevisionConflict] = useState(false);
   const editorRef = useRef<ContentEditorRef>(null);
   // Saving mid-upload would persist the edit without the file the user just
   // pasted in — same failure as posting a new comment.
@@ -355,6 +370,9 @@ function useEditAttachmentState(
   useEffect(() => {
     setSuppressedAgentIds(new Set());
   }, [issueId, entry.id, entry.parent_id]);
+  useEffect(() => {
+    if (revisionConflict) setInitialContentBase(entry.content ?? "");
+  }, [entry.content, revisionConflict]);
 
   const { isDragOver, dropZoneProps } = useFileDropZone({
     onDrop: (files) => files.forEach((f) => editorRef.current?.uploadFile(f)),
@@ -388,6 +406,7 @@ function useEditAttachmentState(
 
   const resetState = () => {
     setEditing(false);
+    setRevisionConflict(false);
     setContent(entry.content ?? "");
     setSuppressedAgentIds(new Set());
     setRetainedStandaloneIds(null);
@@ -399,6 +418,7 @@ function useEditAttachmentState(
     cancelledRef.current = false;
     const draft = getDraft(draftKey) ?? entry.content ?? "";
     setInitialValue(draft);
+    setInitialContentBase(entry.content ?? "");
     setContent(draft);
     setRetainedStandaloneIds(initialStandaloneAttachmentIds(entry));
     setEditing(true);
@@ -407,6 +427,21 @@ function useEditAttachmentState(
   const cancelEdit = () => {
     cancelledRef.current = true;
     resetState();
+  };
+
+  /**
+   * Discard the local draft and continue from the version the server holds.
+   * Local-only — the server already stores this content, so nothing is written.
+   * The editor is dirty (that is why the conflict exists), so `adoptContent` is
+   * the only channel that lands: a plain `defaultValue` change is mount-only.
+   */
+  const adoptServerVersion = () => {
+    const serverContent = entry.content ?? "";
+    editorRef.current?.adoptContent(serverContent);
+    setContent(serverContent);
+    setDraft(draftKey, serverContent);
+    setInitialContentBase(serverContent);
+    setRevisionConflict(false);
   };
 
   // Await-then-render save (MUL-5181): shared submit contract, with the edit-
@@ -457,11 +492,18 @@ function useEditAttachmentState(
           trimmed,
           activeIds,
           suppressAgentIds.length > 0 ? suppressAgentIds : undefined,
+          initialContentBase,
         );
+        setRevisionConflict(false);
         return true;
       } catch (err) {
+        if (errorCode(err) === "revision_conflict") {
+          setRevisionConflict(true);
+        }
         toast.error(
-          err instanceof Error && err.message
+          errorCode(err) === "revision_conflict"
+            ? t(($) => $.revision.conflict)
+            : err instanceof Error && err.message
             ? err.message
             : t(($) => $.comment.update_failed),
         );
@@ -513,53 +555,173 @@ function useEditAttachmentState(
     startEdit,
     cancelEdit,
     saveEdit,
+    revisionConflict,
+    adoptServerVersion,
   };
+}
+
+function CommentRevisionConflict({
+  serverContent,
+  localContent,
+  onKeepLocal,
+  onUseServer,
+  saving,
+}: {
+  serverContent: string;
+  localContent: string;
+  onKeepLocal: () => void;
+  onUseServer: () => void;
+  saving?: boolean;
+}) {
+  const { t } = useT("issues");
+  return (
+    <RevisionConflictCompare
+      className="mt-2"
+      title={t(($) => $.revision.compare_comment)}
+      serverLabel={t(($) => $.revision.server_version)}
+      localLabel={t(($) => $.revision.local_version)}
+      serverValue={serverContent}
+      localValue={localContent}
+      serverAction={(
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          onClick={onUseServer}
+        >
+          {t(($) => $.revision.use_server)}
+        </Button>
+      )}
+      localAction={(
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          disabled={saving}
+          onClick={onKeepLocal}
+        >
+          {t(($) => $.revision.keep_local)}
+        </Button>
+      )}
+    />
+  );
 }
 
 // ---------------------------------------------------------------------------
 // Single comment row (used for both parent and replies within the same Card)
 // ---------------------------------------------------------------------------
 
+export function SupplementReceipt({ issueId, entry }: {
+  issueId: string;
+  entry: TimelineEntry;
+}) {
+  if (!entry.supplement_task_id || !entry.supplement_status || entry.supplement_status === "delivered") return null;
+  return <ActiveSupplementReceipt issueId={issueId} entry={entry} />;
+}
+
+function ActiveSupplementReceipt({ issueId, entry }: { issueId: string; entry: TimelineEntry }) {
+  const { t } = useT("issues");
+  const retry = useRetryTaskSupplement(issueId);
+  // Run placement belongs to one card, but every bound supplement must observe
+  // the task's terminal state, including earlier top-level comments.
+  const { data: taskStatus } = useQuery({
+    ...issueTasksOptions(issueId),
+    enabled: !!issueId && !!entry.supplement_task_id && !!entry.supplement_status,
+    select: (tasks) => tasks.find((task) => task.id === entry.supplement_task_id)?.status,
+  });
+  if (!entry.supplement_task_id || !entry.supplement_status || entry.supplement_status === "delivered") return null;
+  const terminal = taskStatus === "completed" || taskStatus === "failed" || taskStatus === "cancelled";
+  const endedBeforeDelivery = terminal
+    && (entry.supplement_status === "pending" || entry.supplement_status === "delivering");
+  if (!endedBeforeDelivery && (entry.supplement_status === "pending" || entry.supplement_status === "delivering")) {
+    return <p role="status" className="mt-1.5 text-caption text-muted-foreground">
+      {t(($) => $.inline_run.supplement_waiting_delivery)}
+    </p>;
+  }
+  const reasonCode = endedBeforeDelivery ? "turn_ended" : entry.supplement_failure_reason;
+  const reason = reasonCode === "turn_ended"
+    ? t(($) => $.inline_run.supplement_failure_turn_ended)
+    : reasonCode === "turn_not_started"
+      ? t(($) => $.inline_run.supplement_failure_turn_not_started)
+      : reasonCode === "provider_rejected"
+        ? t(($) => $.inline_run.supplement_failure_provider_rejected)
+        : reasonCode === "timeout"
+          ? t(($) => $.inline_run.supplement_failure_timeout)
+          : t(($) => $.inline_run.supplement_failure_unknown);
+  return <div role="alert" className="mt-1.5 flex items-center gap-2 text-caption text-destructive">
+    <span>{t(($) => $.inline_run.supplement_not_delivered, { reason })}</span>
+    {!terminal && reasonCode !== "turn_ended" && <Button type="button" size="xs" variant="outline" disabled={retry.isPending}
+      onClick={() => retry.mutate({ taskId: entry.supplement_task_id!, commentId: entry.id }, {
+        onError: () => toast.error(t(($) => $.inline_run.supplement_retry_failed)),
+      })}>
+      {retry.isPending && <Loader2 className="size-3 animate-spin motion-reduce:animate-none" />}
+      {t(($) => $.inline_run.supplement_retry)}
+    </Button>}
+  </div>;
+}
+
 function CommentRow({
+  runHeader,
+  runMetadata,
+  replyTo,
   issueId,
   entry,
   currentUserId,
   canModerate = false,
   isResolution = false,
   isHighlighted = false,
+  hasReplies = false,
   onEdit,
   onDelete,
   onToggleReaction,
+  onCreateSubIssue,
   onResolveToggle,
+  onCopyLink,
 }: {
+  runHeader?: ReactNode;
+  runMetadata?: ReactNode;
+  replyTo?: ReactNode;
   issueId: string;
   entry: TimelineEntry;
   currentUserId?: string;
   canModerate?: boolean;
   /** True when this reply is the thread's resolution (shows the green badge). */
   isResolution?: boolean;
+  /** True when other replies answer this one; they are kept when it is deleted. */
+  hasReplies?: boolean;
   /** True when this row is the deep-link target currently being highlighted. */
   isHighlighted?: boolean;
-  onEdit: (commentId: string, content: string, attachmentIds: string[], suppressAgentIds?: string[]) => Promise<void>;
+  onEdit: (commentId: string, content: string, attachmentIds: string[], suppressAgentIds?: string[], contentBase?: string) => Promise<void>;
   onDelete: (commentId: string) => void;
   onToggleReaction: (commentId: string, emoji: string) => void;
+  onCreateSubIssue?: (commentId: string) => void;
   onResolveToggle?: (commentId: string, resolved: boolean) => void;
+  onCopyLink?: (commentId: string) => void;
 }) {
   const { t } = useT("issues");
+  const locale = useLocale();
   const timeAgo = useTimeAgo();
   const { getActorName } = useActorName();
 
   const edit = useEditAttachmentState(issueId, entry, onEdit);
 
   const isOwn = entry.actor_type === "member" && entry.actor_id === currentUserId;
-  const canEditEntry = isOwn || (canModerate && entry.actor_type === "member");
-  const canDeleteEntry = isOwn || canModerate;
+  const canEditEntry = !entry.supplement_task_id && (isOwn || (canModerate && entry.actor_type === "member"));
+  const supplementInFlight = entry.supplement_task_id && (entry.supplement_status === "pending" || entry.supplement_status === "delivering");
+  const canDeleteEntry = !supplementInFlight && (isOwn || canModerate);
   const [confirmDelete, setConfirmDelete] = useState(false);
 
   const reactions = entry.reactions ?? [];
 
+  // A deleted reply renders nothing at all. Its row is kept only so the
+  // replies to it keep a direct parent (#8296), and the thread renders those
+  // replies flat, in its place — a placeholder row would say nothing they do
+  // not already say. Callers drop this row's chrome too, so the thread shows
+  // no empty divider where it was.
+  if (isDeletedComment(entry)) return null;
+
   return (
-    <div className="py-1.5">
+    <div data-comment-block className="pb-3">
       {/* Header pins to the timeline's scroll parent within this reply's own
           row box, so a LONG reply keeps its
           author + actions visible while you scroll its body, then releases once
@@ -567,11 +729,20 @@ function CommentRow({
           highlight state while it occludes the body scrolling underneath. */}
       <StickyHeaderShell
         highlighted={isHighlighted}
-        className="flex items-center gap-2.5 px-4 pt-1 pb-1.5"
+        className="flex items-center gap-2.5 px-4 max-md:px-3 pt-3 pb-2"
       >
-        <ActorAvatar actorType={entry.actor_type} actorId={entry.actor_id} size="md" enableHoverCard showStatusDot />
+        <ActorAvatar
+          actorType={entry.actor_type}
+          actorId={entry.actor_id}
+          name={entry.actor_name}
+          avatarUrl={entry.actor_avatar_url}
+          profileRequiresDirectoryEntry
+          size="md"
+          enableHoverCard
+          showStatusDot
+        />
         <span className="cursor-pointer text-body font-medium">
-          {getActorName(entry.actor_type, entry.actor_id)}
+          {entry.actor_name || getActorName(entry.actor_type, entry.actor_id)}
         </span>
         <Tooltip>
           <TooltipTrigger
@@ -582,9 +753,11 @@ function CommentRow({
             }
           />
           <TooltipContent side="top">
-            {new Date(entry.created_at).toLocaleString()}
+            {new Date(entry.created_at).toLocaleString(locale)}
           </TooltipContent>
         </Tooltip>
+
+        {runHeader}
 
         {isResolution && (
           <span className="text-caption font-medium text-success">
@@ -592,16 +765,48 @@ function CommentRow({
           </span>
         )}
 
-        <div className="ml-auto flex items-center gap-0.5">
+        <div data-comment-actions className="ml-auto flex shrink-0 items-center gap-0.5">
+          {!edit.editing && <QuickEmojiPicker
+            onSelect={(emoji) => onToggleReaction(entry.id, emoji)}
+            ariaLabel={t(($) => $.comment.add_reaction)}
+            align="end"
+            className={buttonVariants({ variant: "ghost", size: "icon-sm", className: commentActionClassName })}
+          />}
           <DropdownMenu>
             <DropdownMenuTrigger
               render={
-                <Button variant="ghost" size="icon-sm" className="text-muted-foreground">
-                  <MoreHorizontal className="h-4 w-4" />
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  className={commentActionClassName}
+                  aria-label={t(($) => $.comment.more_actions)}
+                >
+                  <MoreHorizontal className="h-4 w-4" aria-hidden />
                 </Button>
               }
             />
             <DropdownMenuContent align="end">
+              {/* Groups: act on it (edit, resolve), take it elsewhere, then delete alone. */}
+              {canEditEntry && (
+                <DropdownMenuItem onClick={edit.startEdit}>
+                  <Pencil className="h-3.5 w-3.5" />
+                  {t(($) => $.comment.edit_action)}
+                </DropdownMenuItem>
+              )}
+              {onResolveToggle && (
+                isResolution ? (
+                  <DropdownMenuItem onClick={() => onResolveToggle(entry.id, false)}>
+                    <RotateCcw className="h-3.5 w-3.5" />
+                    {t(($) => $.comment.resolve.unresolve_action)}
+                  </DropdownMenuItem>
+                ) : (
+                  <DropdownMenuItem onClick={() => onResolveToggle(entry.id, true)}>
+                    <CheckCircle2 className="h-3.5 w-3.5" />
+                    {t(($) => $.comment.resolve.resolve_with_comment_action)}
+                  </DropdownMenuItem>
+                )
+              )}
+              {(canEditEntry || onResolveToggle) && <DropdownMenuSeparator />}
               <DropdownMenuItem onClick={() => {
                 void copyText(entry.content ?? "").then((ok) => {
                   if (ok) toast.success(t(($) => $.comment.copied_toast));
@@ -610,38 +815,25 @@ function CommentRow({
                 <Copy className="h-3.5 w-3.5" />
                 {t(($) => $.comment.copy_action)}
               </DropdownMenuItem>
-              {onResolveToggle && (
-                <>
-                  <DropdownMenuSeparator />
-                  {isResolution ? (
-                    <DropdownMenuItem onClick={() => onResolveToggle(entry.id, false)}>
-                      <RotateCcw className="h-3.5 w-3.5" />
-                      {t(($) => $.comment.resolve.unresolve_action)}
-                    </DropdownMenuItem>
-                  ) : (
-                    <DropdownMenuItem onClick={() => onResolveToggle(entry.id, true)}>
-                      <CheckCircle2 className="h-3.5 w-3.5" />
-                      {t(($) => $.comment.resolve.resolve_with_comment_action)}
-                    </DropdownMenuItem>
-                  )}
-                </>
+              {onCopyLink && (
+                <DropdownMenuItem onClick={() => onCopyLink(entry.id)}>
+                  <Link2 className="h-3.5 w-3.5" />
+                  {t(($) => $.comment.copy_link_action)}
+                </DropdownMenuItem>
               )}
-              {(canEditEntry || canDeleteEntry) && (
+              {onCreateSubIssue && entry.comment_type === "comment" && (
+                <DropdownMenuItem onClick={() => onCreateSubIssue(entry.id)}>
+                  <MessageSquarePlus className="h-3.5 w-3.5" aria-hidden />
+                  {t(($) => $.source_context.create_action)}
+                </DropdownMenuItem>
+              )}
+              {canDeleteEntry && (
                 <>
                   <DropdownMenuSeparator />
-                  {canEditEntry && (
-                    <DropdownMenuItem onClick={edit.startEdit}>
-                      <Pencil className="h-3.5 w-3.5" />
-                      {t(($) => $.comment.edit_action)}
-                    </DropdownMenuItem>
-                  )}
-                  {canEditEntry && canDeleteEntry && <DropdownMenuSeparator />}
-                  {canDeleteEntry && (
-                    <DropdownMenuItem onClick={() => setConfirmDelete(true)} variant="destructive">
-                      <Trash2 className="h-3.5 w-3.5" />
-                      {t(($) => $.comment.delete_action)}
-                    </DropdownMenuItem>
-                  )}
+                  <DropdownMenuItem onClick={() => setConfirmDelete(true)} variant="destructive">
+                    <Trash2 className="h-3.5 w-3.5" />
+                    {t(($) => $.comment.delete_action)}
+                  </DropdownMenuItem>
                 </>
               )}
             </DropdownMenuContent>
@@ -650,14 +842,16 @@ function CommentRow({
             open={confirmDelete}
             onOpenChange={setConfirmDelete}
             onConfirm={() => onDelete(entry.id)}
+            hasReplies={hasReplies}
           />
         </div>
       </StickyHeaderShell>
+      {replyTo && <div className="pl-12 pr-4 max-md:pl-3 max-md:pr-3 pb-1.5">{replyTo}</div>}
 
       {edit.editing ? (
         <div
           {...edit.dropZoneProps}
-          className="relative pl-12 pr-4 pt-1"
+          className="relative pl-12 pr-4 max-md:pl-3 max-md:pr-3 pt-1"
           onKeyDown={(e) => { if (e.key === "Escape") edit.cancelEdit(); }}
         >
           <div className="text-body leading-relaxed">
@@ -678,6 +872,15 @@ function CommentRow({
               attachments={edit.editorAttachments}
             />
           </div>
+          {edit.revisionConflict ? (
+            <CommentRevisionConflict
+              serverContent={entry.content ?? ""}
+              localContent={edit.content}
+              onKeepLocal={() => void edit.saveEdit()}
+              onUseServer={edit.adoptServerVersion}
+              saving={edit.saving}
+            />
+          ) : null}
           {edit.standaloneEditAttachments.length > 0 && (
             <AttachmentList
               attachments={edit.standaloneEditAttachments}
@@ -696,6 +899,7 @@ function CommentRow({
               <CommentTriggerChips
                 agents={edit.triggerPreview.agents}
                 blocked={edit.triggerPreview.blocked}
+                hasAllMembersMention={edit.triggerPreview.hasAllMembersMention}
                 draftContent={edit.content}
                 suppressedAgentIds={edit.suppressedAgentIds}
                 onToggle={edit.toggleSuppressedAgent}
@@ -725,26 +929,89 @@ function CommentRow({
         </div>
       ) : (
         <>
-          <div className="pl-12 pr-4 pt-1 text-body leading-relaxed text-foreground">
+          <div tabIndex={currentUserId ? 0 : undefined} role="group"
+            aria-label={t(($) => $.reply.annotations.source_label, { name: entry.actor_name || getActorName(entry.actor_type, entry.actor_id) })}
+            data-comment-content={entry.id} className="pl-12 pr-4 max-md:pl-3 max-md:pr-3 text-body leading-relaxed text-foreground">
             <ReadonlyContent content={entry.content ?? ""} attachments={entry.attachments} />
           </div>
-          <AttachmentList attachments={entry.attachments} content={entry.content} className="mt-1.5 pl-12 pr-4" />
+          <AttachmentList attachments={entry.attachments} content={entry.content} className="mt-1.5 pl-12 pr-4 max-md:pl-3 max-md:pr-3" />
+          <div className="pl-12 pr-4 max-md:pl-3 max-md:pr-3">
+            <SupplementReceipt issueId={issueId} entry={entry} />
+          </div>
           {retryableAgentFailureComment(entry) && (
             <TaskCommentRetryButton
               issueId={issueId}
               taskId={entry.source_task_id}
-              className="mt-2 pl-12 pr-4"
+              className="mt-2 pl-12 pr-4 max-md:pl-3 max-md:pr-3"
             />
           )}
-          <ReactionBar
-            reactions={reactions}
-            currentUserId={currentUserId}
-            onToggle={(emoji) => onToggleReaction(entry.id, emoji)}
-            getActorName={getActorName}
-            className="mt-1.5 pl-12 pr-4"
-          />
         </>
       )}
+      <div className="pl-12 pr-4 max-md:pl-3 max-md:pr-3">{runMetadata}</div>
+      {!edit.editing && <ReactionBar
+        reactions={reactions}
+        showPicker={false}
+        currentUserId={currentUserId}
+        onToggle={(emoji) => onToggleReaction(entry.id, emoji)}
+        getActorName={getActorName}
+        className="mt-1.5 pl-12 pr-4 max-md:pl-3 max-md:pr-3"
+      />}
+    </div>
+  );
+}
+
+/** Names the input a run answers once other rows separate the two (MUL-7628). */
+function ReplyToQuote({ entry, onJump }: { entry: TimelineEntry; onJump?: (commentId: string) => void }) {
+  const { t } = useT("issues");
+  const { getActorName } = useActorName();
+  const label = t(($) => $.comment.replying_to, {
+    name: entry.actor_name || getActorName(entry.actor_type, entry.actor_id),
+    preview: descriptionPreview(entry.content ?? ""),
+  });
+  return (
+    <button type="button" disabled={!onJump} onClick={() => onJump?.(entry.id)} title={label}
+      className="flex max-w-full min-w-0 items-center gap-1.5 rounded-xs text-left text-caption text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:hover:text-muted-foreground">
+      <CornerUpLeft aria-hidden className="size-3 shrink-0" />
+      <span className="min-w-0 truncate">{label}</span>
+    </button>
+  );
+}
+
+/** A run without a persisted reply still belongs to the agent, never its trigger author. */
+export function AgentRunComment({ run, standalone = false, commentProps, entering = false, replyTo }: {
+  run: CommentRun;
+  standalone?: boolean;
+  entering?: boolean;
+  commentProps?: CommentCardProps;
+  /** The input this run answers, shown when the thread no longer places the two together. */
+  replyTo?: ReactNode;
+}) {
+  const viewState = useInlineCommentRunState();
+  const replyEntry = commentProps?.entry;
+  // A deleted reply renders nothing in a run slot either (see CommentRow), so
+  // the slot falls back to the run's own activity block: the run happened, and
+  // it still carries `hasReply`, so it never prints the deleted body as its
+  // output. A deleted thread ROOT keeps rendering — it heads its own thread.
+  const replyHidden = !standalone && !!replyEntry && isDeletedComment(replyEntry);
+  const reply = replyHidden ? undefined : replyEntry;
+  const motionRef = useRunCommentMotion(entering, reply?.id, run.task.status);
+  return (
+    <div ref={motionRef} data-run-slot-id={run.task.id}
+      data-run-comment-id={!reply ? run.task.id : undefined}
+      id={!standalone && reply ? `comment-${reply.id}` : undefined}
+      className={cn(standalone ? !reply && "rounded-xl border bg-card" : "border-t border-border/50", !reply && "py-1.5", reply && commentProps?.highlightedCommentId === reply.id && highlightedCommentBackgroundClass)}>
+      {commentProps && reply ? standalone ? (
+        <CommentCard {...commentProps} runs={commentProps.runs ?? [run]} runViewState={viewState} />
+      ) : (
+        <CommentRow {...commentProps}
+          isHighlighted={commentProps.highlightedCommentId === reply?.id}
+          isResolution={!!reply?.resolved_at}
+          replyTo={replyTo}
+          runHeader={<PlacedInlineCommentRun run={run} viewState={viewState} presentation="header" />}
+          runMetadata={<PlacedInlineCommentRun run={run} viewState={viewState} />} />
+      ) : <div className="px-4 max-md:px-3">
+        <InlineCommentRun run={run} viewState={viewState} showIdentity replyTo={replyTo} />
+      </div>}
     </div>
   );
 }
@@ -762,23 +1029,43 @@ function CommentRow({
 
 function CommentCardImpl({
   issueId,
+  runs = EMPTY_COMMENT_RUNS,
+  runViewState,
+  enteringRunIds,
   entry,
   replies,
   currentUserId,
   canModerate = false,
   onReply,
+  onReplyAccepted,
   onEdit,
   onDelete,
   onToggleReaction,
+  onCreateSubIssue,
   onResolveToggle,
+  onCopyLink,
+  onJumpToComment,
   onCollapseResolved,
   expandedResolvedIds,
   onResolvedExpandChange,
   highlightedCommentId,
 }: CommentCardProps) {
   const { t } = useT("issues");
+  const locale = useLocale();
   const timeAgo = useTimeAgo();
   const { getActorName } = useActorName();
+  const replyTarget = useCommentDraftStore((s) => s.drafts[`reply:${issueId}:${entry.id}`]?.replyTarget);
+  const replyTargetId = replyTarget?.commentId ?? entry.id;
+  // A deleted target's tombstone is as gone as a removed row.
+  const replyTargetMissing = !!replyTarget && replyTargetId !== entry.id
+    && !replies.some((r) => r.id === replyTargetId && !isDeletedComment(r));
+  const annotation = useCommentAnnotations({
+    draftKey: `reply:${issueId}:${entry.id}`,
+    sources: [entry, ...replies].filter((e) => e.type === "comment")
+      .map((e) => ({ id: e.id, name: e.actor_name || getActorName(e.actor_type, e.actor_id), revision: e.revision })),
+    enabled: !!currentUserId,
+    onAdded: () => { if (replyFolded) onResolvedExpandChange?.(entry.id, true); },
+  });
   const isCollapsed = useCommentCollapseStore((s) => s.isCollapsed(issueId, entry.id));
   const toggleCollapse = useCommentCollapseStore((s) => s.toggle);
   const open = !isCollapsed;
@@ -790,13 +1077,69 @@ function CommentCardImpl({
   const edit = useEditAttachmentState(issueId, entry, onEdit);
 
   const isOwn = entry.actor_type === "member" && entry.actor_id === currentUserId;
-  const canEditEntry = isOwn || (canModerate && entry.actor_type === "member");
-  const canDeleteEntry = isOwn || canModerate;
+  const canEditEntry = !entry.supplement_task_id && (isOwn || (canModerate && entry.actor_type === "member"));
+  const supplementInFlight = entry.supplement_status === "pending" || entry.supplement_status === "delivering";
+  const canDeleteEntry = !supplementInFlight && (isOwn || canModerate);
   const [confirmDelete, setConfirmDelete] = useState(false);
 
   const allNestedReplies = replies;
+  // What the thread shows. Tombstones are excluded from display and counts but
+  // stay in `allNestedReplies`, which run anchoring and "has replies" reason
+  // over. Every tombstone has at least one live descendant (the server prunes
+  // one that loses its last reply), so no content hides behind this.
+  const visibleReplies = allNestedReplies.filter((reply) => !isDeletedComment(reply));
+  const renderRuns = (commentId: string, presentation: "inline" | "header" = "inline") => runs.filter((run) => run.commentId === commentId && run.hasReply
+    && (!run.anchorCommentId || run.anchorCommentId === commentId || replyFolded))
+    .map((run) => <PlacedInlineCommentRun key={run.task.id} run={run} presentation={presentation} viewState={run.commentId === entry.id ? runViewState : undefined} />);
 
-  const replyCount = allNestedReplies.length;
+  // A run slot renders the run's latest comment, or its activity until it
+  // posts one.
+  const renderThreadRow = (row: TimelineEntry | ThreadRunSlot) => "run" in row ? (
+    <AgentRunComment key={row.run.task.id} run={row.run} entering={enteringRunIds?.has(row.run.task.id)}
+      replyTo={row.replyTo && <ReplyToQuote entry={row.replyTo} onJump={onJumpToComment} />}
+      commentProps={row.reply ? {
+        issueId, entry: row.reply, replies: [], currentUserId, canModerate, onReply, onEdit, onDelete,
+        onToggleReaction, onCreateSubIssue, onResolveToggle, onCopyLink, highlightedCommentId, enteringRunIds,
+      } : undefined} />
+  ) : renderReply(row);
+
+  const renderReply = (reply: TimelineEntry) => (
+    <Fragment key={reply.id}>
+      {/* A tombstone keeps its place in the thread but contributes no row
+          of its own. */}
+      {!isDeletedComment(reply) && (
+        <div
+          id={`comment-${reply.id}`}
+          className={cn(
+            "border-t border-border/50 transition-colors duration-700",
+            highlightedCommentId === reply.id && highlightedCommentBackgroundClass,
+          )}
+        >
+          <CommentRow
+            issueId={issueId}
+            entry={reply}
+            runHeader={renderRuns(reply.id, "header")}
+            runMetadata={renderRuns(reply.id)}
+            currentUserId={currentUserId}
+            canModerate={canModerate}
+            isResolution={reply.id === replyResolutionId}
+            isHighlighted={highlightedCommentId === reply.id}
+            hasReplies={repliedToIds.has(reply.id)}
+            onEdit={onEdit}
+            onDelete={onDelete}
+            onToggleReaction={onToggleReaction}
+            onCreateSubIssue={onCreateSubIssue}
+            onResolveToggle={onResolveToggle}
+            onCopyLink={onCopyLink}
+          />
+        </div>
+      )}
+    </Fragment>
+  );
+
+  const replyCount = visibleReplies.length;
+  const repliedToIds = new Set(allNestedReplies.map((reply) => reply.parent_id));
+  const deleted = isDeletedComment(entry);
   const contentPreview = (entry.content ?? "").replace(/\n/g, " ").slice(0, 80);
   const reactions = entry.reactions ?? [];
 
@@ -811,11 +1154,17 @@ function CommentCardImpl({
   const threadExpanded = !!expandedResolvedIds?.has(entry.id);
   const replyFolded = replyResolutionId != null && !threadExpanded;
   const foldedReplies = replyResolutionId
-    ? allNestedReplies.filter((r) => r.id !== replyResolutionId)
-    : allNestedReplies;
+    ? visibleReplies.filter((r) => r.id !== replyResolutionId)
+    : visibleReplies;
   const resolutionReply = replyResolutionId
     ? allNestedReplies.find((r) => r.id === replyResolutionId) ?? null
     : null;
+  // Replies and run slots in the order they happened (MUL-7628). Folded, the
+  // resolution stays visible along with any run that has not replied yet.
+  const threadRows = replyFolded
+    ? orderThreadWithRuns(entry, resolutionReply ? [resolutionReply] : [], runs.filter((run) => !run.hasReply
+      && (run.anchorCommentId === entry.id || run.anchorCommentId === replyResolutionId)))
+    : orderThreadWithRuns(entry, allNestedReplies, runs);
 
   // Pin the root comment's header to the timeline's scroll parent while the
   // thread is open, so a LONG root comment keeps its author + actions visible
@@ -834,12 +1183,13 @@ function CommentCardImpl({
     // overflow-clip (not -hidden) clips the rounded corners WITHOUT creating a
     // scroll container, so the sticky collapse affordances below resolve to the
     // timeline's scroll parent instead of this card. See PR #3623.
-    <Card className="!py-0 !gap-0 overflow-clip transition-colors duration-700">
+    <Card ref={annotation.cardRef} {...annotation.captureProps} className="!py-0 !gap-0 overflow-clip transition-colors duration-700">
+      {annotation.popup}
       {onCollapseResolved && (
         <button
           type="button"
           onClick={onCollapseResolved}
-          className="sticky top-0 z-20 flex w-full items-center gap-2.5 border-b border-border/50 bg-muted px-4 py-2.5 text-left text-body text-muted-foreground transition-colors cursor-pointer hover:bg-accent hover:text-accent-foreground"
+          className="sticky top-0 z-20 flex w-full items-center gap-2.5 border-b border-border/50 bg-muted px-4 max-md:px-3 py-2.5 text-left text-body text-muted-foreground transition-colors cursor-pointer hover:bg-accent hover:text-accent-foreground"
           aria-label={t(($) => $.comment.resolve.collapse)}
         >
           <ListChevronsDownUp className="h-3.5 w-3.5" />
@@ -852,39 +1202,50 @@ function CommentCardImpl({
             That is what keeps exactly one header pinned at a time: without this
             wrapper the header's containing block is the whole thread and it
             stays stuck behind every reply. */}
-        <div className={cn("transition-colors duration-700", isHighlighted && highlightedCommentBackgroundClass)}>
-          {/* Header — always visible, acts as toggle */}
+        <div data-comment-block className={cn("transition-colors duration-700", isHighlighted && highlightedCommentBackgroundClass)}>
+          {/* Keep the author aligned with replies; thread controls sit on the right. */}
           <StickyHeaderShell
             sticky={stickyHeader}
             highlighted={isHighlighted}
-            className="px-4 py-3"
+            className={cn("px-4 max-md:px-3", open ? "pt-3 pb-2" : "py-3")}
           >
             <div className="flex items-center gap-2.5">
-              <button
-                type="button"
-                aria-expanded={open}
-                aria-controls={`comment-body-${entry.id}`}
-                onClick={handleToggle}
-                className="shrink-0 rounded p-0.5 text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
-              >
-                <ChevronRight className={cn("h-3.5 w-3.5 transition-transform", open && "rotate-90")} />
-              </button>
-              <ActorAvatar actorType={entry.actor_type} actorId={entry.actor_id} size="md" enableHoverCard showStatusDot />
-              <span className="shrink-0 cursor-pointer text-body font-medium">
-                {getActorName(entry.actor_type, entry.actor_id)}
-              </span>
-              <Tooltip>
-                <TooltipTrigger
-                  render={
-                    <span className="shrink-0 text-caption text-muted-foreground cursor-default">
-                      {timeAgo(entry.created_at)}
-                    </span>
-                  }
-                />
-                <TooltipContent side="top">
-                  {new Date(entry.created_at).toLocaleString()}
-                </TooltipContent>
-              </Tooltip>
+              {deleted ? (
+                // The thread's root was deleted; its replies still hang off it.
+                <span className="min-w-0 truncate text-body italic text-muted-foreground">
+                  {t(($) => $.comment.deleted_placeholder)}
+                </span>
+              ) : (
+                <>
+                  <ActorAvatar
+                    actorType={entry.actor_type}
+                    actorId={entry.actor_id}
+                    name={entry.actor_name}
+                    avatarUrl={entry.actor_avatar_url}
+                    profileRequiresDirectoryEntry
+                    size="md"
+                    enableHoverCard
+                    showStatusDot
+                  />
+                  <span className="shrink-0 cursor-pointer text-body font-medium">
+                    {entry.actor_name || getActorName(entry.actor_type, entry.actor_id)}
+                  </span>
+                  <Tooltip>
+                    <TooltipTrigger
+                      render={
+                        <span className="shrink-0 text-caption text-muted-foreground cursor-default">
+                          {timeAgo(entry.created_at)}
+                        </span>
+                      }
+                    />
+                    <TooltipContent side="top">
+                      {new Date(entry.created_at).toLocaleString(locale)}
+                    </TooltipContent>
+                  </Tooltip>
+
+                  {renderRuns(entry.id, "header")}
+                </>
+              )}
 
               {!open && contentPreview && (
                 <span className="min-w-0 flex-1 truncate text-caption text-muted-foreground">
@@ -897,17 +1258,64 @@ function CommentCardImpl({
                 </span>
               )}
 
-              {open && (
-                <div className="ml-auto flex items-center gap-0.5">
+              <div data-comment-actions className="ml-auto flex shrink-0 items-center gap-0.5">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label={open ? t(($) => $.comment.collapse_thread) : t(($) => $.comment.expand_thread)}
+                  title={open ? t(($) => $.comment.collapse_thread) : t(($) => $.comment.expand_thread)}
+                  aria-expanded={open}
+                  aria-controls={open ? `comment-body-${entry.id}` : undefined}
+                  onClick={handleToggle}
+                  className={commentActionClassName}
+                >
+                  <ChevronRight aria-hidden className={cn("h-3.5 w-3.5 transition-transform motion-reduce:transition-none", open && "rotate-90")} />
+                </Button>
+                {open && !deleted && <>
+                  {!edit.editing && <QuickEmojiPicker
+                    onSelect={(emoji) => onToggleReaction(entry.id, emoji)}
+                    ariaLabel={t(($) => $.comment.add_reaction)}
+                    align="end"
+                    className={buttonVariants({ variant: "ghost", size: "icon-sm", className: commentActionClassName })}
+                  />}
                   <DropdownMenu>
                     <DropdownMenuTrigger
                       render={
-                        <Button variant="ghost" size="icon-sm" className="text-muted-foreground">
-                          <MoreHorizontal className="h-4 w-4" />
+                        <Button
+                          variant="ghost"
+                          size="icon-sm"
+                          className={commentActionClassName}
+                          aria-label={t(($) => $.comment.more_actions)}
+                        >
+                          <MoreHorizontal className="h-4 w-4" aria-hidden />
                         </Button>
                       }
                     />
                     <DropdownMenuContent align="end">
+                      {/* Groups: act on it (edit, resolve), take it elsewhere, then delete alone. */}
+                      {canEditEntry && (
+                        <DropdownMenuItem onClick={edit.startEdit}>
+                          <Pencil className="h-3.5 w-3.5" />
+                          {t(($) => $.comment.edit_action)}
+                        </DropdownMenuItem>
+                      )}
+                      {onResolveToggle && (
+                        <DropdownMenuItem onClick={() => onResolveToggle(entry.id, !entry.resolved_at)}>
+                          {entry.resolved_at ? (
+                            <>
+                              <RotateCcw className="h-3.5 w-3.5" />
+                              {t(($) => $.comment.resolve.unresolve_thread_action)}
+                            </>
+                          ) : (
+                            <>
+                              <CheckCircle2 className="h-3.5 w-3.5" />
+                              {t(($) => $.comment.resolve.resolve_thread_action)}
+                            </>
+                          )}
+                        </DropdownMenuItem>
+                      )}
+                      {(canEditEntry || onResolveToggle) && <DropdownMenuSeparator />}
                       <DropdownMenuItem onClick={() => {
                         void copyText(entry.content ?? "").then((ok) => {
                           if (ok) toast.success(t(($) => $.comment.copied_toast));
@@ -916,40 +1324,25 @@ function CommentCardImpl({
                         <Copy className="h-3.5 w-3.5" />
                         {t(($) => $.comment.copy_action)}
                       </DropdownMenuItem>
-                      {onResolveToggle && (
-                        <>
-                          <DropdownMenuSeparator />
-                          <DropdownMenuItem onClick={() => onResolveToggle(entry.id, !entry.resolved_at)}>
-                            {entry.resolved_at ? (
-                              <>
-                                <RotateCcw className="h-3.5 w-3.5" />
-                                {t(($) => $.comment.resolve.unresolve_thread_action)}
-                              </>
-                            ) : (
-                              <>
-                                <CheckCircle2 className="h-3.5 w-3.5" />
-                                {t(($) => $.comment.resolve.resolve_thread_action)}
-                              </>
-                            )}
-                          </DropdownMenuItem>
-                        </>
+                      {onCopyLink && (
+                        <DropdownMenuItem onClick={() => onCopyLink(entry.id)}>
+                          <Link2 className="h-3.5 w-3.5" />
+                          {t(($) => $.comment.copy_link_action)}
+                        </DropdownMenuItem>
                       )}
-                      {(canEditEntry || canDeleteEntry) && (
+                      {onCreateSubIssue && entry.comment_type === "comment" && (
+                        <DropdownMenuItem onClick={() => onCreateSubIssue(entry.id)}>
+                          <MessageSquarePlus className="h-3.5 w-3.5" aria-hidden />
+                          {t(($) => $.source_context.create_action)}
+                        </DropdownMenuItem>
+                      )}
+                      {canDeleteEntry && (
                         <>
                           <DropdownMenuSeparator />
-                          {canEditEntry && (
-                            <DropdownMenuItem onClick={edit.startEdit}>
-                              <Pencil className="h-3.5 w-3.5" />
-                              {t(($) => $.comment.edit_action)}
-                            </DropdownMenuItem>
-                          )}
-                          {canEditEntry && canDeleteEntry && <DropdownMenuSeparator />}
-                          {canDeleteEntry && (
-                            <DropdownMenuItem onClick={() => setConfirmDelete(true)} variant="destructive">
-                              <Trash2 className="h-3.5 w-3.5" />
-                              {t(($) => $.comment.delete_action)}
-                            </DropdownMenuItem>
-                          )}
+                          <DropdownMenuItem onClick={() => setConfirmDelete(true)} variant="destructive">
+                            <Trash2 className="h-3.5 w-3.5" />
+                            {t(($) => $.comment.delete_action)}
+                          </DropdownMenuItem>
                         </>
                       )}
                     </DropdownMenuContent>
@@ -958,22 +1351,22 @@ function CommentCardImpl({
                     open={confirmDelete}
                     onOpenChange={setConfirmDelete}
                     onConfirm={() => onDelete(entry.id)}
-                    hasReplies
+                    hasReplies={replyCount > 0}
                   />
-                </div>
-              )}
+                </>}
+              </div>
             </div>
           </StickyHeaderShell>
 
         {/* Root comment body. Avoid Base UI's Panel here: every mounted panel
             probes computed styles to detect animations, forcing a style
             recalculation across long issue-detail documents. */}
-        {open && (
-          <div id={`comment-body-${entry.id}`} className="px-4 pt-1 pb-3">
+        {open && !deleted && (
+          <div id={`comment-body-${entry.id}`} className="px-4 max-md:px-3 pb-3">
             {edit.editing ? (
               <div
                 {...edit.dropZoneProps}
-                className="relative pl-10"
+                className="relative pl-8 max-md:pl-0"
                 onKeyDown={(e) => { if (e.key === "Escape") edit.cancelEdit(); }}
               >
                 <div className="text-body leading-relaxed">
@@ -994,6 +1387,15 @@ function CommentCardImpl({
                     attachments={edit.editorAttachments}
                   />
                 </div>
+                {edit.revisionConflict ? (
+                  <CommentRevisionConflict
+                    serverContent={entry.content ?? ""}
+                    localContent={edit.content}
+                    onKeepLocal={() => void edit.saveEdit()}
+                    onUseServer={edit.adoptServerVersion}
+                    saving={edit.saving}
+                  />
+                ) : null}
                 <div className="flex items-center justify-between mt-2">
                   <div className="flex min-w-0 flex-1 flex-col gap-1">
                     {edit.standaloneEditAttachments.length > 0 && (
@@ -1012,6 +1414,7 @@ function CommentCardImpl({
                     <CommentTriggerChips
                       agents={edit.triggerPreview.agents}
                       blocked={edit.triggerPreview.blocked}
+                      hasAllMembersMention={edit.triggerPreview.hasAllMembersMention}
                       draftContent={edit.content}
                       suppressedAgentIds={edit.suppressedAgentIds}
                       onToggle={edit.toggleSuppressedAgent}
@@ -1041,26 +1444,33 @@ function CommentCardImpl({
               </div>
             ) : (
               <>
-                <div className="pl-10 text-body leading-relaxed text-foreground">
+                <div tabIndex={currentUserId ? 0 : undefined} role="group"
+            aria-label={t(($) => $.reply.annotations.source_label, { name: entry.actor_name || getActorName(entry.actor_type, entry.actor_id) })}
+            data-comment-content={entry.id} className="pl-8 max-md:pl-0 text-body leading-relaxed text-foreground">
                   <ReadonlyContent content={entry.content ?? ""} attachments={entry.attachments} />
                 </div>
-                <AttachmentList attachments={entry.attachments} content={entry.content} className="mt-1.5 pl-10" />
+                <AttachmentList attachments={entry.attachments} content={entry.content} className="mt-1.5 pl-8 max-md:pl-0" />
+                <div className="pl-8 max-md:pl-0">
+                  <SupplementReceipt issueId={issueId} entry={entry} />
+                </div>
                 {retryableAgentFailureComment(entry) && (
                   <TaskCommentRetryButton
                     issueId={issueId}
                     taskId={entry.source_task_id}
-                    className="mt-2 pl-10"
+                    className="mt-2 pl-8 max-md:pl-0"
                   />
                 )}
-                <ReactionBar
-                  reactions={reactions}
-                  currentUserId={currentUserId}
-                  onToggle={(emoji) => onToggleReaction(entry.id, emoji)}
-                  getActorName={getActorName}
-                  className="mt-1.5 pl-10"
-                />
               </>
             )}
+            <div className="pl-8 max-md:pl-0">{renderRuns(entry.id)}</div>
+            {!edit.editing && <ReactionBar
+              reactions={reactions}
+              showPicker={false}
+              currentUserId={currentUserId}
+              onToggle={(emoji) => onToggleReaction(entry.id, emoji)}
+              getActorName={getActorName}
+              className="mt-1.5 pl-8 max-md:pl-0"
+            />}
           </div>
         )}
         </div>
@@ -1074,35 +1484,14 @@ function CommentCardImpl({
             <>
               {/* reply-mode folded: other replies behind a bar, resolution pinned below */}
               {foldedReplies.length > 0 && (
-                <div className="border-t border-border/50 px-4 py-2.5">
+                <div className="border-t border-border/50 px-4 max-md:px-3 py-2.5">
                   <CommentsFoldBar
                     replies={foldedReplies}
                     onExpand={() => onResolvedExpandChange?.(entry.id, true)}
                   />
                 </div>
               )}
-              {resolutionReply && (
-                <div
-                  id={`comment-${resolutionReply.id}`}
-                  className={cn(
-                    "border-t border-border/50 transition-colors duration-700",
-                    highlightedCommentId === resolutionReply.id && highlightedCommentBackgroundClass,
-                  )}
-                >
-                  <CommentRow
-                    issueId={issueId}
-                    entry={resolutionReply}
-                    currentUserId={currentUserId}
-                    canModerate={canModerate}
-                    isResolution
-                    isHighlighted={highlightedCommentId === resolutionReply.id}
-                    onEdit={onEdit}
-                    onDelete={onDelete}
-                    onToggleReaction={onToggleReaction}
-                    onResolveToggle={onResolveToggle}
-                  />
-                </div>
-              )}
+              {threadRows.map(renderThreadRow)}
             </>
           ) : (
             <>
@@ -1111,7 +1500,7 @@ function CommentCardImpl({
                 <button
                   type="button"
                   onClick={() => onResolvedExpandChange(entry.id, false)}
-                  className="sticky top-0 z-20 flex w-full items-center gap-2.5 border-t border-border/50 bg-muted px-4 py-2.5 text-left text-body text-muted-foreground transition-colors cursor-pointer hover:bg-accent hover:text-accent-foreground"
+                  className="sticky top-0 z-20 flex w-full items-center gap-2.5 border-t border-border/50 bg-muted px-4 max-md:px-3 py-2.5 text-left text-body text-muted-foreground transition-colors cursor-pointer hover:bg-accent hover:text-accent-foreground"
                   aria-label={t(($) => $.comment.resolve.collapse)}
                 >
                   <ListChevronsDownUp className="h-3.5 w-3.5" />
@@ -1119,41 +1508,22 @@ function CommentCardImpl({
                 </button>
               )}
               {/* Replies — chronological; the resolution keeps its place with a badge */}
-              {allNestedReplies.map((reply) => (
-                <div
-                  key={reply.id}
-                  id={`comment-${reply.id}`}
-                  className={cn(
-                    "border-t border-border/50 transition-colors duration-700",
-                    highlightedCommentId === reply.id && highlightedCommentBackgroundClass,
-                  )}
-                >
-                  <CommentRow
-                    issueId={issueId}
-                    entry={reply}
-                    currentUserId={currentUserId}
-                    canModerate={canModerate}
-                    isResolution={reply.id === replyResolutionId}
-                    isHighlighted={highlightedCommentId === reply.id}
-                    onEdit={onEdit}
-                    onDelete={onDelete}
-                    onToggleReaction={onToggleReaction}
-                    onResolveToggle={onResolveToggle}
-                  />
-                </div>
-              ))}
+              {threadRows.map(renderThreadRow)}
 
               {/* Reply input */}
-              <div className="border-t border-border/50 px-4 py-2.5">
+              <div className="border-t border-border/50 px-4 max-md:px-3 py-2.5">
                 <ReplyInput
                   issueId={issueId}
-                  parentId={entry.id}
+                  parentId={replyTargetId}
+                  targetMissing={replyTargetMissing}
                   placeholder={t(($) => $.reply.placeholder)}
                   size="sm"
                   avatarType="member"
                   avatarId={currentUserId ?? ""}
                   draftKey={`reply:${issueId}:${entry.id}`}
-                  onSubmit={(content, attachmentIds, suppressAgentIds) => onReply(entry.id, content, attachmentIds, suppressAgentIds)}
+                  onEditAnnotation={(id) => annotation.editAnnotation(id, true)}
+                  onSubmit={(content, attachmentIds, suppressAgentIds) => replyTargetMissing ? Promise.resolve(false) : onReply(replyTargetId, content, attachmentIds, suppressAgentIds)}
+                  onAccepted={onReplyAccepted}
                 />
               </div>
             </>
