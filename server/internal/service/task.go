@@ -4183,15 +4183,45 @@ func (s *TaskService) maybeLogClaimSlow(agentID pgtype.UUID, outcome string, sta
 // Issue status is NOT changed here — the agent manages it via the CLI.
 func (s *TaskService) StartTask(ctx context.Context, taskID pgtype.UUID, supplementSupport ...bool) (*db.AgentTaskQueue, error) {
 	enableTaskSupplement := len(supplementSupport) > 0 && supplementSupport[0]
-	task, err := s.Queries.StartAgentTaskWithSupplement(ctx, db.StartAgentTaskWithSupplementParams{
-		TaskID:               taskID,
-		EnableTaskSupplement: enableTaskSupplement,
-	})
-	if err != nil {
+	var task db.AgentTaskQueue
+	if err := s.runInTx(ctx, func(qtx *db.Queries) error {
+		started, err := qtx.StartAgentTaskWithSupplement(ctx, db.StartAgentTaskWithSupplementParams{
+			TaskID:               taskID,
+			EnableTaskSupplement: enableTaskSupplement,
+		})
+		if err != nil {
+			return err
+		}
+		if err := startWorkflowTask(ctx, qtx, started); err != nil {
+			return err
+		}
+		task = started
+		return nil
+	}); err != nil {
 		return nil, fmt.Errorf("start task: %w", err)
 	}
 	s.taskStarted(ctx, task)
 	return &task, nil
+}
+
+func startWorkflowTask(ctx context.Context, qtx *db.Queries, task db.AgentTaskQueue) error {
+	if !task.WorkflowAttemptID.Valid {
+		return nil
+	}
+	lease, err := qtx.GetWorkflowTaskLeaseContext(ctx, task.ID)
+	if err != nil {
+		return fmt.Errorf("load workflow lease context: %w", err)
+	}
+	if _, err := qtx.StartWorkflowAttemptByTask(ctx, db.StartWorkflowAttemptByTaskParams{
+		LeaseSeconds: float64(lease.LeaseSeconds),
+		TaskID:       task.ID,
+	}); err != nil {
+		return fmt.Errorf("start workflow attempt: %w", err)
+	}
+	if _, err := qtx.MarkWorkflowNodeRunning(ctx, task.ID); err != nil {
+		return fmt.Errorf("mark workflow node running: %w", err)
+	}
+	return nil
 }
 
 // StartTaskForClaim serializes the ownership check and transition with reclaim,
@@ -4219,6 +4249,9 @@ func (s *TaskService) StartTaskForClaim(ctx context.Context, claim db.LockAgentT
 		})
 		if err != nil {
 			return nil, fmt.Errorf("start claimed task: %w", err)
+		}
+		if err := startWorkflowTask(ctx, qtx, task); err != nil {
+			return nil, fmt.Errorf("start claimed workflow task: %w", err)
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {

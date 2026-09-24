@@ -1003,7 +1003,12 @@ func TestAutopilotQuotaSchedulePersistsSkippedRun(t *testing.T) {
 	ctx := context.Background()
 	q := db.New(pool)
 	workspaceIDString, publisherID, agentID, _ := seedAttributionFixture(t, pool)
-	autopilotIDString, _ := seedRunOnlyAutopilot(t, pool, workspaceIDString, agentID, publisherID)
+	autopilotIDString, seededRunID := seedRunOnlyAutopilot(t, pool, workspaceIDString, agentID, publisherID)
+	// The shared fixture creates an active run. Settle it so this test reaches
+	// the quota gate instead of the scheduled non-overlap gate.
+	if _, err := pool.Exec(ctx, `UPDATE autopilot_run SET status = 'completed' WHERE id = $1`, seededRunID); err != nil {
+		t.Fatalf("settle fixture run: %v", err)
+	}
 	workspaceID := util.MustParseUUID(workspaceIDString)
 	t.Cleanup(func() {
 		pool.Exec(context.Background(), `DELETE FROM autopilot_quota_reservation WHERE workspace_id = $1`, workspaceID)

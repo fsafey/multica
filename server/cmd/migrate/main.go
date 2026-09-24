@@ -105,14 +105,14 @@ var pgBigmOperatorClass = extensionOperatorClass{
 // manual SQL. A higher-numbered migration cannot help — the instance never
 // reaches a version above the failing 198.
 //
-// GH #6388: migration 257 builds a replacement unique index concurrently. A
+// GH #6388: migration 293 builds a replacement unique index concurrently. A
 // failed build can leave an INVALID relation that IF NOT EXISTS would otherwise
 // mistake for a successful retry. The hook removes only that invalid leftover;
-// migration 257 can then rebuild it while the valid v1 index remains in place.
+// migration 293 can then rebuild it while the valid v1 index remains in place.
 //
-// MUL-5823: migration 261 replaces the terminal-task partial index the same
+// MUL-5823: migration 297 replaces the terminal-task partial index the same
 // way, so it carries the same hazard — an INVALID v2 leftover recorded as
-// success would let migration 262 drop the still-valid v1, leaving all four
+// success would let migration 298 drop the still-valid v1, leaving all four
 // dashboard rollups on a full table scan.
 // concurrentIndexCleanups maps a migration version to the index it builds with
 // CREATE INDEX CONCURRENTLY. Every entry gets an invalid-index cleanup hook, so
@@ -123,15 +123,15 @@ var pgBigmOperatorClass = extensionOperatorClass{
 // creates — a typo here would be invisible at runtime, because a hook that names
 // a nonexistent index is a silent no-op.
 //
-// MUL-5999: migrations 273–277 each build one index concurrently, three of them
+// MUL-5999: migrations 309-313 each build one index concurrently, three of them
 // on hot tables (agent_task_queue is the largest table in the database). They
-// carry the same hazard as 257 / 261: an interrupted build leaves an INVALID
+// carry the same hazard as 293 / 297: an interrupted build leaves an INVALID
 // index of the same name, `IF NOT EXISTS` then skips the rebuild, the runner
 // records the migration as applied, and the queries that need the index silently
 // stay on a full scan — the exact regression these migrations exist to fix.
 //
-// MUL-6288: registration used to be opt-in per batch, so 316 / 317 / 326 / 328 /
-// 330 / 331 shipped without a hook and the hazard came back. The map is now
+// MUL-6288: registration used to be opt-in per batch, so 352 / 353 / 362 / 364 /
+// 366 / 367 shipped without a hook and the hazard came back. The map is now
 // total — every up migration that builds an index concurrently is listed, the
 // same invariant `concurrentDownIndexCleanups` already holds for rollbacks — and
 // TestEveryConcurrentUpBuildHasCleanup fails the build if a new migration is
@@ -470,11 +470,11 @@ var upMigrationConditions = map[string]migrationCondition{
 	// migration. SaaS backfills separately; self-host converges in 491.
 	"505_issue_status_lifecycle_categories": skipMigration("superseded by 478 expansion and 491 convergence (MUL-7365)"),
 	// Current search no longer consumes an issue-description GIN. Fresh installs
-	// should not build the historical fallback only to retire it at migration 464.
-	"139_issue_description_trgm_index": skipMigration("issue description search indexes are retired by migration 464"),
+	// should not build the historical fallback only to retire it at migration 500.
+	"139_issue_description_trgm_index": skipMigration("issue description search indexes are retired by migration 500"),
 	// Current search no longer consumes a comment-content GIN. Fresh installs
-	// should not build the historical fallback only to retire it at migration 455.
-	"140_comment_content_trgm_index": skipMigration("comment content search indexes are retired by migration 455"),
+	// should not build the historical fallback only to retire it at migration 491.
+	"140_comment_content_trgm_index": skipMigration("comment content search indexes are retired by migration 491"),
 	// Existing pg_bigm deployments already have both indexes. Remove the
 	// fallback only after proving the preferred index has the exact usable shape;
 	// pg_bigm-less self-hosted databases keep trgm and record 371 as a no-op.
@@ -490,7 +490,7 @@ var upMigrationConditions = map[string]migrationCondition{
 // selected before its retirement: pg_bigm deployments get the preferred bigram
 // index, while pg_bigm-less self-hosted deployments get the trigram fallback.
 // Migration 463 independently restores the optional issue-description bigram;
-// migration 464's portable trigram rollback is unconditional.
+// migration 500's portable trigram rollback is unconditional.
 var downMigrationConditions = map[string]migrationCondition{
 	"490_drop_comment_content_bigm_index":   whenOperatorClassAvailable(pgBigmOperatorClass),
 	"491_drop_comment_content_trgm_index":   whenOperatorClassUnavailable(pgBigmOperatorClass),

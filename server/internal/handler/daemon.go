@@ -2051,8 +2051,8 @@ func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 				"error", nextErr)
 		} else {
 			response["claim_poll_hint_supported"] = true
-			if nextDeferred.Valid {
-				response["next_deferred_task_after_ms"] = claimPollHintDelay(time.Now(), nextDeferred.Time).Milliseconds()
+			if nextDeferred.FireAt.Valid {
+				response["next_deferred_task_after_ms"] = claimPollHintDelay(nextDeferred.DatabaseNow.Time, nextDeferred.FireAt.Time).Milliseconds()
 			}
 		}
 	}
@@ -4718,6 +4718,7 @@ type taskCompletionResult struct {
 	Output                string `json:"output"`
 	SessionID             string `json:"session_id"`
 	WorkDir               string `json:"work_dir"`
+	DurableWorkDir        string `json:"durable_work_dir,omitempty"`
 	SessionRolloutMissing bool   `json:"session_rollout_missing,omitempty"`
 	RetiredSessionID      string `json:"retired_session_id,omitempty"`
 }
@@ -4813,6 +4814,7 @@ func (h *Handler) CompleteTask(w http.ResponseWriter, r *http.Request) {
 		Output:                req.Output,
 		SessionID:             req.SessionID,
 		WorkDir:               req.WorkDir,
+		DurableWorkDir:        req.DurableWorkDir,
 		SessionRolloutMissing: req.SessionRolloutMissing,
 		RetiredSessionID:      req.RetiredSessionID,
 	})

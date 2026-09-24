@@ -145,8 +145,8 @@ func TestNextDeferredTaskFireAtForRuntimes_OmitsIneligibleOverdueTasks(t *testin
 			if err != nil {
 				t.Fatalf("NextDeferredTaskFireAtForRuntimes: %v", err)
 			}
-			if next.Valid != tt.wantHint {
-				t.Fatalf("hint validity = %v, want %v", next.Valid, tt.wantHint)
+			if next.FireAt.Valid != tt.wantHint {
+				t.Fatalf("hint validity = %v, want %v", next.FireAt.Valid, tt.wantHint)
 			}
 		})
 	}

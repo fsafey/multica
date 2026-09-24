@@ -2442,7 +2442,7 @@ ORDER BY atq.priority DESC, atq.created_at ASC;
 -- promoted must not advertise an immediate follow-up claim. The response
 -- converts the timestamp to a relative delay, avoiding any dependency on
 -- daemon/server clock synchronization.
-SELECT MIN(fire_at)::timestamptz
+SELECT MIN(fire_at)::timestamptz AS fire_at, now()::timestamptz AS database_now
 FROM agent_task_queue t
 WHERE t.runtime_id = ANY(@runtime_ids::uuid[])
   AND t.status = 'deferred'

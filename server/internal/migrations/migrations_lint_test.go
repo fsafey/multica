@@ -13,6 +13,10 @@ import (
 func TestMigrationNumericPrefixesAreUnique(t *testing.T) {
 	files := migrationFilesForLint(t, "*.up.sql")
 
+	// This fork inserted 36 applied migrations at 203-238. Its recorded
+	// production history already maps upstream's old 203-251 series to 239-287,
+	// so the v0.5.3 upstream 252-547 series continues at 288-583. Keep those
+	// recorded filenames stable; future upstream syncs must continue the offset.
 	// Migrations through 128 contain historical duplicate numeric prefixes.
 	// From 129 onward, keep the numeric sequence unique so release tooling and
 	// operators can identify one schema change unambiguously by its number.

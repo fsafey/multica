@@ -7580,7 +7580,7 @@ func (q *Queries) MergeDelegatedFailureCommentIntoPendingTask(ctx context.Contex
 }
 
 const nextDeferredTaskFireAtForRuntimes = `-- name: NextDeferredTaskFireAtForRuntimes :one
-SELECT MIN(fire_at)::timestamptz
+SELECT MIN(fire_at)::timestamptz AS fire_at, now()::timestamptz AS database_now
 FROM agent_task_queue t
 WHERE t.runtime_id = ANY($1::uuid[])
   AND t.status = 'deferred'
@@ -7612,6 +7612,11 @@ type NextDeferredTaskFireAtForRuntimesParams struct {
 	RuntimeStaleSecs float64       `json:"runtime_stale_secs"`
 }
 
+type NextDeferredTaskFireAtForRuntimesRow struct {
+	FireAt      pgtype.Timestamptz `json:"fire_at"`
+	DatabaseNow pgtype.Timestamptz `json:"database_now"`
+}
+
 // Returns the next future deferred task for a daemon's authorized runtime set,
 // or an eligible task that crossed fire_at during this claim. Overdue tasks
 // whose runtime is offline/stale or that are blocked by an existing issue+agent
@@ -7620,11 +7625,11 @@ type NextDeferredTaskFireAtForRuntimesParams struct {
 // promoted must not advertise an immediate follow-up claim. The response
 // converts the timestamp to a relative delay, avoiding any dependency on
 // daemon/server clock synchronization.
-func (q *Queries) NextDeferredTaskFireAtForRuntimes(ctx context.Context, arg NextDeferredTaskFireAtForRuntimesParams) (pgtype.Timestamptz, error) {
+func (q *Queries) NextDeferredTaskFireAtForRuntimes(ctx context.Context, arg NextDeferredTaskFireAtForRuntimesParams) (NextDeferredTaskFireAtForRuntimesRow, error) {
 	row := q.db.QueryRow(ctx, nextDeferredTaskFireAtForRuntimes, arg.RuntimeIds, arg.RuntimeStaleSecs)
-	var column_1 pgtype.Timestamptz
-	err := row.Scan(&column_1)
-	return column_1, err
+	var i NextDeferredTaskFireAtForRuntimesRow
+	err := row.Scan(&i.FireAt, &i.DatabaseNow)
+	return i, err
 }
 
 const promoteDeferredChannelIssueTask = `-- name: PromoteDeferredChannelIssueTask :one

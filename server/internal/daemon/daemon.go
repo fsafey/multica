@@ -10001,6 +10001,7 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 	// tail to be persisted.
 	drainFinished := make(chan struct{})
 	go func() {
+		defer close(drainFinished)
 		var mu sync.Mutex
 		var pendingContent strings.Builder
 		var pendingType string
