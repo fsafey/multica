@@ -484,12 +484,3 @@ func boolToPtr(value pgtype.Bool) *bool {
 	result := value.Bool
 	return &result
 }
-
-func isTerminalTaskStatus(status string) bool {
-	switch status {
-	case "completed", "failed", "cancelled":
-		return true
-	default:
-		return false
-	}
-}

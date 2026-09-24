@@ -1458,11 +1458,15 @@ func (s *WorkflowService) CancelRun(
 		}); err != nil {
 			return fmt.Errorf("cancel workflow run attempts: %w", err)
 		}
-		if _, err := qtx.CancelWorkflowRunTasks(ctx, db.CancelWorkflowRunTasksParams{
+		cancelledTasks, err := qtx.CancelWorkflowRunTasks(ctx, db.CancelWorkflowRunTasksParams{
 			Error: message,
 			RunID: runID,
-		}); err != nil {
+		})
+		if err != nil {
 			return fmt.Errorf("cancel workflow run tasks: %w", err)
+		}
+		if err := SettleTerminalTaskState(ctx, qtx, cancelledTasks...); err != nil {
+			return fmt.Errorf("settle cancelled workflow run tasks: %w", err)
 		}
 		if _, err := qtx.ReleaseWorkflowRunResources(ctx, runID); err != nil {
 			return fmt.Errorf("release workflow run resources: %w", err)
@@ -1571,11 +1575,15 @@ func (s *WorkflowService) CancelNode(
 			}); err != nil {
 				return fmt.Errorf("cancel workflow attempt: %w", err)
 			}
-			if _, err := qtx.CancelWorkflowTaskForAttempt(ctx, db.CancelWorkflowTaskForAttemptParams{
+			cancelledTasks, err := qtx.CancelWorkflowTaskForAttempt(ctx, db.CancelWorkflowTaskForAttemptParams{
 				Error:     message,
 				AttemptID: current.CurrentAttemptID,
-			}); err != nil {
+			})
+			if err != nil {
 				return fmt.Errorf("cancel workflow task: %w", err)
+			}
+			if err := SettleTerminalTaskState(ctx, qtx, cancelledTasks...); err != nil {
+				return fmt.Errorf("settle cancelled workflow task: %w", err)
 			}
 			if _, err := qtx.ReleaseWorkflowAttemptResources(ctx, current.CurrentAttemptID); err != nil {
 				return fmt.Errorf("release cancelled workflow resources: %w", err)
@@ -1677,8 +1685,12 @@ func (s *WorkflowService) ExpireLeases(ctx context.Context, maxAttempts int32) (
 			if _, err := qtx.ReleaseWorkflowAttemptResources(ctx, attempt.ID); err != nil {
 				return fmt.Errorf("release expired workflow resources: %w", err)
 			}
-			if _, err := qtx.ExpireWorkflowTask(ctx, attempt.ID); err != nil {
+			expiredTasks, err := qtx.ExpireWorkflowTask(ctx, attempt.ID)
+			if err != nil {
 				return fmt.Errorf("expire workflow task: %w", err)
+			}
+			if err := SettleTerminalTaskState(ctx, qtx, expiredTasks...); err != nil {
+				return fmt.Errorf("settle expired workflow task: %w", err)
 			}
 			expiredCount++
 		}

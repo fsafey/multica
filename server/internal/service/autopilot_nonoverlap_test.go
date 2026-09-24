@@ -64,6 +64,8 @@ func TestScheduledRunOnlyAutopilotDoesNotOverlap(t *testing.T) {
 		Enabled:        true,
 		CronExpression: pgtype.Text{String: "*/5 * * * *", Valid: true},
 		Timezone:       pgtype.Text{String: "UTC", Valid: true},
+		CreatedByType:  pgtype.Text{String: "member", Valid: true},
+		CreatedByID:    util.MustParseUUID(publisherID),
 	})
 	if err != nil {
 		t.Fatalf("create autopilot trigger: %v", err)
@@ -174,6 +176,7 @@ func TestScheduledRunOnlyAutopilotDoesNotOverlap(t *testing.T) {
 		pgtype.Timestamptz{Time: plannedAt.Add(2 * time.Minute), Valid: true},
 		pgtype.UUID{},
 		pgtype.UUID{},
+		"",
 	)
 	if err != nil {
 		t.Fatalf("scheduled overlap probe: %v", err)
@@ -194,6 +197,7 @@ func TestScheduledRunOnlyAutopilotDoesNotOverlap(t *testing.T) {
 		pgtype.Timestamptz{},
 		pgtype.UUID{},
 		util.MustParseUUID(publisherID),
+		"",
 	)
 	if err != nil {
 		t.Fatalf("manual dispatch: %v", err)

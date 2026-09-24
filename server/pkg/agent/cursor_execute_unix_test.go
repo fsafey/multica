@@ -3,12 +3,15 @@
 package agent
 
 import (
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/multica-ai/multica/server/pkg/taskfailure"
 )
 
 // A real cursor-agent reads the prompt from stdin to EOF (see buildCursorArgs).
@@ -147,10 +150,14 @@ exit 1
 			t.Errorf("error = %q, want substring %q", result.Error, want)
 		}
 	}
-	for _, secret := range []string{"cursor-secret-token-value", homeDir} {
-		if strings.Contains(result.Error, secret) {
-			t.Errorf("error leaked %q: %q", secret, result.Error)
-		}
+	if strings.Contains(result.Error, "cursor-secret-token-value") {
+		t.Errorf("error leaked the bearer token: %q", result.Error)
+	}
+	// Host paths are deliberately NOT masked: a crash diagnostic is only
+	// actionable if the path it names is the real one, and masking a path
+	// segment never was an access-control boundary. See redact.Text.
+	if !strings.Contains(result.Error, homeDir+"/private") {
+		t.Errorf("error = %q, want the home path preserved verbatim", result.Error)
 	}
 	if result.Output != "" {
 		t.Fatalf("output = %q, want empty failed output", result.Output)
@@ -186,11 +193,14 @@ exit 1
 }
 
 func TestCursorExecuteReportsScannerOverflow(t *testing.T) {
-	script := `#!/bin/sh
-printf '%s\n' '{"type":"system","subtype":"init","session_id":"sess-overflow"}'
-dd if=/dev/zero bs=1048576 count=11 2>/dev/null | tr '\000' x
+	// The oversized event is sized from agentStreamMaxLineBytes so raising
+	// the shared cap cannot silently turn this into a plain oversized-line
+	// pass that never reaches the overflow branch.
+	script := fmt.Sprintf(`#!/bin/sh
+printf '%%s\n' '{"type":"system","subtype":"init","session_id":"sess-overflow"}'
+dd if=/dev/zero bs=1048576 count=%d 2>/dev/null | tr '\000' x
 printf '\n'
-`
+`, agentStreamMaxLineBytes/(1024*1024)+1)
 	result := executeFakeCursor(t, script)
 
 	if result.Status != "failed" {
@@ -261,6 +271,20 @@ exit 1
 	}
 	if result.Output != "" {
 		t.Fatalf("output = %q, want empty failed output", result.Output)
+	}
+}
+
+func TestCursorExecuteConnectTimeoutIsResumeSafe(t *testing.T) {
+	t.Parallel()
+	result := executeFakeCursor(t, "#!/bin/sh\n"+drainStdin+"\nprintf '%s\\n' 'Error: [unavailable] connect ETIMEDOUT 192.0.2.1:443' >&2\nexit 1\n")
+	if result.Status != "failed" || result.SessionID != "" {
+		t.Fatalf("expected failure before first session event: %+v", result)
+	}
+	if result.ResumeRejected || result.ResumeRejectedTransient {
+		t.Fatal("a connection timeout does not prove resume was rejected")
+	}
+	if got := taskfailure.Classify(result.Error); got != taskfailure.ReasonAgentProviderNetwork {
+		t.Fatalf("actual Cursor adapter error classified as %s, want network: %s", got, result.Error)
 	}
 }
 

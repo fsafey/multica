@@ -68,15 +68,6 @@ func TestServerCompatibilityGate(t *testing.T) {
 // un-upgraded server, the extender logs once and STOPS instead of Warn-looping
 // forever.
 func TestPrepareLeaseExtender_UnsupportedRouteStopsLoudly(t *testing.T) {
-	oldRefresh := taskPrepareLeaseRefresh
-	oldTimeout := taskPrepareLeaseTimeout
-	taskPrepareLeaseRefresh = 10 * time.Millisecond
-	taskPrepareLeaseTimeout = 500 * time.Millisecond
-	t.Cleanup(func() {
-		taskPrepareLeaseRefresh = oldRefresh
-		taskPrepareLeaseTimeout = oldTimeout
-	})
-
 	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/prepare-lease") {
@@ -90,8 +81,9 @@ func TestPrepareLeaseExtender_UnsupportedRouteStopsLoudly(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	d := &Daemon{
-		client: NewClient(srv.URL),
-		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		client:              NewClient(srv.URL),
+		logger:              slog.New(slog.NewTextHandler(io.Discard, nil)),
+		prepareLeaseRefresh: 10 * time.Millisecond,
 	}
 	task := Task{ID: "task-1", RuntimeID: "rt-1"}
 	taskLog := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -112,15 +104,6 @@ func TestPrepareLeaseExtender_UnsupportedRouteStopsLoudly(t *testing.T) {
 // only fires on a missing route: an ordinary transient failure must NOT stop
 // the loop.
 func TestPrepareLeaseExtender_TransientErrorKeepsRetrying(t *testing.T) {
-	oldRefresh := taskPrepareLeaseRefresh
-	oldTimeout := taskPrepareLeaseTimeout
-	taskPrepareLeaseRefresh = 10 * time.Millisecond
-	taskPrepareLeaseTimeout = 500 * time.Millisecond
-	t.Cleanup(func() {
-		taskPrepareLeaseRefresh = oldRefresh
-		taskPrepareLeaseTimeout = oldTimeout
-	})
-
 	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/prepare-lease") {
@@ -133,8 +116,9 @@ func TestPrepareLeaseExtender_TransientErrorKeepsRetrying(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	d := &Daemon{
-		client: NewClient(srv.URL),
-		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		client:              NewClient(srv.URL),
+		logger:              slog.New(slog.NewTextHandler(io.Discard, nil)),
+		prepareLeaseRefresh: 10 * time.Millisecond,
 	}
 	stop := d.startTaskPrepareLeaseExtender(context.Background(), Task{ID: "task-1", RuntimeID: "rt-1"}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	t.Cleanup(stop)

@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -169,6 +170,18 @@ func TestWorkflowClaimFiftyWorkersCreateOneAttempt(t *testing.T) {
 	})
 
 	service := NewWorkflowService(db.New(pool), pool)
+	issue := db.Issue{
+		ID:          util.MustParseUUID(issueID),
+		WorkspaceID: util.MustParseUUID(workspaceID),
+		AssigneeID:  util.MustParseUUID(agentID),
+	}
+	taskService := NewTaskService(db.New(pool), pool, nil, events.New())
+	if _, err := taskService.EnqueueTaskForIssue(ctx, issue); !errors.Is(err, ErrWorkflowManagedDispatch) {
+		t.Fatalf("assigned workflow agent enqueue error = %v, want workflow-managed refusal", err)
+	}
+	if _, err := taskService.EnqueueTaskForMention(ctx, issue, util.MustParseUUID(agentID), pgtype.UUID{}, OriginNamed); !errors.Is(err, ErrWorkflowManagedDispatch) {
+		t.Fatalf("mentioned workflow agent enqueue error = %v, want workflow-managed refusal", err)
+	}
 	runtimes := []pgtype.UUID{util.MustParseUUID(runtimeID)}
 	var claimed atomic.Int64
 	var failures atomic.Int64
@@ -226,7 +239,6 @@ func TestWorkflowClaimFiftyWorkersCreateOneAttempt(t *testing.T) {
 	).Scan(&workflowTaskID); err != nil {
 		t.Fatalf("load workflow task: %v", err)
 	}
-	taskService := NewTaskService(db.New(pool), pool, nil, events.New())
 	startedTask, err := taskService.StartTask(ctx, util.MustParseUUID(workflowTaskID))
 	if err != nil {
 		t.Fatalf("start materialized workflow task: %v", err)

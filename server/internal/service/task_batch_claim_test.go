@@ -165,78 +165,137 @@ func TestClaimTasksForRuntimes_MaxTasksCap(t *testing.T) {
 	}
 }
 
-// TestClaimTasksForRuntimes_DoesNotCrossRuntimeForSameAgent covers the
-// re-pinning window: queued rows retain their enqueue-time runtime even after
-// an agent moves. A runtime-specific candidate must never cause the agent's
-// higher-priority row on another runtime to be dispatched.
-func TestClaimTasksForRuntimes_DoesNotCrossRuntimeForSameAgent(t *testing.T) {
+// TestClaimTasksForRuntimes_AnyDueRuntimeChecksTheCompleteSet pins MUL-6486's
+// collection-level reclaim gate. Per-runtime backstops can begin staggered, but
+// one due member must run the single UPDATE over every runtime on that daemon;
+// filtering the SQL array to only the due member both misses recoverable work
+// and lets fixed query overhead drift back toward one call per poll.
+func TestClaimTasksForRuntimes_AnyDueRuntimeChecksTheCompleteSet(t *testing.T) {
 	ctx := context.Background()
+	rdb := newRedisTestClient(t)
 	pool := newTaskClaimRacePool(t)
 	svc := NewTaskService(db.New(pool), pool, nil, events.New())
+	svc.ReclaimCheck = NewReclaimCheckCache(rdb)
 
 	rt1, rt2 := batchClaimFixture(t, ctx, pool)
+	ids := []pgtype.UUID{util.MustParseUUID(rt1), util.MustParseUUID(rt2)}
 
-	var workspaceID, ownerID, agentID string
+	var staleTaskID string
 	if err := pool.QueryRow(ctx, `
-		SELECT ar.workspace_id, ar.owner_id, a.id
-		FROM agent_runtime ar
-		JOIN agent a ON a.runtime_id = ar.id
-		WHERE ar.id = $1
+		SELECT id FROM agent_task_queue
+		WHERE runtime_id = $1
+		ORDER BY created_at
 		LIMIT 1
-	`, rt1).Scan(&workspaceID, &ownerID, &agentID); err != nil {
-		t.Fatalf("load fixture agent: %v", err)
+	`, rt2).Scan(&staleTaskID); err != nil {
+		t.Fatalf("load rt2 task: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE agent_task_queue
+		SET status = 'dispatched', dispatched_at = now() - interval '10 minutes',
+		    started_at = NULL, prepare_lease_expires_at = NULL
+		WHERE id = $1
+	`, staleTaskID); err != nil {
+		t.Fatalf("make rt2 task stale: %v", err)
 	}
 
-	var issueID, foreignTaskID string
-	if err := pool.QueryRow(ctx, `
-		INSERT INTO issue (
-			workspace_id, title, status, priority, creator_id, creator_type,
-			number, position
-		)
-		VALUES ($1, 'cross-runtime priority trap', 'in_progress', 'none',
-		        $2, 'member', 899999, 99)
-		RETURNING id
-	`, workspaceID, ownerID).Scan(&issueID); err != nil {
-		t.Fatalf("create cross-runtime issue: %v", err)
-	}
-	if err := pool.QueryRow(ctx, `
-		INSERT INTO agent_task_queue (
-			agent_id, runtime_id, issue_id, status, priority, context
-		)
-		VALUES ($1, $2, $3, 'queued', 100, '{}'::jsonb)
-		RETURNING id
-	`, agentID, rt2, issueID).Scan(&foreignTaskID); err != nil {
-		t.Fatalf("create cross-runtime task: %v", err)
-	}
-	t.Cleanup(func() {
-		c := context.Background()
-		pool.Exec(c, `DELETE FROM agent_task_queue WHERE id = $1`, foreignTaskID)
-		pool.Exec(c, `DELETE FROM issue WHERE id = $1`, issueID)
-	})
-
-	claimed, err := svc.ClaimTasksForRuntimes(
+	now := time.Now()
+	svc.ReclaimCheck.MarkChecked(
 		ctx,
-		[]pgtype.UUID{util.MustParseUUID(rt1)},
-		1,
+		[]string{rt1},
+		now.Add(-ReclaimCheckBackstopInterval-time.Second),
+		now.Add(ReclaimCheckRetryInterval),
 	)
-	if err != nil {
-		t.Fatalf("claim rt1: %v", err)
-	}
-	if len(claimed) != 1 {
-		t.Fatalf("claimed %d tasks, want 1", len(claimed))
-	}
-	if got := util.UUIDToString(claimed[0].RuntimeID); got != rt1 {
-		t.Fatalf("claimed runtime = %s, want %s", got, rt1)
+	svc.ReclaimCheck.MarkChecked(ctx, []string{rt2}, now, now.Add(ReclaimCheckRetryInterval))
+	due := svc.ReclaimCheck.DueRuntimeIDs(ctx, []string{rt1, rt2}, now)
+	if len(due) != 1 || due[0] != rt1 {
+		t.Fatalf("precondition due runtimes = %v, want [%s]", due, rt1)
 	}
 
-	var status string
-	if err := pool.QueryRow(ctx, `
-		SELECT status FROM agent_task_queue WHERE id = $1
-	`, foreignTaskID).Scan(&status); err != nil {
-		t.Fatalf("read foreign task status: %v", err)
+	claimed, err := svc.ClaimTasksForRuntimes(ctx, ids, 5)
+	if err != nil {
+		t.Fatalf("batch claim: %v", err)
 	}
-	if status != "queued" {
-		t.Fatalf("foreign-runtime task status = %s, want queued", status)
+	for _, task := range claimed {
+		if util.UUIDToString(task.ID) == staleTaskID {
+			return
+		}
+	}
+	t.Fatalf("batch claim omitted stale task %s on non-due runtime %s: got %v", staleTaskID, rt2, claimed)
+}
+
+// TestClaimTasksForRuntimes_EmptyReclaimDefersHintForRetry covers the recovery
+// hole where the task hint was previously made inert after one empty UPDATE.
+// A temporarily stale runtime heartbeat is intentionally correlated with a
+// lost claim response: the task remains dispatched, and its hint must become
+// due again after the short retry rather than waiting for the 90-second
+// backstop.
+func TestClaimTasksForRuntimes_EmptyReclaimDefersHintForRetry(t *testing.T) {
+	ctx := context.Background()
+	rdb := newRedisTestClient(t)
+	pool := newTaskClaimRacePool(t)
+	svc := NewTaskService(db.New(pool), pool, nil, events.New())
+	svc.ReclaimCheck = NewReclaimCheckCache(rdb)
+
+	rt1, _ := batchClaimFixture(t, ctx, pool)
+	runtimeID := util.MustParseUUID(rt1)
+	var taskID string
+	if err := pool.QueryRow(ctx, `
+		SELECT id FROM agent_task_queue
+		WHERE runtime_id = $1
+		ORDER BY created_at
+		LIMIT 1
+	`, rt1).Scan(&taskID); err != nil {
+		t.Fatalf("load task: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE agent_task_queue
+		SET status = 'dispatched', dispatched_at = now() - interval '10 minutes',
+		    started_at = NULL, prepare_lease_expires_at = NULL
+		WHERE id = $1
+	`, taskID); err != nil {
+		t.Fatalf("make task stale: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE agent_runtime
+		SET status = 'online', last_seen_at = now() - interval '10 minutes'
+		WHERE id = $1
+	`, rt1); err != nil {
+		t.Fatalf("make runtime temporarily ineligible: %v", err)
+	}
+
+	now := time.Now()
+	svc.ReclaimCheck.MarkChecked(ctx, []string{rt1}, now, now.Add(ReclaimCheckRetryInterval))
+	svc.ReclaimCheck.Track(ctx, rt1, taskID, now.Add(-time.Second))
+	if due := svc.ReclaimCheck.DueRuntimeIDs(ctx, []string{rt1}, now); len(due) != 1 {
+		t.Fatalf("precondition due runtimes = %v, want [%s]", due, rt1)
+	}
+
+	if claimed, err := svc.ClaimTasksForRuntimes(ctx, []pgtype.UUID{runtimeID}, 5); err != nil {
+		t.Fatalf("batch claim: %v", err)
+	} else if len(claimed) != 0 {
+		t.Fatalf("claimed tasks with stale runtime heartbeat: %v", claimed)
+	}
+	var status string
+	if err := pool.QueryRow(ctx, `SELECT status FROM agent_task_queue WHERE id = $1`, taskID).Scan(&status); err != nil {
+		t.Fatalf("read task after empty reclaim: %v", err)
+	}
+	if status != "dispatched" {
+		t.Fatalf("task status after empty reclaim = %q, want dispatched", status)
+	}
+
+	score, err := rdb.ZScore(ctx, reclaimCheckScheduleKey(rt1), taskID).Result()
+	if err != nil {
+		t.Fatalf("read deferred hint: %v", err)
+	}
+	retryAt := time.UnixMilli(int64(score))
+	if retryAt.Before(now.Add(ReclaimCheckRetryInterval)) || retryAt.After(time.Now().Add(ReclaimCheckRetryInterval+time.Second)) {
+		t.Fatalf("retry hint = %v, want approximately one retry interval after the check", retryAt)
+	}
+	if due := svc.ReclaimCheck.DueRuntimeIDs(ctx, []string{rt1}, retryAt.Add(-time.Millisecond)); len(due) != 0 {
+		t.Fatalf("hint retriggered before retry deadline: %v", due)
+	}
+	if due := svc.ReclaimCheck.DueRuntimeIDs(ctx, []string{rt1}, retryAt.Add(time.Millisecond)); len(due) != 1 {
+		t.Fatalf("hint did not retrigger after empty reclaim: %v", due)
 	}
 }
 

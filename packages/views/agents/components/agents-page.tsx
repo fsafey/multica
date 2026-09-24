@@ -61,6 +61,7 @@ import {
 } from "@multica/ui/components/ui/tooltip";
 import { useNavigation, useRowLink } from "../../navigation";
 import { ActorAvatar } from "../../common/actor-avatar";
+import { docsLocalePrefix } from "../../common/docs-locale";
 import { ProviderLogo } from "../../runtimes/components/provider-logo";
 import {
   CollectionPageHeader,
@@ -73,7 +74,7 @@ import {
   AgentListToolbar,
   countActiveFilterDimensions,
 } from "./agent-list-toolbar";
-import { useT } from "../../i18n";
+import { useLocale, useT } from "../../i18n";
 import { matchesPinyin } from "../../editor/extensions/pinyin-match";
 
 // Column template — single source of truth for header, rows, and skeletons.
@@ -255,7 +256,7 @@ function PageHeaderBar({
   totalCount: number;
   onCreate: () => void;
 }) {
-  const { t } = useT("agents");
+  const { t, i18n } = useT("agents");
   return (
     <CollectionPageHeader
       icon={Bot}
@@ -263,7 +264,7 @@ function PageHeaderBar({
       count={totalCount}
       description={t(($) => $.page.tagline)}
       learnMore={{
-        href: "https://multica.ai/docs/agents",
+        href: `https://multica.ai/docs${docsLocalePrefix(i18n.language)}/agents`,
         label: t(($) => $.page.learn_more),
       }}
       actions={
@@ -399,7 +400,7 @@ function NameCell({ row }: { row: AgentListRow }) {
             </Tooltip>
           )}
           {isOwnedByMe && (
-            <span className="shrink-0 rounded bg-muted px-1 text-micro font-medium text-muted-foreground">
+            <span className="shrink-0 rounded-xs bg-muted px-1 text-micro font-medium text-muted-foreground">
               {t(($) => $.row.you)}
             </span>
           )}
@@ -768,6 +769,7 @@ function LoadingSkeleton() {
 
 export function AgentsPage(_props: AgentsPageProps = {}) {
   const { t } = useT("agents");
+  const locale = useLocale();
   const wsId = useWorkspaceId();
   const paths = useWorkspacePaths();
   const navigation = useNavigation();
@@ -969,9 +971,13 @@ export function AgentsPage(_props: AgentsPageProps = {}) {
     overscan: 10,
   });
 
-  const handleDuplicate = useCallback((agent: Agent) => {
-    navigation.push(`${paths.newAgent()}?duplicate=${encodeURIComponent(agent.id)}`);
-  }, [navigation, paths]);
+  // Straight to the manual form: a duplicate already has every field decided,
+  // so the method chooser would be a step with nothing to choose.
+  const duplicateHref = useCallback(
+    (agent: Agent) =>
+      `${paths.newAgentManual()}?duplicate=${encodeURIComponent(agent.id)}`,
+    [paths],
+  );
 
   const selectedRows = rows.filter((row) => selectedIds.has(row.agent.id));
   const allSelected = rows.length > 0 && selectedRows.length === rows.length;
@@ -1102,7 +1108,7 @@ export function AgentsPage(_props: AgentsPageProps = {}) {
                       className={`h-16 cursor-pointer ${
                         selectedIds.has(row.agent.id) ? "bg-accent/30" : ""
                       }`}
-                      {...rowLink(paths.agentDetail(row.agent.id))}
+                      {...rowLink(paths.agentDetail(row.agent.id), row.agent.name)}
                     >
                       <CheckboxCell
                         checked={selectedIds.has(row.agent.id)}
@@ -1136,7 +1142,7 @@ export function AgentsPage(_props: AgentsPageProps = {}) {
                       )}
                       {isColVisible("runs") ? (
                         <ListGridCell className="hidden justify-end font-mono text-caption tabular-nums text-muted-foreground @2xl:flex">
-                          {row.runCount.toLocaleString()}
+                          {row.runCount.toLocaleString(locale)}
                         </ListGridCell>
                       ) : (
                         <ListGridCell className="hidden px-0 @2xl:flex" />
@@ -1154,7 +1160,7 @@ export function AgentsPage(_props: AgentsPageProps = {}) {
                         <ListGridCell className="hidden whitespace-nowrap text-caption tabular-nums text-muted-foreground @2xl:flex">
                           {new Date(
                             row.agent.created_at,
-                          ).toLocaleDateString()}
+                          ).toLocaleDateString(locale)}
                         </ListGridCell>
                       ) : (
                         <ListGridCell className="hidden px-0 @2xl:flex" />
@@ -1168,7 +1174,7 @@ export function AgentsPage(_props: AgentsPageProps = {}) {
                             agent={row.agent}
                             presence={row.presence}
                             canManage={row.canManage}
-                            onDuplicate={handleDuplicate}
+                            duplicateHref={duplicateHref(row.agent)}
                           />
                         </span>
                       </ListGridCell>
