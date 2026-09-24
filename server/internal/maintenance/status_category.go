@@ -36,7 +36,7 @@ func (StatusCategory) Validate(scope string, dry bool, raw json.RawMessage) (jso
 }
 func (StatusCategory) Preflight(ctx context.Context, tx pgx.Tx) error {
 	var applied bool
-	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version='478_issue_status_category_expand')`).Scan(&applied); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version='514_issue_status_category_expand')`).Scan(&applied); err != nil {
 		return err
 	}
 	if !applied {

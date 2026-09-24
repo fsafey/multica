@@ -64,7 +64,7 @@ func TestRunMigrationsRepairsInvalidConcurrentIndexBeforeRetry(t *testing.T) {
 		t.Fatalf("remove conflicting row before retry: %v", err)
 	}
 
-	const version = "257_agent_task_queue_channel_media_pending_unique_v2"
+	const version = "293_agent_task_queue_channel_media_pending_unique_v2"
 	if preMigrationHooks[version] == nil {
 		t.Fatalf("production hook is not registered for %s", version)
 	}
@@ -110,18 +110,18 @@ func TestRunMigrationsRepairsDingTalkGroupRouteIndexesBeforeRetry(t *testing.T) 
 		wantUnique bool
 	}{
 		{
-			version:    "305_dingtalk_group_route_installation_conversation_unique",
+			version:    "341_dingtalk_group_route_installation_conversation_unique",
 			index:      "idx_dingtalk_group_route_installation_conversation",
 			columns:    "installation_id, conversation_id",
 			wantUnique: true,
 		},
 		{
-			version: "306_dingtalk_group_route_workspace_index",
+			version: "342_dingtalk_group_route_workspace_index",
 			index:   "idx_dingtalk_group_route_workspace",
 			columns: "workspace_id",
 		},
 		{
-			version:    "307_dingtalk_group_route_id_unique",
+			version:    "343_dingtalk_group_route_id_unique",
 			index:      "idx_dingtalk_group_route_id_unique",
 			columns:    "id",
 			wantUnique: true,
@@ -267,7 +267,7 @@ func TestRunMigrationsRepairsInvalidConcurrentIndexDuringRollback(t *testing.T) 
 	})
 
 	const (
-		version   = "300_drop_redundant_issue_workspace_number_index"
+		version   = "336_drop_redundant_issue_workspace_number_index"
 		indexName = "idx_issue_workspace_number"
 	)
 	tableName := pgx.Identifier{schema, "issue"}.Sanitize()
@@ -474,7 +474,7 @@ func TestRunMigrationsRepairsInvalidTerminalCompletedAtIndex(t *testing.T) {
 	// the search_path — correct in production where it lives in public, but
 	// invisible from this test's private schema. So assert the registration
 	// exists, then run with a schema-qualified instance of the same hook.
-	const version = "261_agent_task_queue_terminal_completed_at_v2"
+	const version = "297_agent_task_queue_terminal_completed_at_v2"
 	if preMigrationHooks[version] == nil {
 		t.Fatalf("production hook is not registered for %s", version)
 	}
@@ -502,7 +502,7 @@ func TestRunMigrationsRepairsInvalidTerminalCompletedAtIndex(t *testing.T) {
 
 	// Only now is migration 262 safe: it drops v1 and the workspace is left
 	// with a valid index rather than none.
-	const dropVersion = "262_drop_agent_task_queue_terminal_completed_at_v1"
+	const dropVersion = "298_drop_agent_task_queue_terminal_completed_at_v1"
 	dropPath := filepath.Join(dir, dropVersion+".up.sql")
 	dropSQL := "DROP INDEX CONCURRENTLY IF EXISTS " + pgx.Identifier{schema, v1Index}.Sanitize() + ";\n"
 	if err := os.WriteFile(dropPath, []byte(dropSQL), 0o600); err != nil {
@@ -572,7 +572,7 @@ func TestRunMigrationsRepairsShareLinkIndexesBeforeRetry(t *testing.T) {
 		Hooks: hooksForDirection("up"),
 	}
 
-	opts.Files = realMigrationFiles(t, []string{"327_workspace_share_link"}, "up")
+	opts.Files = realMigrationFiles(t, []string{"363_workspace_share_link"}, "up")
 	if err := runMigrations(ctx, pool, opts); err != nil {
 		t.Fatalf("create share link table: %v", err)
 	}
@@ -596,8 +596,8 @@ func TestRunMigrationsRepairsShareLinkIndexesBeforeRetry(t *testing.T) {
 	// The hook has to drop the leftover before 328 retries, otherwise 329 has
 	// no usable index to promote.
 	opts.Files = realMigrationFiles(t, []string{
-		"328_workspace_share_link_id_uidx",
-		"329_workspace_share_link_primary_key",
+		"364_workspace_share_link_id_uidx",
+		"365_workspace_share_link_primary_key",
 	}, "up")
 	if err := runMigrations(ctx, pool, opts); err != nil {
 		t.Fatalf("retry share link primary key with invalid-index cleanup: %v", err)
@@ -623,8 +623,8 @@ func TestRunMigrationsRepairsShareLinkIndexesBeforeRetry(t *testing.T) {
 	// Second window: 330 and 331 build successfully, then the runner dies
 	// before recording them. The next run must be a clean no-op, not a wedge.
 	versions := []string{
-		"330_workspace_share_link_active_ws_uidx",
-		"331_workspace_share_link_code_uidx",
+		"366_workspace_share_link_active_ws_uidx",
+		"367_workspace_share_link_code_uidx",
 	}
 	opts.Files = realMigrationFiles(t, versions, "up")
 	if err := runMigrations(ctx, pool, opts); err != nil {

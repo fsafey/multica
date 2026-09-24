@@ -72,10 +72,10 @@ func TestDingTalkGroupRoutingRemovalMigrations(t *testing.T) {
 	}
 
 	for _, name := range []string{
-		"304_dingtalk_group_route.up.sql",
-		"305_dingtalk_group_route_installation_conversation_unique.up.sql",
-		"306_dingtalk_group_route_workspace_index.up.sql",
-		"307_dingtalk_group_route_id_unique.up.sql",
+		"340_dingtalk_group_route.up.sql",
+		"341_dingtalk_group_route_installation_conversation_unique.up.sql",
+		"342_dingtalk_group_route_workspace_index.up.sql",
+		"343_dingtalk_group_route_id_unique.up.sql",
 	} {
 		applyMigrationFile(t, ctx, conn.Conn(), name)
 	}
@@ -137,7 +137,7 @@ func TestDingTalkGroupRoutingRemovalMigrations(t *testing.T) {
 		t.Fatalf("seed outbound cards: %v", err)
 	}
 
-	applyMigrationFile(t, ctx, conn.Conn(), "382_remove_dingtalk_group_routing_bindings.up.sql")
+	applyMigrationFile(t, ctx, conn.Conn(), "418_remove_dingtalk_group_routing_bindings.up.sql")
 
 	assertMigrationRowCount(t, ctx, conn, "channel_chat_session_binding", 3)
 	assertMigrationRowCount(t, ctx, conn, "channel_outbound_card_message", 3)
@@ -157,13 +157,13 @@ func TestDingTalkGroupRoutingRemovalMigrations(t *testing.T) {
 	}
 
 	for _, name := range []string{
-		"383_create_dingtalk_group_presence.up.sql",
-		"384_create_dingtalk_group_presence_identity_index.up.sql",
-		"385_create_dingtalk_group_presence_activity_index.up.sql",
-		"386_backfill_dingtalk_group_presence.up.sql",
-		"387_create_dingtalk_bot_identity.up.sql",
-		"388_create_dingtalk_bot_identity_installation_index.up.sql",
-		"389_backfill_dingtalk_bot_identity.up.sql",
+		"419_create_dingtalk_group_presence.up.sql",
+		"420_create_dingtalk_group_presence_identity_index.up.sql",
+		"421_create_dingtalk_group_presence_activity_index.up.sql",
+		"422_backfill_dingtalk_group_presence.up.sql",
+		"423_create_dingtalk_bot_identity.up.sql",
+		"424_create_dingtalk_bot_identity_installation_index.up.sql",
+		"425_backfill_dingtalk_bot_identity.up.sql",
 	} {
 		applyMigrationFile(t, ctx, conn.Conn(), name)
 	}
@@ -269,14 +269,14 @@ func TestDingTalkGroupRoutingRemovalMigrations(t *testing.T) {
 	}
 
 	for _, name := range []string{
-		"389_backfill_dingtalk_bot_identity.down.sql",
-		"388_create_dingtalk_bot_identity_installation_index.down.sql",
-		"387_create_dingtalk_bot_identity.down.sql",
-		"386_backfill_dingtalk_group_presence.down.sql",
-		"385_create_dingtalk_group_presence_activity_index.down.sql",
-		"384_create_dingtalk_group_presence_identity_index.down.sql",
-		"383_create_dingtalk_group_presence.down.sql",
-		"382_remove_dingtalk_group_routing_bindings.down.sql",
+		"425_backfill_dingtalk_bot_identity.down.sql",
+		"424_create_dingtalk_bot_identity_installation_index.down.sql",
+		"423_create_dingtalk_bot_identity.down.sql",
+		"422_backfill_dingtalk_group_presence.down.sql",
+		"421_create_dingtalk_group_presence_activity_index.down.sql",
+		"420_create_dingtalk_group_presence_identity_index.down.sql",
+		"419_create_dingtalk_group_presence.down.sql",
+		"418_remove_dingtalk_group_routing_bindings.down.sql",
 	} {
 		applyMigrationFile(t, ctx, conn.Conn(), name)
 	}

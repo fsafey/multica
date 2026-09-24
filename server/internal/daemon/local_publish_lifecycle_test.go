@@ -129,17 +129,15 @@ func TestHandleTask_SerialPublishBackFinalizesBeforeTerminalReportAndMutexReleas
 			t.Cleanup(srv.Close)
 
 			d = &Daemon{
-				cfg:                 Config{DaemonID: "d-lifecycle"},
-				client:              NewClient(srv.URL),
-				logger:              slog.New(slog.NewTextHandler(io.Discard, nil)),
-				workspaces:          make(map[string]*workspaceState),
-				runtimeIndex:        map[string]Runtime{"rt-1": {ID: "rt-1", Provider: "claude"}},
-				activeEnvRoots:      make(map[string]int),
-				deletingEnvRoots:    make(map[string]bool),
-				activeCodexStores:   make(map[string]int),
-				deletingCodexStores: make(map[string]bool),
-				localPathLocks:      NewLocalPathLocker(),
-				cancelPollInterval:  time.Hour,
+				cfg:                Config{DaemonID: "d-lifecycle"},
+				client:             NewClient(srv.URL),
+				logger:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+				workspaces:         make(map[string]*workspaceState),
+				runtimeIndex:       map[string]Runtime{"rt-1": {ID: "rt-1", Provider: "claude"}},
+				activeEnvRoots:     make(map[string]int),
+				deletingEnvRoots:   make(map[string]bool),
+				localPathLocks:     NewLocalPathLocker(),
+				cancelPollInterval: time.Hour,
 			}
 			d.runner = taskRunnerFunc(func(_ context.Context, _ Task, _ string, _ int, _ *slog.Logger) (TaskResult, error) {
 				return TaskResult{
@@ -235,17 +233,15 @@ func TestHandleTask_SerialPublishBackServerCancellationNeverPublishes(t *testing
 	}))
 	t.Cleanup(srv.Close)
 	d := &Daemon{
-		cfg:                 Config{DaemonID: "d-cancel"},
-		client:              NewClient(srv.URL),
-		logger:              slog.New(slog.NewTextHandler(io.Discard, nil)),
-		workspaces:          make(map[string]*workspaceState),
-		runtimeIndex:        map[string]Runtime{"rt-1": {ID: "rt-1", Provider: "claude"}},
-		activeEnvRoots:      make(map[string]int),
-		deletingEnvRoots:    make(map[string]bool),
-		activeCodexStores:   make(map[string]int),
-		deletingCodexStores: make(map[string]bool),
-		localPathLocks:      NewLocalPathLocker(),
-		cancelPollInterval:  time.Hour,
+		cfg:                Config{DaemonID: "d-cancel"},
+		client:             NewClient(srv.URL),
+		logger:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		workspaces:         make(map[string]*workspaceState),
+		runtimeIndex:       map[string]Runtime{"rt-1": {ID: "rt-1", Provider: "claude"}},
+		activeEnvRoots:     make(map[string]int),
+		deletingEnvRoots:   make(map[string]bool),
+		localPathLocks:     NewLocalPathLocker(),
+		cancelPollInterval: time.Hour,
 	}
 	d.runner = taskRunnerFunc(func(_ context.Context, _ Task, _ string, _ int, _ *slog.Logger) (TaskResult, error) {
 		return TaskResult{Status: "completed", PublishBackWorktree: wt, PublishBackProvider: "claude"}, nil

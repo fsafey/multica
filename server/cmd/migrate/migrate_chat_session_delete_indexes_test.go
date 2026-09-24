@@ -64,9 +64,9 @@ func TestChatSessionDeleteIndexMigrationsPreserveCoverageAndRollback(t *testing.
 	}
 
 	versions := []string{
-		"472_agent_task_queue_chat_session_index",
-		"473_drop_agent_task_queue_chat_with_session_index",
-		"474_dingtalk_bot_identity_workspace_index",
+		"508_agent_task_queue_chat_session_index",
+		"509_drop_agent_task_queue_chat_with_session_index",
+		"510_dingtalk_bot_identity_workspace_index",
 	}
 	if err := runMigrations(ctx, pool, runOptions{
 		Direction:             "up",
@@ -113,9 +113,9 @@ func TestChatSessionDeleteIndexMigrationsPreserveCoverageAndRollback(t *testing.
 	`, "idx_agent_task_queue_chat_session")
 
 	reversedVersions := []string{
-		"474_dingtalk_bot_identity_workspace_index",
-		"473_drop_agent_task_queue_chat_with_session_index",
-		"472_agent_task_queue_chat_session_index",
+		"510_dingtalk_bot_identity_workspace_index",
+		"509_drop_agent_task_queue_chat_with_session_index",
+		"508_agent_task_queue_chat_session_index",
 	}
 	if err := runMigrations(ctx, pool, runOptions{
 		Direction:             "down",

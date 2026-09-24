@@ -277,7 +277,7 @@ func TestCancelCommentAssigneeFallbacksMigration(t *testing.T) {
 		}
 		want[dbfx.Task(t, agentID, cols)] = tc.want
 	}
-	sql, err := os.ReadFile("../../migrations/456_cancel_comment_assignee_fallbacks.up.sql")
+	sql, err := os.ReadFile("../../migrations/492_cancel_comment_assignee_fallbacks.up.sql")
 	if err != nil {
 		t.Fatal(err)
 	}

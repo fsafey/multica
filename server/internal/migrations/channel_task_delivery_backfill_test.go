@@ -77,7 +77,7 @@ func TestChatOriginHookBackfillsOnlyFirstPartySessionsInShortPages(t *testing.T)
 		t.Fatalf("create legacy fixture: %v", err)
 	}
 
-	if _, err := conn.Exec(ctx, readMigrationFile(t, "420_channel_chat_route_generation.up.sql")); err != nil {
+	if _, err := conn.Exec(ctx, readMigrationFile(t, "456_channel_chat_route_generation.up.sql")); err != nil {
 		t.Fatalf("apply migration: %v", err)
 	}
 	var preHookCount int
@@ -255,7 +255,7 @@ func TestChannelTaskDeliveryBackfillSnapshotsOnlyTasksWithLiveRoutingData(t *tes
 				}
 			}
 
-			_, err = conn.Exec(ctx, readMigrationFile(t, "427_channel_task_delivery_backfill.up.sql"))
+			_, err = conn.Exec(ctx, readMigrationFile(t, "463_channel_task_delivery_backfill.up.sql"))
 			if err != nil {
 				t.Fatalf("apply migration: %v", err)
 			}
@@ -308,10 +308,10 @@ func TestChannelTaskDeliveryPrimaryKeyReusesConcurrentIndex(t *testing.T) {
 	`); err != nil {
 		t.Fatalf("create delivery table: %v", err)
 	}
-	if _, err := conn.Exec(ctx, readMigrationFile(t, "423_channel_task_delivery_pkey_index.up.sql")); err != nil {
+	if _, err := conn.Exec(ctx, readMigrationFile(t, "459_channel_task_delivery_pkey_index.up.sql")); err != nil {
 		t.Fatalf("build concurrent unique index: %v", err)
 	}
-	if _, err := conn.Exec(ctx, readMigrationFile(t, "424_channel_task_delivery_primary_key.up.sql")); err != nil {
+	if _, err := conn.Exec(ctx, readMigrationFile(t, "460_channel_task_delivery_primary_key.up.sql")); err != nil {
 		t.Fatalf("attach primary key: %v", err)
 	}
 

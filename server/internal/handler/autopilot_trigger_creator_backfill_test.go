@@ -76,7 +76,7 @@ func TestMigration467BackfillsTriggerCreatorFromAutopilot(t *testing.T) {
 		t.Fatalf("pre-backfill webhook = %v, want skipped: the legacy trigger has no principal yet", before)
 	}
 
-	migration, err := os.ReadFile("../../migrations/467_autopilot_trigger_creator_from_autopilot.up.sql")
+	migration, err := os.ReadFile("../../migrations/503_autopilot_trigger_creator_from_autopilot.up.sql")
 	if err != nil {
 		t.Fatal(err)
 	}

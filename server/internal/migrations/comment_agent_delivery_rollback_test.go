@@ -47,13 +47,13 @@ func TestCommentAgentDeliveryRollbackMigrationRemovesRevertedSchema(t *testing.T
 		t.Fatalf("create reverted feature schema: %v", err)
 	}
 
-	applyMigrationFile(t, ctx, conn.Conn(), "534_drop_comment_agent_delivery.up.sql")
+	applyMigrationFile(t, ctx, conn.Conn(), "570_drop_comment_agent_delivery.up.sql")
 	assertCommentAgentDeliveryTableMissing(t, ctx, conn)
 
 	// Both fresh installs and a retried migration see no table. The cleanup is
 	// deliberately idempotent and its down direction must not recreate data.
-	applyMigrationFile(t, ctx, conn.Conn(), "534_drop_comment_agent_delivery.up.sql")
-	applyMigrationFile(t, ctx, conn.Conn(), "534_drop_comment_agent_delivery.down.sql")
+	applyMigrationFile(t, ctx, conn.Conn(), "570_drop_comment_agent_delivery.up.sql")
+	applyMigrationFile(t, ctx, conn.Conn(), "570_drop_comment_agent_delivery.down.sql")
 	assertCommentAgentDeliveryTableMissing(t, ctx, conn)
 }
 

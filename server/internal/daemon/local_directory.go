@@ -41,6 +41,8 @@ type localDirectoryRef struct {
 	DaemonID      string `json:"daemon_id"`
 	Label         string `json:"label,omitempty"`
 	ExecutionMode string `json:"execution_mode,omitempty"`
+	Isolate       bool   `json:"isolate,omitempty"`
+	PublishBack   string `json:"publish_back,omitempty"`
 }
 
 // localDirectoryAssignment is the resolved view of a task's local_directory
@@ -62,6 +64,38 @@ type localDirectoryAssignment struct {
 // on this rather than on "is there a local_directory assignment at all".
 func (a *localDirectoryAssignment) UsesWorktree() bool {
 	return a != nil && strings.TrimSpace(a.Ref.ExecutionMode) == localDirectoryModeWorktree
+}
+
+func (a *localDirectoryAssignment) UsesForkIsolation() bool {
+	return a != nil && a.Ref.Isolate
+}
+
+// mutexKey serializes every path within one git repository against its
+// canonical root. Publish-back requires a git repository; ordinary in-place
+// directories may use their resolved path instead.
+func (a *localDirectoryAssignment) mutexKey() (string, error) {
+	if a == nil {
+		return "", errors.New("local_directory: assignment is nil")
+	}
+	cmd := exec.Command("git", "-C", a.AbsPath, "rev-parse", "--show-toplevel")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		if a.Ref.PublishBack != "" {
+			return "", fmt.Errorf("local_directory: publish_back=%s requires a git repository: %s: %w", a.Ref.PublishBack, strings.TrimSpace(stderr.String()), err)
+		}
+		return a.RealPath, nil
+	}
+	root := strings.TrimSpace(string(out))
+	if root == "" {
+		return "", errors.New("local_directory: git resolved an empty toplevel")
+	}
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", fmt.Errorf("local_directory: resolve git toplevel %q: %w", root, err)
+	}
+	return filepath.Clean(realRoot), nil
 }
 
 // DisplayName is the human-facing name for this directory, safe to render in
@@ -99,6 +133,9 @@ func (a *localDirectoryAssignment) ValidateExecutionMode() error {
 	}
 	switch strings.TrimSpace(a.Ref.ExecutionMode) {
 	case "", localDirectoryModeInPlace, localDirectoryModeWorktree:
+		if a.Ref.Isolate && a.UsesWorktree() {
+			return errors.New("local_directory: isolate and execution_mode=worktree cannot be combined")
+		}
 		return nil
 	default:
 		return fmt.Errorf(
@@ -181,6 +218,7 @@ func findLocalDirectoryAssignment(resources []ProjectResourceData, daemonID stri
 			return nil, fmt.Errorf("local_directory: parse resource_ref: %w", err)
 		}
 		ref.DaemonID = strings.TrimSpace(ref.DaemonID)
+		ref.ExecutionMode = strings.TrimSpace(ref.ExecutionMode)
 		ref.PublishBack = strings.TrimSpace(ref.PublishBack)
 		if ref.DaemonID == "" {
 			return nil, errors.New("local_directory: resource_ref missing daemon_id")
@@ -199,6 +237,9 @@ func findLocalDirectoryAssignment(resources []ProjectResourceData, daemonID stri
 			}
 		default:
 			return nil, fmt.Errorf("local_directory: unsupported publish_back mode %q", ref.PublishBack)
+		}
+		if ref.Isolate && ref.ExecutionMode == localDirectoryModeWorktree {
+			return nil, errors.New("local_directory: isolate and execution_mode=worktree cannot be combined")
 		}
 		if match != nil {
 			// Server-side invariant: at most one local_directory per

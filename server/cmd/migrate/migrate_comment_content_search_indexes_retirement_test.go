@@ -61,8 +61,8 @@ func TestCommentContentSearchIndexesRetirement(t *testing.T) {
 	}
 
 	versions := []string{
-		"454_drop_comment_content_bigm_index",
-		"455_drop_comment_content_trgm_index",
+		"490_drop_comment_content_bigm_index",
+		"491_drop_comment_content_trgm_index",
 	}
 	options := runOptions{
 		Direction:             "up",

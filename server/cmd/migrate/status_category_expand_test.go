@@ -32,7 +32,7 @@ func TestStatusCategoryExpandUpgradePaths(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			execFile("332_issue_status")
+			execFile("368_issue_status")
 			for _, key := range issuestatus.Canonical() {
 				_, err := pool.Exec(ctx, `INSERT INTO issue_status(workspace_id,key,name,category,color,is_system,archived_at)
       VALUES ('00000000-0000-0000-0000-000000000001',$1,'System',$1,'#123456',true,NULL),
@@ -42,7 +42,7 @@ func TestStatusCategoryExpandUpgradePaths(t *testing.T) {
 				}
 			}
 			opts := f.opts()
-			opts.Files = realMigrationFiles(t, []string{"469_issue_status_lifecycle_categories"}, "up")
+			opts.Files = realMigrationFiles(t, []string{"505_issue_status_lifecycle_categories"}, "up")
 			if applied {
 				if err := runMigrations(ctx, pool, opts); err != nil {
 					t.Fatal(err)
@@ -52,7 +52,7 @@ func TestStatusCategoryExpandUpgradePaths(t *testing.T) {
 			if err := pool.QueryRow(ctx, `SELECT jsonb_agg(to_jsonb(s) ORDER BY key)::text FROM issue_status s`).Scan(&before); err != nil {
 				t.Fatal(err)
 			}
-			opts.Files = realMigrationFiles(t, []string{"469_issue_status_lifecycle_categories", "478_issue_status_category_expand"}, "up")
+			opts.Files = realMigrationFiles(t, []string{"505_issue_status_lifecycle_categories", "514_issue_status_category_expand"}, "up")
 			opts.Conditions = conditionsForDirection("up")
 			if !applied {
 				// A normal reader prevents the expand DDL. The real runner must time out,
@@ -71,7 +71,7 @@ func TestStatusCategoryExpandUpgradePaths(t *testing.T) {
 					t.Fatalf("expected bounded lock timeout, got %v", err)
 				}
 				t.Logf("reader contention stopped expand after %s", time.Since(start))
-				assertMigrationVersionRecorded(t, ctx, pool, f.schema, "478_issue_status_category_expand", false)
+				assertMigrationVersionRecorded(t, ctx, pool, f.schema, "514_issue_status_category_expand", false)
 				if err := reader.Rollback(ctx); err != nil {
 					t.Fatal(err)
 				}
@@ -82,7 +82,7 @@ func TestStatusCategoryExpandUpgradePaths(t *testing.T) {
 				}
 			}
 			// Also replay the actual SQL after an uncertain ledger acknowledgement.
-			execFile("478_issue_status_category_expand")
+			execFile("514_issue_status_category_expand")
 			var after string
 			if err := pool.QueryRow(ctx, `SELECT jsonb_agg(to_jsonb(s) ORDER BY key)::text FROM issue_status s`).Scan(&after); err != nil {
 				t.Fatal(err)
@@ -119,8 +119,8 @@ func TestStatusCategoryExpandUpgradePaths(t *testing.T) {
 			if _, err := pool.Exec(ctx, `UPDATE issue_status SET category = 'started' WHERE key = 'cancelled'`); err == nil {
 				t.Fatal("noncanonical built-in pair accepted")
 			}
-			assertMigrationVersionRecorded(t, ctx, pool, f.schema, "469_issue_status_lifecycle_categories", true)
-			assertMigrationVersionRecorded(t, ctx, pool, f.schema, "478_issue_status_category_expand", true)
+			assertMigrationVersionRecorded(t, ctx, pool, f.schema, "505_issue_status_lifecycle_categories", true)
+			assertMigrationVersionRecorded(t, ctx, pool, f.schema, "514_issue_status_category_expand", true)
 		})
 	}
 }

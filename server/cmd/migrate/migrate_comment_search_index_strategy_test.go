@@ -29,27 +29,27 @@ func TestCommentSearchIndexStrategyChoosesOneUsableIndexPerEnvironment(t *testin
 	}{
 		{
 			name:              "self-host without preferred index builds and keeps fallback",
-			versions:          []string{"140_comment_content_trgm_index", "371_comment_content_search_index_strategy"},
+			versions:          []string{"140_comment_content_trgm_index", "407_comment_content_search_index_strategy"},
 			wantFallbackAfter: true,
 		},
 		{
 			name: "fresh pg_bigm-like environment skips fallback build",
 			createPreferred: `CREATE INDEX idx_comment_content_bigm
 				ON comment USING gin (LOWER(content) public.gin_trgm_ops)`,
-			versions: []string{"140_comment_content_trgm_index", "371_comment_content_search_index_strategy"},
+			versions: []string{"140_comment_content_trgm_index", "407_comment_content_search_index_strategy"},
 		},
 		{
 			name: "existing deployment with both indexes drops fallback",
 			createPreferred: `CREATE INDEX idx_comment_content_bigm
 				ON comment USING gin (LOWER(content) public.gin_trgm_ops)`,
 			createFallback: true,
-			versions:       []string{"371_comment_content_search_index_strategy"},
+			versions:       []string{"407_comment_content_search_index_strategy"},
 		},
 		{
 			name: "same-named but wrong preferred index preserves fallback",
 			createPreferred: `CREATE INDEX idx_comment_content_bigm
 				ON comment (LOWER(content))`,
-			versions:          []string{"140_comment_content_trgm_index", "371_comment_content_search_index_strategy"},
+			versions:          []string{"140_comment_content_trgm_index", "407_comment_content_search_index_strategy"},
 			wantFallbackAfter: true,
 		},
 	}
@@ -100,7 +100,7 @@ func TestCommentSearchIndexStrategyChoosesOneUsableIndexPerEnvironment(t *testin
 			}
 			conditions := map[string]migrationCondition{
 				"140_comment_content_trgm_index":            whenIndexNotUsable(requirement),
-				"371_comment_content_search_index_strategy": whenIndexUsable(requirement),
+				"407_comment_content_search_index_strategy": whenIndexUsable(requirement),
 			}
 			migrationsTable := schema + ".schema_migrations"
 			if err := runMigrations(ctx, pool, runOptions{
@@ -126,7 +126,7 @@ func TestCommentSearchIndexStrategyChoosesOneUsableIndexPerEnvironment(t *testin
 			// database where it was retained, IF NOT EXISTS makes this a no-op.
 			if err := runMigrations(ctx, pool, runOptions{
 				Direction:             "down",
-				Files:                 realMigrationFiles(t, []string{"371_comment_content_search_index_strategy"}, "down"),
+				Files:                 realMigrationFiles(t, []string{"407_comment_content_search_index_strategy"}, "down"),
 				SchemaMigrationsTable: migrationsTable,
 				AdvisoryLockKey:       int64(rand.Uint64()&0x7fffffffffffffff) | 1,
 				Hooks:                 hooksForDirection("down"),
@@ -134,7 +134,7 @@ func TestCommentSearchIndexStrategyChoosesOneUsableIndexPerEnvironment(t *testin
 				t.Fatalf("roll back search index strategy: %v", err)
 			}
 			assertIndexValidity(t, pool, schema, "idx_comment_content_trgm", true)
-			assertMigrationVersionRecorded(t, ctx, pool, schema, "371_comment_content_search_index_strategy", false)
+			assertMigrationVersionRecorded(t, ctx, pool, schema, "407_comment_content_search_index_strategy", false)
 		})
 	}
 }

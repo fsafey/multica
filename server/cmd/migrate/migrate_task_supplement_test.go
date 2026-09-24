@@ -20,13 +20,13 @@ func TestTaskSupplementMigrationsUpDownUpInIsolatedSchema(t *testing.T) {
 
 	for _, direction := range []string{"up", "down", "up"} {
 		versions := []string{
-			"538_task_supplement",
-			"539_task_supplement_request_index",
-			"540_task_supplement_capability_index",
-			"541_task_supplement_comment_index",
-			"542_task_supplement_primary_key",
-			"543_task_supplement_teardown_guard",
-			"544_task_supplement_application_settlement",
+			"574_task_supplement",
+			"575_task_supplement_request_index",
+			"576_task_supplement_capability_index",
+			"577_task_supplement_comment_index",
+			"578_task_supplement_primary_key",
+			"579_task_supplement_teardown_guard",
+			"580_task_supplement_application_settlement",
 		}
 		if direction == "down" {
 			slices.Reverse(versions)

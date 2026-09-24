@@ -37,14 +37,14 @@ func TestSourceContextMigrationsRollbackFailsClosedWithCapturedData(t *testing.T
 	}
 
 	versions := []string{
-		"407_issue_source_context",
-		"408_issue_source_context_id_index",
-		"409_issue_source_context_issue_index",
-		"410_issue_source_context_origin_task_index",
-		"411_attachment_source_context_index",
-		"412_issue_source_context_object_intent_key_index",
-		"413_issue_source_context_object_intent_due_index",
-		"414_issue_source_context_object_intent_context_index",
+		"443_issue_source_context",
+		"444_issue_source_context_id_index",
+		"445_issue_source_context_issue_index",
+		"446_issue_source_context_origin_task_index",
+		"447_attachment_source_context_index",
+		"448_issue_source_context_object_intent_key_index",
+		"449_issue_source_context_object_intent_due_index",
+		"450_issue_source_context_object_intent_context_index",
 	}
 	options := runOptions{
 		Direction:             "up",

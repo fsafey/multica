@@ -194,7 +194,7 @@ func TestTaskExecutionEvidenceEndToEnd(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("insert task usage: %v", err)
 	}
-	absoluteWorkDir := "/Users/private/multica_workspaces/" + testWorkspaceID + "/" + shortTaskID(taskID) + "/workdir"
+	absoluteWorkDir := "/Users/private/multica_workspaces/" + testWorkspaceID + "/" + legacyTaskDirSegment(taskID) + "/workdir"
 	if _, err := testPool.Exec(ctx, `
 		UPDATE agent_task_queue
 		SET status = 'completed',
@@ -246,7 +246,7 @@ func TestTaskExecutionEvidenceEndToEnd(t *testing.T) {
 	if response.ExecutionSnapshotDigest == "" || response.EvidenceManifestDigest == "" {
 		t.Fatalf("evidence digests are missing: %#v", response)
 	}
-	if response.Task.WorkDir != testWorkspaceID+"/"+shortTaskID(taskID)+"/workdir" {
+	if response.Task.WorkDir != testWorkspaceID+"/"+legacyTaskDirSegment(taskID)+"/workdir" {
 		t.Fatalf("privacy-safe workdir = %q", response.Task.WorkDir)
 	}
 

@@ -59,7 +59,7 @@ func TestChannelOutboundMessageDownRefusesExplicitChannelChat(t *testing.T) {
 		t.Fatalf("create fixture: %v", err)
 	}
 
-	if _, err := conn.Exec(ctx, readMigrationFile(t, "425_channel_outbound_message.down.sql")); err == nil ||
+	if _, err := conn.Exec(ctx, readMigrationFile(t, "461_channel_outbound_message.down.sql")); err == nil ||
 		!strings.Contains(err.Error(), "cannot roll back channel chat routes") {
 		t.Fatalf("down migration error = %v, want explicit channel Chat refusal", err)
 	}
@@ -74,7 +74,7 @@ func TestChannelOutboundMessageDownRefusesExplicitChannelChat(t *testing.T) {
 	if _, err := conn.Exec(ctx, `UPDATE chat_session SET explicitly_created_at = NULL`); err != nil {
 		t.Fatalf("clear explicit origin: %v", err)
 	}
-	applyMigrationFile(t, ctx, conn.Conn(), "425_channel_outbound_message.down.sql")
+	applyMigrationFile(t, ctx, conn.Conn(), "461_channel_outbound_message.down.sql")
 	if err := conn.QueryRow(ctx, `SELECT to_regclass('channel_outbound_message') IS NOT NULL`).Scan(&outboundExists); err != nil {
 		t.Fatalf("check dropped outbound table: %v", err)
 	}

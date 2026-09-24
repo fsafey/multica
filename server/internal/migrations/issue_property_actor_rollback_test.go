@@ -50,7 +50,7 @@ func TestIssuePropertyActorRollbackFailsClosed(t *testing.T) {
 		t.Fatalf("create temporary issue_property table: %v", err)
 	}
 
-	applyMigrationFile(t, ctx, conn.Conn(), "341_issue_property_actor_types.up.sql")
+	applyMigrationFile(t, ctx, conn.Conn(), "377_issue_property_actor_types.up.sql")
 
 	const workspaceID = "00000000-0000-0000-0000-000000000001"
 	if _, err := conn.Exec(ctx, `
@@ -68,7 +68,7 @@ func TestIssuePropertyActorRollbackFailsClosed(t *testing.T) {
 		t.Fatalf("insert archived actor property definition: %v", err)
 	}
 
-	downSQL := readMigrationFile(t, "341_issue_property_actor_types.down.sql")
+	downSQL := readMigrationFile(t, "377_issue_property_actor_types.down.sql")
 	_, err = conn.Exec(ctx, downSQL)
 	if err == nil {
 		t.Fatal("down migration succeeded with actor definitions present; it must fail closed")
@@ -95,7 +95,7 @@ func TestIssuePropertyActorRollbackFailsClosed(t *testing.T) {
 		t.Fatalf("convert actor definitions to text: %v", err)
 	}
 
-	applyMigrationFile(t, ctx, conn.Conn(), "341_issue_property_actor_types.down.sql")
+	applyMigrationFile(t, ctx, conn.Conn(), "377_issue_property_actor_types.down.sql")
 
 	if _, err := conn.Exec(ctx, `
 		INSERT INTO issue_property (workspace_id, name, type)

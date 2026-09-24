@@ -79,6 +79,7 @@ WITH incoming AS (
         NULLIF(m.output_truncated, '')::bool,
         NULLIF(m.call_id, '')
     FROM incoming AS m
+    ON CONFLICT (task_id, seq) DO NOTHING
     RETURNING *
 )
 SELECT * FROM inserted ORDER BY seq ASC;
@@ -101,3 +102,7 @@ ORDER BY seq ASC;
 -- name: DeleteTaskMessages :exec
 DELETE FROM task_message
 WHERE task_id = $1;
+
+-- name: GetTaskMessageBySequence :one
+SELECT * FROM task_message
+WHERE task_id = $1 AND seq = $2;

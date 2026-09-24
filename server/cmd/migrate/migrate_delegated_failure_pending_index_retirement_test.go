@@ -56,8 +56,8 @@ func TestDelegatedFailurePendingIndexRetirement(t *testing.T) {
 		Hooks:                 hooksForDirection("up"),
 	}
 	options.Files = realMigrationFiles(t, []string{
-		"343_comment_delegated_failure_pending_index",
-		"444_comment_recovery_settled_at",
+		"379_comment_delegated_failure_pending_index",
+		"480_comment_recovery_settled_at",
 	}, "up")
 	if err := runMigrations(ctx, pool, options); err != nil {
 		t.Fatalf("apply historical delegated-failure migrations: %v", err)
@@ -79,7 +79,7 @@ func TestDelegatedFailurePendingIndexRetirement(t *testing.T) {
 	}
 
 	options.Files = realMigrationFiles(t, []string{
-		"445_comment_delegated_failure_unsettled_index",
+		"481_comment_delegated_failure_unsettled_index",
 	}, "up")
 	if err := runMigrations(ctx, pool, options); err != nil {
 		t.Fatalf("apply replacement delegated-failure index migration: %v", err)
@@ -87,7 +87,7 @@ func TestDelegatedFailurePendingIndexRetirement(t *testing.T) {
 	assertIndexValidity(t, pool, schema, "idx_comment_delegated_failure_pending", true)
 	assertIndexValidity(t, pool, schema, "idx_comment_delegated_failure_unsettled", true)
 
-	const version = "450_drop_comment_delegated_failure_pending_index"
+	const version = "486_drop_comment_delegated_failure_pending_index"
 	options.Files = realMigrationFiles(t, []string{version}, "up")
 	if err := runMigrations(ctx, pool, options); err != nil {
 		t.Fatalf("apply delegated-failure index retirement migration: %v", err)

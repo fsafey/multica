@@ -337,7 +337,7 @@ func (d *Daemon) healthHandler(startedAt time.Time) http.HandlerFunc {
 		// liveness/diagnostics, so callers must not treat a reachable endpoint
 		// as ready — they gate on this status. Consumers that only know
 		// "running" (older CLI/desktop) safely treat "starting" as not-ready.
-		claimsPaused, draining, claimsInFlight, activeTaskCount := d.claimState()
+		_, draining, _, _ := d.claimState()
 
 		status := "starting"
 		if d.ready.Load() {

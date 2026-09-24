@@ -83,7 +83,7 @@ func TestChannelReplyDeliveryAttemptDepthUpgradesAnInstalledTable(t *testing.T) 
 		t.Fatalf("seed an installed row: %v", err)
 	}
 
-	upgrade, err := os.ReadFile("../../migrations/506_channel_reply_delivery_attempt_depth.up.sql")
+	upgrade, err := os.ReadFile("../../migrations/542_channel_reply_delivery_attempt_depth.up.sql")
 	if err != nil {
 		t.Fatalf("read the upgrade migration: %v", err)
 	}

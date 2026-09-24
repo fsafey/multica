@@ -25,7 +25,7 @@ func TestIssueTriageStateMigration(t *testing.T) {
 		t.Fatalf("seed pre-existing issues: %v", err)
 	}
 
-	applyMigrationFile(t, ctx, s.pool, "483_issue_triage_state.up.sql")
+	applyMigrationFile(t, ctx, s.pool, "519_issue_triage_state.up.sql")
 
 	if s.triageStateValidated(t, ctx) {
 		t.Error("483 validated the CHECK, scanning the issue table under ACCESS EXCLUSIVE")
@@ -35,7 +35,7 @@ func TestIssueTriageStateMigration(t *testing.T) {
 	}
 	s.assertTriageStateEnforced(t, ctx, "483")
 
-	applyMigrationFile(t, ctx, s.pool, "489_issue_triage_state_validate.up.sql")
+	applyMigrationFile(t, ctx, s.pool, "525_issue_triage_state_validate.up.sql")
 
 	if !s.triageStateValidated(t, ctx) {
 		t.Error("489 left the CHECK NOT VALID")
@@ -44,14 +44,14 @@ func TestIssueTriageStateMigration(t *testing.T) {
 
 	// Rolling back the validation cannot restore a validated constraint, so it
 	// has to leave the state 483 produced rather than no constraint at all.
-	applyMigrationFile(t, ctx, s.pool, "489_issue_triage_state_validate.down.sql")
+	applyMigrationFile(t, ctx, s.pool, "525_issue_triage_state_validate.down.sql")
 
 	if s.triageStateValidated(t, ctx) {
 		t.Error("489 down left the CHECK validated")
 	}
 	s.assertTriageStateEnforced(t, ctx, "489 down")
 
-	applyMigrationFile(t, ctx, s.pool, "483_issue_triage_state.down.sql")
+	applyMigrationFile(t, ctx, s.pool, "519_issue_triage_state.down.sql")
 
 	var columnExists bool
 	if err := s.pool.QueryRow(ctx, `

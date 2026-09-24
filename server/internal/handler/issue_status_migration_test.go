@@ -26,7 +26,7 @@ func TestIssueStatusLifecycleMigrationPreservesIdentity(t *testing.T) {
 	if _, err := tx.Exec(ctx, "SET LOCAL search_path TO "+pgx.Identifier{schema}.Sanitize()+", public"); err != nil {
 		t.Fatal(err)
 	}
-	old, err := os.ReadFile("../../migrations/332_issue_status.up.sql")
+	old, err := os.ReadFile("../../migrations/368_issue_status.up.sql")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +51,7 @@ func TestIssueStatusLifecycleMigrationPreservesIdentity(t *testing.T) {
 	if _, err := tx.Exec(ctx, "CREATE TEMP TABLE catalog_before AS SELECT * FROM issue_status"); err != nil {
 		t.Fatal(err)
 	}
-	migration, err := os.ReadFile("../../migrations/469_issue_status_lifecycle_categories.up.sql")
+	migration, err := os.ReadFile("../../migrations/505_issue_status_lifecycle_categories.up.sql")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +102,7 @@ func TestIssueStatusLifecycleMigrationPreservesIdentity(t *testing.T) {
 	if _, err := tx.Exec(ctx, "CREATE TEMP TABLE catalog_before_icon AS SELECT * FROM issue_status"); err != nil {
 		t.Fatal(err)
 	}
-	iconMigration, err := os.ReadFile("../../migrations/470_issue_status_icon.up.sql")
+	iconMigration, err := os.ReadFile("../../migrations/506_issue_status_icon.up.sql")
 	if err != nil {
 		t.Fatal(err)
 	}

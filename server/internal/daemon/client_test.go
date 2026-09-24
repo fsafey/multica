@@ -17,7 +17,6 @@ import (
 	"github.com/multica-ai/multica/server/pkg/remotemcp"
 	"time"
 
-	"github.com/multica-ai/multica/server/pkg/executionevidence"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 

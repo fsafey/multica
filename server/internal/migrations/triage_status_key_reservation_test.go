@@ -135,10 +135,10 @@ func TestTriageStatusKeyReservationIsNotApplied(t *testing.T) {
 	}
 
 	for _, file := range []string{
-		"475_issue_status_key_not_reserved.up.sql",
-		"476_reserve_triage_status_key.up.sql",
-		"477_issue_effective_status_triage.up.sql",
-		"490_drop_triage_status_key_reservation.up.sql",
+		"511_issue_status_key_not_reserved.up.sql",
+		"512_reserve_triage_status_key.up.sql",
+		"513_issue_effective_status_triage.up.sql",
+		"526_drop_triage_status_key_reservation.up.sql",
 	} {
 		applyMigrationFile(t, ctx, s.pool, file)
 	}
@@ -195,7 +195,7 @@ func TestDropTriageStatusKeyReservationRepairsAMigratedDatabase(t *testing.T) {
 	assertInsertCheckViolation(t, ctx, s.pool,
 		`INSERT INTO issue_status (workspace_id, key, category) VALUES ($1, 'triage', 'todo')`, triageWSOwner)
 
-	applyMigrationFile(t, ctx, s.pool, "490_drop_triage_status_key_reservation.up.sql")
+	applyMigrationFile(t, ctx, s.pool, "526_drop_triage_status_key_reservation.up.sql")
 
 	if s.reservationExists(t, ctx) {
 		t.Fatal("490 left the barrier in place")
@@ -207,7 +207,7 @@ func TestDropTriageStatusKeyReservationRepairsAMigratedDatabase(t *testing.T) {
 
 	// Rolling 490 back must not hand the barrier back: a row it forbids now
 	// exists, and the server no longer reads the key as anything special.
-	applyMigrationFile(t, ctx, s.pool, "490_drop_triage_status_key_reservation.down.sql")
+	applyMigrationFile(t, ctx, s.pool, "526_drop_triage_status_key_reservation.down.sql")
 	if s.reservationExists(t, ctx) {
 		t.Error("490 down restored a barrier the catalog would violate")
 	}

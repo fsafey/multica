@@ -18,8 +18,8 @@ import (
 // before it will consider it. Applying 446 alone leaves the index built, valid
 // and ignored.
 var issuePropertiesBigramMigrations = []string{
-	"446_issue_properties_bigm_index",
-	"447_issue_properties_bigm_index_statistics",
+	"482_issue_properties_bigm_index",
+	"483_issue_properties_bigm_index_statistics",
 }
 
 // TestIssuePropertiesBigramIndexBuildsOnlyWherePGBigmExists runs migrations 446
@@ -162,7 +162,7 @@ func TestIssuePropertiesBigramIndexNeedsAnalyzeForItsExpression(t *testing.T) {
 		}
 	}
 
-	applyMigration(t, "446_issue_properties_bigm_index")
+	applyMigration(t, "482_issue_properties_bigm_index")
 	assertIndexValidity(t, pool, schema, "idx_issue_properties_bigm", true)
 	withoutStatistics := estimatedRows(t, ctx, pool, prefilterQuery)
 	if withoutStatistics < actual*10 {
@@ -171,7 +171,7 @@ func TestIssuePropertiesBigramIndexNeedsAnalyzeForItsExpression(t *testing.T) {
 			withoutStatistics, actual)
 	}
 
-	applyMigration(t, "447_issue_properties_bigm_index_statistics")
+	applyMigration(t, "483_issue_properties_bigm_index_statistics")
 	if got := statisticsRowCount(t, ctx, pool, schema, "idx_issue_properties_bigm"); got == 0 {
 		t.Fatal("447 generated no statistics for the LOWER(properties::text) expression")
 	}

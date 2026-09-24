@@ -38,10 +38,10 @@ func TestRedundantIndexMigrationsPreserveCoveringQueryPlansAndRollback(t *testin
 	createRedundantIndexFixture(t, ctx, pool)
 
 	versions := []string{
-		"300_drop_redundant_issue_workspace_number_index",
-		"301_drop_redundant_sys_cron_job_plan_index",
-		"302_drop_redundant_channel_chat_session_binding_index",
-		"303_drop_redundant_lark_chat_session_binding_index",
+		"336_drop_redundant_issue_workspace_number_index",
+		"337_drop_redundant_sys_cron_job_plan_index",
+		"338_drop_redundant_channel_chat_session_binding_index",
+		"339_drop_redundant_lark_chat_session_binding_index",
 	}
 	indexNames := []string{
 		"idx_issue_workspace_number",

@@ -128,7 +128,9 @@ const (
 	// same directory run concurrently and deliver their work as a branch.
 	// Only valid when the directory is a git working tree — the daemon
 	// verifies that at task time, since the server can't see the filesystem.
-	localDirectoryModeWorktree = "worktree"
+	localDirectoryModeWorktree        = "worktree"
+	localDirectoryPublishBackSerialFF = "serial_ff"
+	localDirectoryPublishSubmitBundle = "submit_bundle"
 )
 
 // localDirectoryRef is the JSONB shape stored for resource_type=local_directory.
@@ -146,6 +148,8 @@ type localDirectoryRef struct {
 	DaemonID      string `json:"daemon_id"`
 	Label         string `json:"label,omitempty"`
 	ExecutionMode string `json:"execution_mode,omitempty"`
+	Isolate       bool   `json:"isolate,omitempty"`
+	PublishBack   string `json:"publish_back,omitempty"`
 }
 
 // requireWorktreeCapableDaemon rejects saving a local_directory ref that asks
@@ -289,11 +293,24 @@ func validateLocalDirectoryRef(ref json.RawMessage) (json.RawMessage, error) {
 	}
 	payload.Label = strings.TrimSpace(payload.Label)
 	payload.ExecutionMode = strings.TrimSpace(payload.ExecutionMode)
+	payload.PublishBack = strings.TrimSpace(payload.PublishBack)
 	switch payload.ExecutionMode {
 	case "", localDirectoryModeInPlace, localDirectoryModeWorktree:
 	default:
 		return nil, fmt.Errorf("local_directory: execution_mode must be %q or %q, got %q",
 			localDirectoryModeInPlace, localDirectoryModeWorktree, payload.ExecutionMode)
+	}
+	if payload.Isolate && payload.ExecutionMode == localDirectoryModeWorktree {
+		return nil, errors.New("local_directory: isolate and execution_mode=worktree cannot be combined")
+	}
+	switch payload.PublishBack {
+	case "":
+	case localDirectoryPublishBackSerialFF, localDirectoryPublishSubmitBundle:
+		if !payload.Isolate {
+			return nil, errors.New("local_directory: publish_back requires isolate=true")
+		}
+	default:
+		return nil, fmt.Errorf("local_directory: unsupported publish_back mode %q", payload.PublishBack)
 	}
 	out, err := json.Marshal(payload)
 	if err != nil {

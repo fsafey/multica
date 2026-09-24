@@ -241,9 +241,8 @@ func TestReportTaskMessagesPublishesInSeqOrder(t *testing.T) {
 // leave a prefix of the batch behind and no way to complete it (the daemon does
 // not retry this endpoint).
 //
-// Note what this does and does not guarantee: the batch is consistent, not
-// complete. A failing batch is now lost whole. Closing that gap needs a retry
-// plus a (task_id, seq) uniqueness rule, which is not part of this change.
+// Primary-key failure still rolls the batch back. Sequence replays are handled
+// separately by the daemon endpoint so a retried delivery can be acknowledged.
 func TestCreateTaskMessagesBatchIsAtomic(t *testing.T) {
 	if testHandler == nil {
 		t.Skip("database not available")
@@ -283,6 +282,39 @@ func TestCreateTaskMessagesBatchIsAtomic(t *testing.T) {
 	if count != 1 {
 		t.Fatalf("task_message rows after the failed batch = %d, want 1 (only the seeded row) — "+
 			"the batch persisted a prefix instead of rolling back", count)
+	}
+}
+
+func TestReportTaskMessagesAcceptsMatchingReplayAndRejectsConflict(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	taskID := seedBatchTask(t, "batch-replay")
+	first := []any{map[string]any{"seq": 1, "type": "text", "content": "original"}}
+	testutil.Call(t, testHandler.ReportTaskMessages, batchMessagesRequest(t, taskID, first)).Want(http.StatusOK)
+	testutil.Call(t, testHandler.ReportTaskMessages, batchMessagesRequest(t, taskID, first)).Want(http.StatusOK)
+	testutil.Call(t, testHandler.ReportTaskMessages, batchMessagesRequest(t, taskID, []any{
+		map[string]any{"seq": 1, "type": "text", "content": "different"},
+	})).Want(http.StatusConflict)
+	var count int
+	var content string
+	dbfx.QueryRow(t, `SELECT count(*), max(content) FROM task_message WHERE task_id = $1`, taskID).Scan(&count, &content)
+	if count != 1 || content != "original" {
+		t.Fatalf("replayed task messages = (%d, %q), want one original", count, content)
+	}
+}
+
+func TestReportTaskMessagesRejectsConflictingSequenceWithinBatch(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	taskID := seedBatchTask(t, "batch-conflicting-seq")
+	testutil.Call(t, testHandler.ReportTaskMessages, batchMessagesRequest(t, taskID, []any{
+		map[string]any{"seq": 1, "type": "text", "content": "first"},
+		map[string]any{"seq": 1, "type": "text", "content": "second"},
+	})).Want(http.StatusConflict)
+	if count := dbfx.Count(t, `SELECT count(*) FROM task_message WHERE task_id = $1`, taskID); count != 0 {
+		t.Fatalf("conflicting batch persisted %d task messages, want none", count)
 	}
 }
 

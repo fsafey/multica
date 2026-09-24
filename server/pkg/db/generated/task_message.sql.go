@@ -94,6 +94,7 @@ WITH incoming AS (
         NULLIF(m.output_truncated, '')::bool,
         NULLIF(m.call_id, '')
     FROM incoming AS m
+    ON CONFLICT (task_id, seq) DO NOTHING
     RETURNING id, task_id, seq, type, tool, content, input, output, created_at, arrival_order, output_truncated, call_id
 )
 SELECT id, task_id, seq, type, tool, content, input, output, created_at, arrival_order, output_truncated, call_id FROM inserted ORDER BY seq ASC
@@ -224,6 +225,36 @@ WHERE task_id = $1
 func (q *Queries) DeleteTaskMessages(ctx context.Context, taskID pgtype.UUID) error {
 	_, err := q.db.Exec(ctx, deleteTaskMessages, taskID)
 	return err
+}
+
+const getTaskMessageBySequence = `-- name: GetTaskMessageBySequence :one
+SELECT id, task_id, seq, type, tool, content, input, output, created_at, arrival_order, output_truncated, call_id FROM task_message
+WHERE task_id = $1 AND seq = $2
+`
+
+type GetTaskMessageBySequenceParams struct {
+	TaskID pgtype.UUID `json:"task_id"`
+	Seq    int32       `json:"seq"`
+}
+
+func (q *Queries) GetTaskMessageBySequence(ctx context.Context, arg GetTaskMessageBySequenceParams) (TaskMessage, error) {
+	row := q.db.QueryRow(ctx, getTaskMessageBySequence, arg.TaskID, arg.Seq)
+	var i TaskMessage
+	err := row.Scan(
+		&i.ID,
+		&i.TaskID,
+		&i.Seq,
+		&i.Type,
+		&i.Tool,
+		&i.Content,
+		&i.Input,
+		&i.Output,
+		&i.CreatedAt,
+		&i.ArrivalOrder,
+		&i.OutputTruncated,
+		&i.CallID,
+	)
+	return i, err
 }
 
 const listTaskMessageSequencesByArrival = `-- name: ListTaskMessageSequencesByArrival :many

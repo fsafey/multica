@@ -46,7 +46,7 @@ type migrationSQL struct {
 }
 
 // migrationCorpus is every migration file, keyed by file name
-// ("273_agent_task_queue_runtime_id_index.up.sql"), read and parsed once per
+// ("309_agent_task_queue_runtime_id_index.up.sql"), read and parsed once per
 // package run. Four tests audit the directory; each used to read and strip all
 // of it on its own, and on a slow filesystem that was most of this package's
 // time. The files are read concurrently for the same reason: there are about a
@@ -129,11 +129,11 @@ func TestConcurrentIndexCleanupsMatchTheirMigrations(t *testing.T) {
 	// The MUL-5999 batch specifically: every one of these builds an index the
 	// new teardown queries depend on, so none of them may lose its hook.
 	for _, version := range []string{
-		"273_agent_task_queue_runtime_id_index",
-		"274_task_token_workspace_id_index",
-		"275_task_token_agent_id_index",
-		"276_chat_draft_restore_task_id_index",
-		"277_autopilot_run_task_id_index",
+		"309_agent_task_queue_runtime_id_index",
+		"310_task_token_workspace_id_index",
+		"311_task_token_agent_id_index",
+		"312_chat_draft_restore_task_id_index",
+		"313_autopilot_run_task_id_index",
 	} {
 		if _, ok := concurrentIndexCleanups[version]; !ok {
 			t.Errorf("%s: missing from concurrentIndexCleanups", version)
@@ -269,7 +269,7 @@ func TestRunMigrationsRepairsInvalidRuntimeIDIndex(t *testing.T) {
 	})
 
 	const indexName = "idx_agent_task_queue_runtime_id"
-	const version = "273_agent_task_queue_runtime_id_index"
+	const version = "309_agent_task_queue_runtime_id_index"
 	tableName := pgx.Identifier{schema, "agent_task_queue"}.Sanitize()
 	if _, err := pool.Exec(ctx, "CREATE TABLE "+tableName+` (
 		id BIGSERIAL PRIMARY KEY,

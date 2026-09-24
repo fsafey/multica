@@ -1711,7 +1711,7 @@ const lockAutopilotRunAdmission = `-- name: LockAutopilotRunAdmission :one
 
 SELECT id FROM autopilot
 WHERE id = $1
-FOR UPDATE
+FOR NO KEY UPDATE
 `
 
 // =====================

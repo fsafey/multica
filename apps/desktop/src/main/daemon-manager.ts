@@ -89,6 +89,7 @@ interface ActiveProfile {
 }
 
 let statusPollTimer: ReturnType<typeof setInterval> | null = null;
+let sameProfileOwnerUnhealthySince: number | null = null;
 let logTailWatcher: { path: string; listener: StatsListener } | null = null;
 let currentState: DaemonStatus["state"] = "installing_cli";
 let getMainWindow: () => BrowserWindow | null = () => null;
@@ -1229,6 +1230,7 @@ async function lifecycleBlockedByForeignDaemon(): Promise<boolean> {
 
 async function stopDaemon(): Promise<{ success: boolean; error?: string }> {
   const active = await ensureActiveProfile();
+  if (!active) return { success: true };
   const external = await externalOwnerStatus(active);
   if (external?.status.externallyManaged) return { success: true };
 
@@ -1244,8 +1246,6 @@ async function stopDaemon(): Promise<{ success: boolean; error?: string }> {
   const bin = await resolveCliBinary();
   if (!bin) return { success: false, error: "multica CLI is not installed" };
 
-  const active = await ensureActiveProfile();
-  if (!active) return { success: true };
   currentState = "stopping";
   // An explicit stop is a clean reset — drop any pending auth-failure verdict.
   authExpired = false;

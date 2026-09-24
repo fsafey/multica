@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"reflect"
 	"slices"
 	"sort"
 	"strconv"
@@ -4685,10 +4686,13 @@ func (h *Handler) ReportTaskProgress(w http.ResponseWriter, r *http.Request) {
 
 // CompleteTask marks a running task as completed.
 type TaskCompleteRequest struct {
-	PRURL     string `json:"pr_url"`
-	Output    string `json:"output"`
-	SessionID string `json:"session_id"` // Claude session ID for future resumption
-	WorkDir   string `json:"work_dir"`   // working directory used during execution
+	PRURL                       string `json:"pr_url"`
+	Output                      string `json:"output"`
+	SessionID                   string `json:"session_id"` // Claude session ID for future resumption
+	WorkDir                     string `json:"work_dir"`   // working directory used during execution
+	ExpectedMessageCount        *int   `json:"expected_message_count,omitempty"`
+	ExpectedLastSequence        *int   `json:"expected_last_sequence,omitempty"`
+	TranscriptDeliveryConfirmed *bool  `json:"transcript_delivery_confirmed,omitempty"`
 	// DurableWorkDir is the configured project directory that replaces a
 	// disposable task worktree after the daemon confirms the worktree is gone.
 	DurableWorkDir string `json:"durable_work_dir,omitempty"`
@@ -4768,6 +4772,9 @@ func (h *Handler) CompleteTask(w http.ResponseWriter, r *http.Request) {
 	// re-route below feeds req.Output into the failure classifier, and that
 	// classifier must see exactly the text we are going to persist.
 	sanitizeTaskCompleteRequest(&req)
+	if !h.recordTaskTranscriptExpectation(w, r, taskID, req.ExpectedMessageCount, req.ExpectedLastSequence, req.TranscriptDeliveryConfirmed) {
+		return
+	}
 
 	// GH #6402: a daemon whose backend does not (yet) read the provider's
 	// structured terminal reason reports a context-exhausted run as a clean
@@ -5463,11 +5470,14 @@ func (h *Handler) GetTaskStatus(w http.ResponseWriter, r *http.Request) {
 
 // FailTask marks a running task as failed.
 type TaskFailRequest struct {
-	Error          string `json:"error"`
-	SessionID      string `json:"session_id,omitempty"`
-	WorkDir        string `json:"work_dir,omitempty"`
-	DurableWorkDir string `json:"durable_work_dir,omitempty"`
-	FailureReason  string `json:"failure_reason,omitempty"`
+	Error                       string `json:"error"`
+	SessionID                   string `json:"session_id,omitempty"`
+	WorkDir                     string `json:"work_dir,omitempty"`
+	DurableWorkDir              string `json:"durable_work_dir,omitempty"`
+	FailureReason               string `json:"failure_reason,omitempty"`
+	ExpectedMessageCount        *int   `json:"expected_message_count,omitempty"`
+	ExpectedLastSequence        *int   `json:"expected_last_sequence,omitempty"`
+	TranscriptDeliveryConfirmed *bool  `json:"transcript_delivery_confirmed,omitempty"`
 	// BranchName: a failed run can still have produced a branch — worktree mode
 	// commits whatever the agent left before tearing the worktree down. Report
 	// it so a partially-successful run is still findable.
@@ -5501,6 +5511,9 @@ func (h *Handler) FailTask(w http.ResponseWriter, r *http.Request) {
 	// here lands in a TEXT column too and a NUL in any one of them fails the
 	// same transaction (GH #7098).
 	sanitizeTaskFailRequest(&req)
+	if !h.recordTaskTranscriptExpectation(w, r, taskID, req.ExpectedMessageCount, req.ExpectedLastSequence, req.TranscriptDeliveryConfirmed) {
+		return
+	}
 
 	h.failTask(w, r, taskID, workspaceID, req)
 }
@@ -5633,6 +5646,7 @@ func (h *Handler) ReportTaskMessages(w http.ResponseWriter, r *http.Request) {
 		OutputTruncations: make([]string, 0, n),
 	}
 	createdAts := taskMessageCreatedAts(req.Messages, time.Now().UTC())
+	normalized := make([]TaskMessageRequest, 0, n)
 	for i, msg := range req.Messages {
 		id, err := uuid.NewV7()
 		if err != nil {
@@ -5665,6 +5679,7 @@ func (h *Handler) ReportTaskMessages(w http.ResponseWriter, r *http.Request) {
 				msg.Input = cleaned
 			}
 		}
+		normalized = append(normalized, msg)
 
 		inputJSON := ""
 		if msg.Input != nil {
@@ -5693,11 +5708,43 @@ func (h *Handler) ReportTaskMessages(w http.ResponseWriter, r *http.Request) {
 		params.OutputTruncations = append(params.OutputTruncations, boolArrayElement(msg.OutputTruncated))
 	}
 
+	seenSequences := make(map[int]TaskMessageRequest, len(normalized))
+	for _, msg := range normalized {
+		if previous, exists := seenSequences[msg.Seq]; exists && !reflect.DeepEqual(previous, msg) {
+			writeError(w, http.StatusConflict, "task message batch repeats a sequence with different content")
+			return
+		}
+		seenSequences[msg.Seq] = msg
+	}
+
 	created, err := h.Queries.CreateTaskMessages(r.Context(), params)
 	if err != nil {
 		slog.Error("failed to create task messages", "task_id", taskID, "count", n, "error", err)
 		writeError(w, http.StatusInternalServerError, "failed to persist task message")
 		return
+	}
+	conflictingSequences := make([]int, 0)
+	if len(created) < len(normalized) {
+		inserted := make(map[int32]struct{}, len(created))
+		for _, row := range created {
+			inserted[row.Seq] = struct{}{}
+		}
+		for _, msg := range normalized {
+			if _, ok := inserted[int32(msg.Seq)]; ok {
+				continue
+			}
+			stored, lookupErr := h.Queries.GetTaskMessageBySequence(r.Context(), db.GetTaskMessageBySequenceParams{
+				TaskID: params.TaskID, Seq: int32(msg.Seq),
+			})
+			if lookupErr != nil {
+				slog.Error("failed to inspect replayed task message", "task_id", taskID, "seq", msg.Seq, "error", lookupErr)
+				writeError(w, http.StatusInternalServerError, "failed to verify task message replay")
+				return
+			}
+			if !taskMessageMatchesRequest(stored, msg) {
+				conflictingSequences = append(conflictingSequences, msg.Seq)
+			}
+		}
 	}
 
 	if workspaceID != "" {
@@ -5715,7 +5762,30 @@ func (h *Handler) ReportTaskMessages(w http.ResponseWriter, r *http.Request) {
 				taskMessageToPayload(db.TaskMessage(m), taskID, uuidToString(task.IssueID)))
 		}
 	}
+	if len(conflictingSequences) > 0 {
+		slog.Warn("task message batch contained conflicting sequences", "task_id", taskID, "sequences", conflictingSequences)
+		writeError(w, http.StatusConflict, "task message sequence already contains different content")
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func taskMessageMatchesRequest(row db.TaskMessage, msg TaskMessageRequest) bool {
+	var storedInput map[string]any
+	if len(row.Input) > 0 && json.Unmarshal(row.Input, &storedInput) != nil {
+		return false
+	}
+	wantTruncated := pgtype.Bool{}
+	if msg.OutputTruncated != nil {
+		wantTruncated = pgtype.Bool{Bool: *msg.OutputTruncated, Valid: true}
+	}
+	return row.Type == msg.Type &&
+		row.Tool == (pgtype.Text{String: msg.Tool, Valid: msg.Tool != ""}) &&
+		row.CallID == (pgtype.Text{String: msg.CallID, Valid: msg.CallID != ""}) &&
+		row.Content == (pgtype.Text{String: msg.Content, Valid: msg.Content != ""}) &&
+		reflect.DeepEqual(storedInput, msg.Input) &&
+		row.Output == (pgtype.Text{String: msg.Output, Valid: msg.Output != ""}) &&
+		row.OutputTruncated == wantTruncated
 }
 
 // AckTaskCancelled receives the daemon's acknowledgement that it observed a
@@ -5724,6 +5794,9 @@ func (h *Handler) ReportTaskMessages(w http.ResponseWriter, r *http.Request) {
 // transcript (#5219); idempotent when nothing was deferred.
 // TaskCancelAckRequest is the body of the daemon's cancel acknowledgement.
 type TaskCancelAckRequest struct {
+	ExpectedMessageCount        *int  `json:"expected_message_count,omitempty"`
+	ExpectedLastSequence        *int  `json:"expected_last_sequence,omitempty"`
+	TranscriptDeliveryConfirmed *bool `json:"transcript_delivery_confirmed,omitempty"`
 	// BranchName: a cancelled worktree task has already committed whatever the
 	// agent produced — the worktree is finalized before the daemon learns of
 	// the cancellation. The rest of the result is discarded on this path, so
@@ -5757,6 +5830,9 @@ func (h *Handler) AckTaskCancelled(w http.ResponseWriter, r *http.Request) {
 	req.FailureReason = util.SanitizeTextForPostgres(req.FailureReason)
 	req.BranchName = util.SanitizeTextForPostgres(req.BranchName)
 	req.DurableWorkDir = util.SanitizeTextForPostgres(req.DurableWorkDir)
+	if !h.recordTaskTranscriptExpectation(w, r, taskID, req.ExpectedMessageCount, req.ExpectedLastSequence, req.TranscriptDeliveryConfirmed) {
+		return
+	}
 
 	// Terminal deliveries first, failing LOUD on persistence errors: these
 	// fields are the only pointer to a cancelled task's work, and the daemon
@@ -6313,6 +6389,7 @@ func (h *Handler) ListTaskMessagesByUser(w http.ResponseWriter, r *http.Request)
 	if !ok {
 		return
 	}
+	taskUUID := task.ID
 
 	task, err := h.Queries.GetAgentTask(r.Context(), taskUUID)
 	if err != nil {

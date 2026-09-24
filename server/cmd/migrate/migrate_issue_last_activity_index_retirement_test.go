@@ -28,19 +28,19 @@ func TestIssueLastActivityIndexRetirement(t *testing.T) {
 			Conditions:            conditionsForDirection("up"),
 		}
 
-		options.Files = realMigrationFiles(t, []string{"361_issue_last_activity_index"}, "up")
+		options.Files = realMigrationFiles(t, []string{"397_issue_last_activity_index"}, "up")
 		if err := runMigrations(ctx, pool, options); err != nil {
 			t.Fatalf("apply historical index migration: %v", err)
 		}
 		assertIndexValidity(t, pool, schema, "idx_issue_workspace_last_activity", true)
-		assertMigrationVersionRecorded(t, ctx, pool, schema, "361_issue_last_activity_index", true)
+		assertMigrationVersionRecorded(t, ctx, pool, schema, "397_issue_last_activity_index", true)
 
-		options.Files = realMigrationFiles(t, []string{"375_drop_issue_last_activity_index"}, "up")
+		options.Files = realMigrationFiles(t, []string{"411_drop_issue_last_activity_index"}, "up")
 		if err := runMigrations(ctx, pool, options); err != nil {
 			t.Fatalf("apply index retirement migration: %v", err)
 		}
 		assertIndexExists(t, pool, schema, "idx_issue_workspace_last_activity", false)
-		assertMigrationVersionRecorded(t, ctx, pool, schema, "375_drop_issue_last_activity_index", true)
+		assertMigrationVersionRecorded(t, ctx, pool, schema, "411_drop_issue_last_activity_index", true)
 
 		if err := runMigrations(ctx, pool, options); err != nil {
 			t.Fatalf("repeat applied index retirement migration: %v", err)
@@ -58,13 +58,13 @@ func TestIssueLastActivityIndexRetirement(t *testing.T) {
 			Hooks:                 hooksForDirection("up"),
 		}
 
-		options.Files = realMigrationFiles(t, []string{"361_issue_last_activity_index"}, "up")
+		options.Files = realMigrationFiles(t, []string{"397_issue_last_activity_index"}, "up")
 		if err := runMigrations(ctx, pool, options); err != nil {
 			t.Fatalf("apply existing index migration: %v", err)
 		}
 		assertIndexValidity(t, pool, schema, "idx_issue_workspace_last_activity", true)
 
-		options.Files = realMigrationFiles(t, []string{"375_drop_issue_last_activity_index"}, "up")
+		options.Files = realMigrationFiles(t, []string{"411_drop_issue_last_activity_index"}, "up")
 		options.Conditions = conditionsForDirection("up")
 		if err := runMigrations(ctx, pool, options); err != nil {
 			t.Fatalf("apply index retirement migration: %v", err)
@@ -72,14 +72,14 @@ func TestIssueLastActivityIndexRetirement(t *testing.T) {
 		assertIndexExists(t, pool, schema, "idx_issue_workspace_last_activity", false)
 
 		options.Direction = "down"
-		options.Files = realMigrationFiles(t, []string{"375_drop_issue_last_activity_index"}, "down")
+		options.Files = realMigrationFiles(t, []string{"411_drop_issue_last_activity_index"}, "down")
 		options.Hooks = hooksForDirection("down")
 		options.Conditions = conditionsForDirection("down")
 		if err := runMigrations(ctx, pool, options); err != nil {
 			t.Fatalf("roll back index retirement migration: %v", err)
 		}
 		assertIndexValidity(t, pool, schema, "idx_issue_workspace_last_activity", true)
-		assertMigrationVersionRecorded(t, ctx, pool, schema, "375_drop_issue_last_activity_index", false)
+		assertMigrationVersionRecorded(t, ctx, pool, schema, "411_drop_issue_last_activity_index", false)
 	})
 }
 

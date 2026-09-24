@@ -97,14 +97,14 @@ func TestChannelChatContextGenerationMigrationsUpDownAndLegacyRows(t *testing.T)
 		t.Fatalf("seed pre-migration task: %v", err)
 	}
 
-	applyMigrationFile(t, ctx, conn.Conn(), "377_channel_chat_context_generation.up.sql")
+	applyMigrationFile(t, ctx, conn.Conn(), "413_channel_chat_context_generation.up.sql")
 	// The migration runner records each version after executing its SQL. If the
 	// ledger write fails, the next startup executes the same file again.
-	applyMigrationFile(t, ctx, conn.Conn(), "377_channel_chat_context_generation.up.sql")
-	applyMigrationFile(t, ctx, conn.Conn(), "378_channel_chat_context_generation_key.up.sql")
-	applyMigrationFile(t, ctx, conn.Conn(), "378_channel_chat_context_generation_key.up.sql")
-	applyMigrationFile(t, ctx, conn.Conn(), "379_channel_context_mixed_version_guard.up.sql")
-	applyMigrationFile(t, ctx, conn.Conn(), "379_channel_context_mixed_version_guard.up.sql")
+	applyMigrationFile(t, ctx, conn.Conn(), "413_channel_chat_context_generation.up.sql")
+	applyMigrationFile(t, ctx, conn.Conn(), "414_channel_chat_context_generation_key.up.sql")
+	applyMigrationFile(t, ctx, conn.Conn(), "414_channel_chat_context_generation_key.up.sql")
+	applyMigrationFile(t, ctx, conn.Conn(), "415_channel_context_mixed_version_guard.up.sql")
+	applyMigrationFile(t, ctx, conn.Conn(), "415_channel_context_mixed_version_guard.up.sql")
 
 	var bindingRevision, generationRevision int64
 	if err := conn.QueryRow(ctx, `
@@ -169,9 +169,9 @@ func TestChannelChatContextGenerationMigrationsUpDownAndLegacyRows(t *testing.T)
 		t.Fatalf("duplicate generation error = %v, want unique violation", err)
 	}
 
-	applyMigrationFile(t, ctx, conn.Conn(), "379_channel_context_mixed_version_guard.down.sql")
-	applyMigrationFile(t, ctx, conn.Conn(), "378_channel_chat_context_generation_key.down.sql")
-	applyMigrationFile(t, ctx, conn.Conn(), "377_channel_chat_context_generation.down.sql")
+	applyMigrationFile(t, ctx, conn.Conn(), "415_channel_context_mixed_version_guard.down.sql")
+	applyMigrationFile(t, ctx, conn.Conn(), "414_channel_chat_context_generation_key.down.sql")
+	applyMigrationFile(t, ctx, conn.Conn(), "413_channel_chat_context_generation.down.sql")
 
 	var generationExists bool
 	if err := conn.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, channelContextMigrationTestSchema+".channel_chat_context_generation").Scan(&generationExists); err != nil {

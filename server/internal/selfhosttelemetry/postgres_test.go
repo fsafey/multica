@@ -133,10 +133,10 @@ func TestTelemetryMigrationsUpAndDown(t *testing.T) {
 		t.Fatal(err)
 	}
 	up := []string{
-		"479_instance_telemetry_state.up.sql",
-		"480_instance_telemetry_state_singleton_index.up.sql",
-		"481_instance_telemetry_state_primary_key.up.sql",
-		"482_agent_task_queue_telemetry_started_index.up.sql",
+		"515_instance_telemetry_state.up.sql",
+		"516_instance_telemetry_state_singleton_index.up.sql",
+		"517_instance_telemetry_state_primary_key.up.sql",
+		"518_agent_task_queue_telemetry_started_index.up.sql",
 	}
 	for _, name := range up {
 		applyTelemetryMigration(t, pool, name)
@@ -165,10 +165,10 @@ func TestTelemetryMigrationsUpAndDown(t *testing.T) {
 	}
 
 	down := []string{
-		"482_agent_task_queue_telemetry_started_index.down.sql",
-		"481_instance_telemetry_state_primary_key.down.sql",
-		"480_instance_telemetry_state_singleton_index.down.sql",
-		"479_instance_telemetry_state.down.sql",
+		"518_agent_task_queue_telemetry_started_index.down.sql",
+		"517_instance_telemetry_state_primary_key.down.sql",
+		"516_instance_telemetry_state_singleton_index.down.sql",
+		"515_instance_telemetry_state.down.sql",
 	}
 	for _, name := range down {
 		applyTelemetryMigration(t, pool, name)
@@ -222,9 +222,9 @@ func TestTwoPostgresBackedWorkersProduceOnePendingAndDelivery(t *testing.T) {
 	pool := telemetryTestPool(t)
 	ctx := context.Background()
 	for _, name := range []string{
-		"479_instance_telemetry_state.up.sql",
-		"480_instance_telemetry_state_singleton_index.up.sql",
-		"481_instance_telemetry_state_primary_key.up.sql",
+		"515_instance_telemetry_state.up.sql",
+		"516_instance_telemetry_state_singleton_index.up.sql",
+		"517_instance_telemetry_state_primary_key.up.sql",
 	} {
 		applyTelemetryMigration(t, pool, name)
 	}

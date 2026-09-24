@@ -585,6 +585,25 @@ func (s *AutopilotService) dispatchAutopilot(
 	if autopilot.ExecutionMode == "run_only" {
 		initialStatus = "running"
 	}
+	if source == "schedule" && autopilot.ExecutionMode == "run_only" {
+		run, outcome, err := s.createAutopilotRunWithAdmission(ctx, autopilot, triggerID, source, payload, plannedAt, webhookDeliveryID, initialStatus)
+		if err != nil {
+			var quotaErr *AutopilotQuotaExceededError
+			if errors.As(err, &quotaErr) {
+				skipped, skipErr := s.recordSkippedRun(ctx, autopilot, triggerID, source, payload, plannedAt, webhookDeliveryID, quotaErr.Error(), dispatch.ReasonQuotaExceeded)
+				return skipped, dispatch.ReasonQuotaExceeded, skipErr
+			}
+			return nil, dispatch.ReasonInternalError, fmt.Errorf("admit scheduled run: %w", err)
+		}
+		switch outcome {
+		case autopilotAdmissionSkipped:
+			return s.finishSkippedRun(ctx, autopilot, run, source, run.FailureReason.String), dispatch.ReasonAlreadyActive, nil
+		case autopilotAdmissionReused:
+			return &run, dispatch.ReasonCode(run.ReasonCode.String), nil
+		}
+		s.captureAutopilotRunStarted(autopilot, run, source)
+		return s.dispatchAutopilotRun(ctx, autopilot, triggerID, source, &run, actorUserID)
+	}
 
 	run, reused, err := s.createAutopilotRunWithQuota(ctx, autopilot.WorkspaceID, source, idempotencyKey, db.CreateAutopilotRunParams{
 		ID:                dbid.NewV7(),

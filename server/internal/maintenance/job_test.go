@@ -58,14 +58,14 @@ func fixture(t *testing.T) (*pgxpool.Pool, *Service) {
 		}
 	}
 	exec("CREATE TABLE schema_migrations(version text)")
-	for _, name := range []string{"332_issue_status", "333_issue_status_pkey_index", "478_issue_status_category_expand", "485_maintenance_job", "486_maintenance_job_id_index", "487_maintenance_job_idempotency_index", "488_maintenance_job_active_index"} {
+	for _, name := range []string{"368_issue_status", "369_issue_status_pkey_index", "514_issue_status_category_expand", "521_maintenance_job", "522_maintenance_job_id_index", "523_maintenance_job_idempotency_index", "524_maintenance_job_active_index"} {
 		body, err := os.ReadFile(filepath.Join("..", "..", "migrations", name+".up.sql"))
 		if err != nil {
 			t.Fatal(err)
 		}
 		exec(string(body))
 	}
-	exec("INSERT INTO schema_migrations VALUES ('478_issue_status_category_expand')")
+	exec("INSERT INTO schema_migrations VALUES ('514_issue_status_category_expand')")
 	return pool, NewService(pool, StatusCategory{})
 }
 func statusID(i int) string { return fmt.Sprintf("00000000-0000-0000-0000-%012d", i) }
@@ -397,7 +397,7 @@ func TestPreflightChecksActualSchemaAndLedger(t *testing.T) {
 	if _, err := s.Create(ctx, request(true)); err == nil {
 		t.Fatal("missing 478 accepted")
 	}
-	if _, err := pool.Exec(ctx, "INSERT INTO schema_migrations VALUES ('478_issue_status_category_expand')"); err != nil {
+	if _, err := pool.Exec(ctx, "INSERT INTO schema_migrations VALUES ('514_issue_status_category_expand')"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `ALTER TABLE issue_status DROP CONSTRAINT issue_status_category_check;
@@ -472,7 +472,7 @@ func TestUnknownStoredDataCannotComplete(t *testing.T) {
  UPDATE issue_status SET category='unexpected' WHERE id='00000000-0000-0000-0000-000000000008'`); err != nil {
 		t.Fatal(err)
 	}
-	sql, err := os.ReadFile("../../migrations/478_issue_status_category_expand.up.sql")
+	sql, err := os.ReadFile("../../migrations/514_issue_status_category_expand.up.sql")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -561,7 +561,7 @@ func TestContractPreservesAuditAndRejectsCategoryProcessor(t *testing.T) {
 	ctx := context.Background()
 	completed := finish(t, s, create(t, s, false))
 	pending := create(t, s, false)
-	for _, name := range []string{"491_issue_status_category_backfill", "492_issue_status_category_contract", "493_issue_status_category_validate", "494_issue_status_category_read_contract"} {
+	for _, name := range []string{"527_issue_status_category_backfill", "528_issue_status_category_contract", "529_issue_status_category_validate", "530_issue_status_category_read_contract"} {
 		body, err := os.ReadFile(filepath.Join("..", "..", "migrations", name+".up.sql"))
 		if err != nil {
 			t.Fatal(err)

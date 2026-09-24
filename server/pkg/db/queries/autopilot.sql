@@ -310,7 +310,7 @@ RETURNING *;
 -- durable skipped receipt. Different autopilots remain independent.
 SELECT id FROM autopilot
 WHERE id = $1
-FOR UPDATE;
+FOR NO KEY UPDATE;
 
 -- name: RecoverStalePartialAutopilotRunsForAdmission :many
 -- A process can die after creating the run receipt but before linking the

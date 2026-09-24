@@ -227,15 +227,16 @@ const (
 // reportTerminalTask gives the durable outbox one insertion point without
 // revisiting every task exit when it is added.
 type terminalTaskReport struct {
-	kind           terminalTaskReportKind
-	taskID         string
-	output         string
-	branchName     string
-	errorMessage   string
-	sessionID      string
-	workDir        string
-	durableWorkDir string
-	failureReason  string
+	kind                  terminalTaskReportKind
+	taskID                string
+	output                string
+	branchName            string
+	errorMessage          string
+	sessionID             string
+	workDir               string
+	durableWorkDir        string
+	failureReason         string
+	transcriptExpectation TranscriptExpectation
 	// sessionRolloutMissing is true when the daemon withheld this task's Codex
 	// session because its rollout was not in the store (MUL-5305). The server
 	// clears the resume pointer and flags the continuity gap for the next claim.
@@ -384,11 +385,12 @@ type repoCacheBackend interface {
 
 // Daemon is the local agent runtime that polls for and executes tasks.
 type Daemon struct {
-	cfg        Config
-	client     *Client
-	repoCache  repoCacheBackend
-	skillCache *SkillBundleCache
-	logger     *slog.Logger
+	cfg                        Config
+	client                     *Client
+	repoCache                  repoCacheBackend
+	skillCache                 *SkillBundleCache
+	logger                     *slog.Logger
+	taskMessageDeliveryTimeout time.Duration
 
 	// terminalReports is the durable outbox for complete/fail callbacks. The
 	// sender hook is production-wired through Client and overridable in focused
@@ -6130,7 +6132,7 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 		// run errors stay discarded: on a cancelled run they are expected
 		// noise (context canceled, killed process), and persisting them would
 		// stamp a bogus reason on every ordinary mid-run cancel.
-		ack := TaskCancelAck{BranchName: result.BranchName, DurableWorkDir: result.DurableWorkDir}
+		ack := TaskCancelAck{BranchName: result.BranchName, DurableWorkDir: result.DurableWorkDir, TranscriptExpectation: transcriptExpectation(result)}
 		var preserved *worktreePreservedError
 		if errors.As(err, &preserved) {
 			ack.ErrorMessage = preserved.Error()
@@ -6159,13 +6161,14 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 		// shape of the failure (provider 5xx, network, process crash,
 		// …) rather than the coarse legacy "agent_error" bucket.
 		if failErr := d.reportTerminalTask(ctx, terminalTaskReport{
-			kind:           terminalTaskReportFail,
-			taskID:         task.ID,
-			errorMessage:   err.Error(),
-			branchName:     result.BranchName,
-			workDir:        result.WorkDir,
-			durableWorkDir: result.DurableWorkDir,
-			failureReason:  taskRunFailureReason(err),
+			kind:                  terminalTaskReportFail,
+			taskID:                task.ID,
+			errorMessage:          err.Error(),
+			branchName:            result.BranchName,
+			workDir:               result.WorkDir,
+			durableWorkDir:        result.DurableWorkDir,
+			failureReason:         taskRunFailureReason(err),
+			transcriptExpectation: transcriptExpectation(result),
 		}); failErr != nil {
 			taskLog.Error("fail task callback failed", "error", failErr)
 		}
@@ -6198,7 +6201,7 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 		// completed/failed rows the complete/fail callback is the
 		// authoritative channel and a stale run's late ack must not touch
 		// them.
-		if ackErr := d.client.AckTaskCancelled(ctx, task.ID, TaskCancelAck{BranchName: result.BranchName, DurableWorkDir: result.DurableWorkDir}); ackErr != nil {
+		if ackErr := d.client.AckTaskCancelled(ctx, task.ID, TaskCancelAck{BranchName: result.BranchName, DurableWorkDir: result.DurableWorkDir, TranscriptExpectation: transcriptExpectation(result)}); ackErr != nil {
 			taskLog.Warn("cancel ack failed; server sweeper will finalize", "error", ackErr)
 		}
 		return
@@ -6347,7 +6350,7 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 			// exempt env root, so the directory would accumulate one env
 			// root per task forever — the exact cost the exemption was
 			// meant to trade away for a user's own files.
-			if assignment, _ := localDirectoryAssignmentForTask(task, d.cfg.DaemonID); assignment != nil && !assignment.UsesWorktree() {
+			if assignment, _ := localDirectoryAssignmentForTask(task, d.cfg.DaemonID); assignment != nil && !assignment.UsesWorktree() && !assignment.UsesForkIsolation() {
 				meta.LocalDirectory = true
 			}
 			if err := execenv.WriteGCMeta(result.EnvRoot, meta, taskLog); err != nil {
@@ -6585,9 +6588,20 @@ func (d *Daemon) acquireLocalDirectoryLockIfNeeded(ctx context.Context, task Tas
 	// what lets sibling tasks on one directory run concurrently. Path
 	// validation above still applies — git needs to write worktree
 	// registrations into the user's repo.
-	if assignment.UsesWorktree() {
+	if assignment.UsesWorktree() || (assignment.UsesForkIsolation() && assignment.Ref.PublishBack != localDirectoryPublishBackSerialFF) {
 		taskLog.Info("local_directory: worktree mode, skipping path mutex")
 		return nil, false
+	}
+	mutexKey, err := assignment.mutexKey()
+	if err != nil {
+		taskLog.Error("local_directory: resolve mutex key failed", "error", err)
+		if failErr := d.reportTerminalTask(ctx, terminalTaskReport{
+			kind: terminalTaskReportFail, taskID: task.ID,
+			errorMessage: err.Error(), failureReason: "local_directory_error",
+		}); failErr != nil {
+			taskLog.Error("fail task after local_directory mutex-key error", "error", failErr)
+		}
+		return nil, true
 	}
 
 	// A conversation is not a second writer. Everything above still applied —
@@ -6597,7 +6611,7 @@ func (d *Daemon) acquireLocalDirectoryLockIfNeeded(ctx context.Context, task Tas
 	// behind a 20-minute build with nothing to contribute to it (issue #7344).
 	// See localDirectoryLockExempt for why the mutex does not owe this task a
 	// slot.
-	if localDirectoryLockExempt(task) {
+	if assignment.Ref.PublishBack != localDirectoryPublishBackSerialFF && localDirectoryLockExempt(task) {
 		taskLog.Info("local_directory: chat task, skipping path mutex")
 		return nil, false
 	}
@@ -6734,6 +6748,7 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 			sessionID:             result.SessionID,
 			workDir:               result.WorkDir,
 			durableWorkDir:        result.DurableWorkDir,
+			transcriptExpectation: transcriptExpectation(result),
 			sessionRolloutMissing: result.SessionRolloutMissing,
 			retiredSessionID:      result.RetiredSessionID,
 		})
@@ -6880,9 +6895,9 @@ func (d *Daemon) sendTerminalTaskReport(ctx context.Context, report terminalTask
 	}
 	switch report.kind {
 	case terminalTaskReportComplete:
-		return d.client.completeTaskWithRetrySchedule(ctx, report.taskID, report.output, report.branchName, report.sessionID, report.workDir, report.sessionRolloutMissing, report.retiredSessionID, report.durableWorkDir, schedule)
+		return d.client.completeTaskWithRetrySchedule(ctx, report.taskID, report.output, report.branchName, report.sessionID, report.workDir, report.transcriptExpectation, report.sessionRolloutMissing, report.retiredSessionID, report.durableWorkDir, schedule)
 	case terminalTaskReportFail:
-		return d.client.failTaskWithRetrySchedule(ctx, report.taskID, report.errorMessage, report.sessionID, report.workDir, report.branchName, report.failureReason, report.sessionRolloutMissing, report.retiredSessionID, report.durableWorkDir, schedule)
+		return d.client.failTaskWithRetrySchedule(ctx, report.taskID, report.errorMessage, report.sessionID, report.workDir, report.branchName, report.failureReason, report.transcriptExpectation, report.sessionRolloutMissing, report.retiredSessionID, report.durableWorkDir, schedule)
 	default:
 		return fmt.Errorf("unsupported terminal task report kind %d", report.kind)
 	}
@@ -6893,6 +6908,15 @@ func transcriptExpectation(result TaskResult) TranscriptExpectation {
 		MessageCount:      result.ExpectedMessageCount,
 		LastSequence:      result.ExpectedLastSequence,
 		DeliveryConfirmed: result.TranscriptDelivered,
+	}
+}
+
+func taskPrepareTimeoutResult(result TaskResult) TaskResult {
+	return TaskResult{
+		PublishBackWorktree:    result.PublishBackWorktree,
+		PublishBackProvider:    result.PublishBackProvider,
+		WorkflowBundleWorktree: result.WorkflowBundleWorktree,
+		WorkflowBundleProvider: result.WorkflowBundleProvider,
 	}
 }
 
@@ -8726,6 +8750,8 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		} else {
 			if localAssignment != nil {
 				prepParams.LocalWorkDir = localAssignment.AbsPath
+				prepParams.Isolate = localAssignment.Ref.Isolate
+				prepParams.PublishBack = localAssignment.Ref.PublishBack != ""
 			}
 			env, err = d.prepareExecutionEnvironment(prepareCtx, prepParams)
 			if err != nil {
@@ -8734,6 +8760,22 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		}
 	}
 	phaseRecorder.Mark(taskPhaseEnvironmentReady)
+	if env.IsolatedWorktree != nil {
+		switch {
+		case localAssignment != nil && localAssignment.Ref.PublishBack == localDirectoryPublishBackSerialFF:
+			defer func() {
+				taskResult.PublishBackWorktree = env.IsolatedWorktree
+				taskResult.PublishBackProvider = provider
+			}()
+		case localAssignment != nil && localAssignment.Ref.PublishBack == localDirectoryPublishSubmitBundle:
+			defer func() {
+				taskResult.WorkflowBundleWorktree = env.IsolatedWorktree
+				taskResult.WorkflowBundleProvider = provider
+			}()
+		default:
+			defer env.IsolatedWorktree.Remove(d.logger)
+		}
+	}
 	// Belt-and-suspenders: also mark whatever root we ended up with, in case
 	// future changes diverge from ResolveRootDir.
 	if env.RootDir != resolvedRoot && env.RootDir != "" {
@@ -8942,7 +8984,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// is the one thing it cannot work out from its own context — tell it.
 	// Worktree mode is excluded: there the tree is this task's private checkout.
 	var promptOptions []PromptOption
-	if localAssignment != nil && !localAssignment.UsesWorktree() && localDirectoryLockExempt(task) {
+	if localAssignment != nil && !localAssignment.UsesWorktree() && !localAssignment.UsesForkIsolation() && localDirectoryLockExempt(task) {
 		promptOptions = append(promptOptions, WithSharedLocalDirectory())
 	}
 	// Worktree mode hands this turn a tree that is mid-merge when the user's
@@ -9292,7 +9334,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		SessionRequested:      sessionResumeRequested,
 		RequestedSessionID:    requestedSessionID,
 		WorkdirRequested:      workdirReuseRequested,
-		WorkdirReused:         reused,
+		WorkdirReused:         envReused,
 	})
 	if err != nil {
 		return TaskResult{}, fmt.Errorf("build task execution evidence: %w", err)
@@ -9822,7 +9864,12 @@ func freshSessionMayHelp(errText string) bool {
 // messages and is owned by the caller so a same-task retry continues the
 // sequence instead of restarting at 1 — the server orders the transcript by
 // seq alone, and duplicate seqs would interleave the two attempts' rows.
-func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, prompt string, opts agent.ExecOptions, taskLog *slog.Logger, taskID, codexHome string, msgSeq *atomic.Int32) (agent.Result, int32, error) {
+func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, prompt string, opts agent.ExecOptions, taskLog *slog.Logger, taskID, codexHome string, msgSeq *atomic.Int32, deliveredOpts ...*atomic.Bool) (agent.Result, int32, error) {
+	transcriptDelivered := new(atomic.Bool)
+	transcriptDelivered.Store(true)
+	if len(deliveredOpts) > 0 && deliveredOpts[0] != nil {
+		transcriptDelivered = deliveredOpts[0]
+	}
 	phaseRecorder := taskPhaseRecorderFromContext(ctx)
 	// Wrap the caller's ctx so the idle watchdog (below) can interrupt both
 	// the agent subprocess (via the ctx passed to backend.Execute) AND the
@@ -10402,6 +10449,38 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 			Error:  "agent did not produce result within drain timeout",
 		}, toolCount.Load(), nil
 	}
+}
+
+func (d *Daemon) taskMessageDeliveryBudget() time.Duration {
+	if d.taskMessageDeliveryTimeout > 0 {
+		return d.taskMessageDeliveryTimeout
+	}
+	return 30 * time.Second
+}
+
+func retainTaskMessagesWithinBudget(messages []TaskMessageData, byteBudget int) ([]TaskMessageData, bool) {
+	retained := make([]TaskMessageData, 0, len(messages))
+	sizes := make([]int, 0, len(messages))
+	total := 2
+	dropped := false
+	for _, message := range messages {
+		encoded, err := json.Marshal(message)
+		if err != nil {
+			dropped = true
+			continue
+		}
+		size := len(encoded) + 1
+		retained = append(retained, message)
+		sizes = append(sizes, size)
+		total += size
+	}
+	for total > byteBudget && len(retained) > 0 {
+		total -= sizes[0]
+		retained = retained[1:]
+		sizes = sizes[1:]
+		dropped = true
+	}
+	return retained, dropped
 }
 
 // terminalResultHandoffBudget is how long executeAndDrain waits, after force-

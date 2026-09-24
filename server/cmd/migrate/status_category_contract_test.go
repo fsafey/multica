@@ -11,8 +11,8 @@ import (
 )
 
 var categoryContractVersions = []string{
-	"491_issue_status_category_backfill", "492_issue_status_category_contract",
-	"493_issue_status_category_validate", "494_issue_status_category_read_contract",
+	"527_issue_status_category_backfill", "528_issue_status_category_contract",
+	"529_issue_status_category_validate", "530_issue_status_category_read_contract",
 }
 
 // Exercise historical data through the real runner, rather than inserting old
@@ -34,7 +34,7 @@ func TestStatusCategoryContractUpgradePaths(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			execFile("332_issue_status")
+			execFile("368_issue_status")
 			if path != "fresh" {
 				for _, key := range issuestatus.Canonical() {
 					if _, err := pool.Exec(ctx, `INSERT INTO issue_status(workspace_id,key,name,category,color,is_system,position,archived_at)
@@ -45,14 +45,14 @@ func TestStatusCategoryContractUpgradePaths(t *testing.T) {
 				}
 			}
 			opts := f.opts()
-			opts.Files = realMigrationFiles(t, []string{"469_issue_status_lifecycle_categories"}, "up")
+			opts.Files = realMigrationFiles(t, []string{"505_issue_status_lifecycle_categories"}, "up")
 			if path == "applied_469" {
 				if err := runMigrations(ctx, pool, opts); err != nil {
 					t.Fatal(err)
 				}
 			}
 			opts.Conditions = conditionsForDirection("up")
-			opts.Files = realMigrationFiles(t, []string{"469_issue_status_lifecycle_categories", "478_issue_status_category_expand"}, "up")
+			opts.Files = realMigrationFiles(t, []string{"505_issue_status_lifecycle_categories", "514_issue_status_category_expand"}, "up")
 			if err := runMigrations(ctx, pool, opts); err != nil {
 				t.Fatal(err)
 			}
