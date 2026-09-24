@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 
@@ -117,6 +118,35 @@ func (h *Handler) AddRuntimePoolMember(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, member)
+}
+
+func (h *Handler) PruneStaleRuntimePoolMember(w http.ResponseWriter, r *http.Request) {
+	workspaceID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "id"), "workspace_id")
+	if !ok {
+		return
+	}
+	poolID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "poolId"), "pool_id")
+	if !ok {
+		return
+	}
+	runtimeID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "runtimeId"), "runtime_id")
+	if !ok {
+		return
+	}
+	removed, err := h.WorkflowService.PruneStaleRuntimeFromPool(r.Context(), workspaceID, poolID, runtimeID)
+	if err != nil {
+		if errors.Is(err, service.ErrRuntimePoolMemberStillLive) {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"pool_id":    chi.URLParam(r, "poolId"),
+		"runtime_id": chi.URLParam(r, "runtimeId"),
+		"removed":    removed,
+	})
 }
 
 type bindAgentPoolRequest struct {

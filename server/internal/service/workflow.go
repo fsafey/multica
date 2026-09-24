@@ -24,6 +24,8 @@ const (
 
 var ErrStaleWorkflowAttempt = errors.New("stale workflow attempt or claim epoch")
 
+var ErrRuntimePoolMemberStillLive = errors.New("runtime still exists; only stale pool memberships can be pruned")
+
 var (
 	ErrNoWorkflowNodeReady  = errors.New("no compatible workflow node is ready")
 	ErrWorkflowResourceBusy = errors.New("workflow node resource is already claimed")
@@ -259,6 +261,33 @@ func (s *WorkflowService) AddRuntimeToPool(
 		Priority:  priority,
 		Enabled:   true,
 	})
+}
+
+// PruneStaleRuntimeFromPool removes a dangling membership only after the
+// runtime row has been reaped. The pool's workspace is checked first.
+func (s *WorkflowService) PruneStaleRuntimeFromPool(
+	ctx context.Context,
+	workspaceID, poolID, runtimeID pgtype.UUID,
+) (bool, error) {
+	if _, err := s.Queries.GetRuntimePoolInWorkspace(ctx, db.GetRuntimePoolInWorkspaceParams{
+		ID:          poolID,
+		WorkspaceID: workspaceID,
+	}); err != nil {
+		return false, fmt.Errorf("load runtime pool: %w", err)
+	}
+	if _, err := s.Queries.GetAgentRuntime(ctx, runtimeID); err == nil {
+		return false, ErrRuntimePoolMemberStillLive
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		return false, fmt.Errorf("load runtime: %w", err)
+	}
+	rows, err := s.Queries.RemoveRuntimeFromPool(ctx, db.RemoveRuntimeFromPoolParams{
+		PoolID:    poolID,
+		RuntimeID: runtimeID,
+	})
+	if err != nil {
+		return false, fmt.Errorf("remove runtime from pool: %w", err)
+	}
+	return rows > 0, nil
 }
 
 func (s *WorkflowService) BindAgentToPool(
