@@ -104,7 +104,7 @@ async function exists(p) {
 
 if (hasGo()) {
   const version = deriveVersion() || "dev";
-  const commit = git("rev-parse", "--short", "HEAD") || "unknown";
+  const commit = git("rev-parse", "HEAD") || "unknown";
   const date = new Date().toISOString().replace(/\.\d+Z$/, "Z");
   const ldflags = `-X main.version=${version} -X main.commit=${commit} -X main.date=${date}`;
 
