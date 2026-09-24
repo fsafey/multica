@@ -394,6 +394,9 @@ WHERE runtime_id = $1 AND kind = 'user'
 RETURNING *;
 
 -- name: DeleteAgentRuntime :exec
+WITH removed_pool_memberships AS (
+    DELETE FROM runtime_pool_runtime WHERE runtime_id = $1
+)
 DELETE FROM agent_runtime WHERE id = $1;
 
 -- name: DeleteSystemAgentsByRuntime :exec
