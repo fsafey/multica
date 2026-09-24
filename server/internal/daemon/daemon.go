@@ -10295,6 +10295,11 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 		// signalled that the transcript tail was persisted.
 		<-tickerDone
 		flush()
+		mu.Lock()
+		if len(batch) > 0 {
+			markTranscriptUndelivered()
+		}
+		mu.Unlock()
 	}()
 
 	// waitForDrain blocks until the drain goroutine has flushed the transcript
