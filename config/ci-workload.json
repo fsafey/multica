@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "platform": "linux",
+  "required_platforms": [
+    "linux",
+    "macos",
+    "windows"
+  ],
+  "target_branch": "selfhost/production",
+  "unsupported_requirements": [
+    "Native Windows windows-execenv tests and installer tests under Windows PowerShell 5.1 and 7 are required.",
+    "Native macOS macos-runtime tests and BSD shell installer tests are required.",
+    "GitHub path-filter and frontend/backend aggregate job acceptance require coordinator readback; this entry runs every portable scope."
+  ],
+  "artifacts": [],
+  "repository": "fsafey/multica",
+  "checks": [
+    {
+      "name": "toolchain",
+      "command": "test \"$(node --version | cut -d. -f1)\" = v22\ntest \"$(pnpm --version)\" = 10.28.2\ngo version | grep -E \"go1\\.26\\.\"\ncommand -v docker\ncommand -v helm"
+    },
+    {
+      "name": "selection-tests",
+      "command": "node --test scripts/ci-scope.test.mjs scripts/check-image-budget.test.mjs"
+    },
+    {
+      "name": "pnpm-install",
+      "command": "pnpm install --frozen-lockfile"
+    },
+    {
+      "name": "sqlc",
+      "command": "make sqlc\ngit diff --exit-code -- server/pkg/db/generated\ntest -z \"$(git ls-files --others --exclude-standard -- server/pkg/db/generated)\""
+    },
+    {
+      "name": "frontend-build",
+      "command": "pnpm exec turbo build typecheck lint --force --filter='!@multica/docs' --filter='!@multica/mobile'"
+    },
+    {
+      "name": "frontend-test",
+      "command": "pnpm exec turbo test --force --filter='!@multica/docs' --filter='!@multica/mobile' --filter='!@multica/views'"
+    },
+    {
+      "name": "views-shard-1",
+      "command": "pnpm exec turbo test --force --filter='@multica/views' -- --shard=1/2",
+      "matrix": {
+        "shard": "1/2"
+      }
+    },
+    {
+      "name": "views-shard-2",
+      "command": "pnpm exec turbo test --force --filter='@multica/views' -- --shard=2/2",
+      "matrix": {
+        "shard": "2/2"
+      }
+    },
+    {
+      "name": "ui-exports",
+      "command": "bash scripts/check-ui-wildcard-exports.test.sh\nnode scripts/check-ui-wildcard-exports.mjs"
+    },
+    {
+      "name": "ui-radii",
+      "command": "node --test scripts/check-ui-radius-tokens.test.mjs\nnode scripts/check-ui-radius-tokens.mjs"
+    },
+    {
+      "name": "knip-advisory",
+      "command": "pnpm knip",
+      "advisory": true
+    },
+    {
+      "name": "backend-disposable",
+      "command": "bash scripts/ci-cloud-backend",
+      "timeout_seconds": 3600
+    },
+    {
+      "name": "backend-agent",
+      "command": "GOFLAGS=-count=1 bash scripts/test-go.sh --race --only agent"
+    },
+    {
+      "name": "vulnerabilities",
+      "command": "go tool govulncheck ./...",
+      "cwd": "server"
+    },
+    {
+      "name": "linux-installer",
+      "command": "bash scripts/install.test.sh",
+      "matrix": {
+        "os": "linux"
+      }
+    },
+    {
+      "name": "scripts",
+      "command": "bash scripts/selfhost-config.test.sh\nbash scripts/worktree-db.test.sh\nbash scripts/dev-env.test.sh\nbash scripts/perf-compare.test.sh\nnode scripts/generate-reserved-slugs.mjs\ngit diff --exit-code -- packages/core/paths/reserved-slugs.ts\nbash scripts/helm-config.test.sh\nbash scripts/entrypoint.test.sh\nbash scripts/makefile-build.test.sh"
+    },
+    {
+      "name": "mobile",
+      "command": "pnpm exec turbo typecheck lint test --force --filter=@multica/mobile"
+    },
+    {
+      "name": "image-budget",
+      "command": "test \"$CI_EVENT\" != pull_request || node scripts/check-image-budget.mjs --base \"$CI_BASE_SHA\""
+    }
+  ]
+}
