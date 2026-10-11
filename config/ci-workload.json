@@ -67,6 +67,10 @@
       "advisory": true
     },
     {
+      "name": "cloud-backend-adapter-tests",
+      "command": "bash scripts/ci-cloud-backend.test.sh"
+    },
+    {
       "name": "backend-disposable",
       "command": "bash scripts/ci-cloud-backend",
       "timeout_seconds": 3600
