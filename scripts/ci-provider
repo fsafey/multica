@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Delegate provider policy to Standalone Search; this repository owns its workload.
+set -euo pipefail
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+search_ci_repo=${SEARCH_CI_REPO:-"$(dirname "$repo_root")/standalone-search"}
+entry="$search_ci_repo/scripts/ci/provider_swap.py"
+if [[ ! -f "$entry" ]]; then
+  printf 'Shared CI operator missing: %s\nSet SEARCH_CI_REPO to the Standalone Search checkout containing the provider registry.\n' "$entry" >&2
+  exit 2
+fi
+exec uv run --no-project python "$entry" --repo-root "$repo_root" "$@"
