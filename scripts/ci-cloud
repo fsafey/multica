@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+search_ci_repo=${SEARCH_CI_REPO:-"$(dirname "$repo_root")/standalone-search"}
+entry="$search_ci_repo/scripts/ci/portable_codex_job.py"
+if [[ ! -f "$entry" ]]; then
+  printf 'Shared deterministic workload runner missing: %s\nSet SEARCH_CI_REPO to the reviewed Standalone Search checkout.\n' "$entry" >&2
+  exit 2
+fi
+exec uv run --no-project python "$entry" --repo-root "$repo_root" --manifest "$repo_root/config/ci-workload.json" "$@"

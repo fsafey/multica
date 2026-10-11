@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# CI owns these ephemeral services; no host or recorded production database is used.
+set -euo pipefail
+suffix=$(printf '%s' "$CI_OUTPUT_DIR" | shasum -a 256 | cut -c1-16)
+postgres="multica-ci-pg-$suffix"
+redis="multica-ci-redis-$suffix"
+cleanup() {
+  docker rm --force "$postgres" "$redis" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+# Refuse a name collision rather than taking custody of a pre-existing container.
+if docker container inspect "$postgres" >/dev/null 2>&1 || docker container inspect "$redis" >/dev/null 2>&1; then
+  echo 'Disposable CI container identity already exists' >&2
+  trap - EXIT
+  exit 2
+fi
+docker run --detach --rm --name "$postgres" --publish 127.0.0.1::5432 \
+  --env POSTGRES_DB=multica --env POSTGRES_USER=multica --env POSTGRES_PASSWORD=multica \
+  pgvector/pgvector:pg17 >/dev/null
+docker run --detach --rm --name "$redis" --publish 127.0.0.1::6379 redis:7-alpine >/dev/null
+ready=false
+for attempt in {1..60}; do
+  if docker exec "$postgres" pg_isready -U multica -d multica >/dev/null 2>&1 && \
+     docker exec "$redis" redis-cli ping >/dev/null 2>&1; then
+    ready=true
+    break
+  fi
+  sleep 1
+done
+if [[ "$ready" != true ]]; then
+  echo 'Disposable PostgreSQL/Redis did not become ready' >&2
+  exit 2
+fi
+pg_port=$(docker port "$postgres" 5432/tcp | sed 's/.*://')
+redis_port=$(docker port "$redis" 6379/tcp | sed 's/.*://')
+export DATABASE_URL="postgres://multica:multica@127.0.0.1:$pg_port/multica?sslmode=disable"
+export REDIS_TEST_URL="redis://127.0.0.1:$redis_port/1"
+export GOFLAGS=-count=1
+(cd server && go build -race ./...)
+(cd server && go vet -race -tags agentintegration ./...)
+(cd server && go run ./cmd/migrate up)
+bash scripts/test-go.test.sh
+bash scripts/test-go.sh --race --only regular
