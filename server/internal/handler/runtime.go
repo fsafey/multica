@@ -959,15 +959,23 @@ func profileInstanceDeleteRefusal(rt db.AgentRuntime, profile db.RuntimeProfile,
 
 	parts := []string{lead}
 	switch {
+	case blockers.poolMemberships > 0:
+		// First, whatever the status: stopping the daemon or clearing agents
+		// and tasks still leaves a row GC never reclaims, so any of those
+		// remedies would promise a cleanup that does not come.
+		parts = append(parts, fmt.Sprintf(
+			"It is a member of %d runtime pool(s), and Multica never removes a pool member automatically, so a dormant pooled worker returns under the same runtime ID; this row will not be reclaimed on its own. To retire it, once it has been offline for %d days a workspace admin can remove it from each pool with `multica dag pool prune-stale-runtime`, after which Multica reclaims it automatically.",
+			blockers.poolMemberships, ttlDays,
+		))
 	case rt.Status == "online":
 		parts = append(parts, fmt.Sprintf(
-			"It is still online, so its daemon would register it again. Stop that daemon first; Multica then removes the runtime automatically after %d days offline, once no agent is bound to it and nothing is still running on it.",
+			"It is still online, so its daemon would register it again. Stop that daemon first; Multica then removes the runtime automatically after %d days offline, once no agent is bound to it, nothing is still running on it, and it belongs to no runtime pool.",
 			ttlDays,
 		))
 	case !known:
 		// Blocker set unavailable; promise only what holds regardless of it.
 		parts = append(parts, fmt.Sprintf(
-			"It is offline, and Multica removes offline runtimes automatically after %d days, once no agent is bound to them and nothing is still running on them.",
+			"It is offline, and Multica removes offline runtimes automatically after %d days, once no agent is bound to them, nothing is still running on them, and they belong to no runtime pool.",
 			ttlDays,
 		))
 	case len(blockers.agents) > 0 || blockers.undrainedTasks > 0:
@@ -1006,15 +1014,20 @@ func profileInstanceDeleteRefusal(rt db.AgentRuntime, profile db.RuntimeProfile,
 		// Structured companions to the sentence above so a client can render
 		// its own localized copy instead of echoing the English (see
 		// writeErrorCode's rationale). The sentence stays the fallback.
-		"profile_id":              uuidToString(profile.ID),
-		"profile_name":            profile.DisplayName,
-		"runtime_status":          rt.Status,
-		"last_seen_at":            timestampToPtr(rt.LastSeenAt),
-		"auto_cleanup_after_days": ttlDays,
+		"profile_id":     uuidToString(profile.ID),
+		"profile_name":   profile.DisplayName,
+		"runtime_status": rt.Status,
+		"last_seen_at":   timestampToPtr(rt.LastSeenAt),
+	}
+	// A pool member is never cleaned up on its own, so a client rendering from
+	// these fields must not find a cleanup deadline the sentence denies.
+	if blockers.poolMemberships == 0 {
+		resp["auto_cleanup_after_days"] = ttlDays
 	}
 	if known {
 		resp["active_agent_count"] = len(blockers.agents)
 		resp["undrained_task_count"] = blockers.undrainedTasks
+		resp["runtime_pool_count"] = blockers.poolMemberships
 	}
 	return resp
 }
@@ -1023,12 +1036,14 @@ func profileInstanceDeleteRefusal(rt db.AgentRuntime, profile db.RuntimeProfile,
 // reclaim an offline runtime, which is more than its candidate query asks for:
 // the candidate scan wants no non-archived user agent and no runtime-owned task
 // with completed_at NULL, and then gcRuntime re-checks the drain across every
-// user agent bound to the runtime, archived ones included. Reporting any subset
-// of that promises a cleanup the sweeper then skips.
+// user agent bound to the runtime, archived ones included. Both also exempt
+// every runtime pool member. Reporting any subset of that promises a cleanup
+// the sweeper then skips.
 type profileInstanceBlockers struct {
-	agents         []db.Agent
-	undrainedTasks int64
-	known          bool
+	agents          []db.Agent
+	undrainedTasks  int64
+	poolMemberships int64
+	known           bool
 }
 
 // profileInstanceRefusalBlockers reads what would stop retention GC from
@@ -1067,7 +1082,13 @@ func (h *Handler) profileInstanceRefusalBlockers(ctx context.Context, runtimeID 
 			"runtime_id", uuidToString(runtimeID), "error", err)
 		return profileInstanceBlockers{}
 	}
-	return profileInstanceBlockers{agents: agents, undrainedTasks: tasks, known: true}
+	pools, err := h.Queries.CountRuntimePoolMembershipsByRuntime(ctx, runtimeID)
+	if err != nil {
+		slog.Warn("profile instance refusal: runtime pool membership lookup failed",
+			"runtime_id", uuidToString(runtimeID), "error", err)
+		return profileInstanceBlockers{}
+	}
+	return profileInstanceBlockers{agents: agents, undrainedTasks: tasks, poolMemberships: pools, known: true}
 }
 
 // canUseRuntimeForAgent checks runtime-owner consent after workspace membership.

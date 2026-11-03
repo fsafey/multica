@@ -11,7 +11,8 @@ import (
 
 // OfflineRuntimeTTLSeconds is how long an offline runtime is kept before
 // retention GC deletes it, once no active agent and no non-terminal task
-// remain on it. GC applies this to every runtime row, including the
+// remain on it and it belongs to no runtime pool (pool members are never
+// collected). GC applies this to every runtime row, including the
 // profile-backed ones the interactive delete endpoints refuse — so those
 // refusal messages quote this same number to tell the user when the row they
 // cannot delete will disappear on its own. Keeping one constant is what stops

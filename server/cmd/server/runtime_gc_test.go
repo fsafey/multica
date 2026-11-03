@@ -401,6 +401,77 @@ func TestRuntimeGCBatch_PublishesSystemActorAndDeduplicatesWorkspaceRefresh(t *t
 	}
 }
 
+// A pooled worker can sit dormant past the offline TTL. Reaping it deleted its
+// pool memberships with it, so every restart re-registered under a new runtime
+// ID that no pool or pool declaration named. Membership must exempt a runtime
+// from GC whether the membership or its pool is enabled, while a stale
+// non-member in the same workspace is still collected.
+func TestRuntimeGC_KeepsStaleOfflinePoolMembers(t *testing.T) {
+	if testPool == nil {
+		t.Skip("no database connection")
+	}
+	ctx := context.Background()
+	workspaceID := createRuntimeGCFixtureWorkspace(t, ctx, "pool-members")
+	memberID := createRuntimeGCFixtureRuntimeForWorkspace(t, ctx, workspaceID, "pool-member")
+	disabledMemberID := createRuntimeGCFixtureRuntimeForWorkspace(t, ctx, workspaceID, "pool-member-disabled")
+	nonMemberID := createRuntimeGCFixtureRuntimeForWorkspace(t, ctx, workspaceID, "pool-non-member")
+	createRuntimeGCFixturePoolMember(t, ctx, workspaceID, "enabled", true, memberID)
+	createRuntimeGCFixturePoolMember(t, ctx, workspaceID, "disabled", false, disabledMemberID)
+	queries := db.New(testPool)
+
+	candidates, err := queries.ListStaleOfflineRuntimeGCCandidates(ctx, db.ListStaleOfflineRuntimeGCCandidatesParams{
+		StaleSeconds: offlineRuntimeTTLSeconds,
+		MaxPerTick:   runtimeGCBatchSize,
+	})
+	if err != nil {
+		t.Fatalf("list GC candidates: %v", err)
+	}
+	foundNonMember := false
+	for _, id := range candidates {
+		switch util.UUIDToString(id) {
+		case memberID, disabledMemberID:
+			t.Fatalf("stale offline pool member %s entered the bounded GC batch", util.UUIDToString(id))
+		case nonMemberID:
+			foundNonMember = true
+		}
+	}
+	if !foundNonMember {
+		t.Fatal("stale offline non-member missing from GC candidates")
+	}
+
+	// The candidate scan is only an efficiency filter; the locked re-check is
+	// the correctness boundary and must refuse a pool member on its own.
+	result, err := gcRuntime(ctx, testPool, queries, parseUUID(memberID))
+	if err != nil {
+		t.Fatalf("gcRuntime: %v", err)
+	}
+	if result.deleted || result.skipReason != "eligibility_changed" {
+		t.Fatalf("gc result deleted=%v skip_reason=%q, want eligibility-changed skip", result.deleted, result.skipReason)
+	}
+
+	gcRuntimesWithBudget(ctx, testPool, queries, nil, nil, 5*time.Second)
+
+	for _, id := range []string{memberID, disabledMemberID} {
+		var runtimeRows, membershipRows int
+		if err := testPool.QueryRow(ctx, `SELECT count(*) FROM agent_runtime WHERE id = $1`, id).Scan(&runtimeRows); err != nil {
+			t.Fatalf("count runtime: %v", err)
+		}
+		if err := testPool.QueryRow(ctx, `SELECT count(*) FROM runtime_pool_runtime WHERE runtime_id = $1`, id).Scan(&membershipRows); err != nil {
+			t.Fatalf("count pool membership: %v", err)
+		}
+		if runtimeRows != 1 || membershipRows != 1 {
+			t.Fatalf("pool member %s after GC: runtime rows=%d membership rows=%d, want both kept", id, runtimeRows, membershipRows)
+		}
+	}
+	var nonMemberRows int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM agent_runtime WHERE id = $1`, nonMemberID).Scan(&nonMemberRows); err != nil {
+		t.Fatalf("count non-member runtime: %v", err)
+	}
+	if nonMemberRows != 0 {
+		t.Fatalf("stale offline non-member rows=%d after GC, want collected", nonMemberRows)
+	}
+}
+
 func TestRuntimeGC_RollsBackDetachedHistoryWhenDeleteFails(t *testing.T) {
 	if testPool == nil {
 		t.Skip("no database connection")
@@ -735,6 +806,30 @@ func createRuntimeGCFixtureProfile(t *testing.T, ctx context.Context, suffix str
 		_, _ = testPool.Exec(context.Background(), `DELETE FROM runtime_profile WHERE id = $1`, profileID)
 	})
 	return profileID
+}
+
+// createRuntimeGCFixturePoolMember creates a pool whose enabled flag, and that
+// of its single membership, both follow enabled.
+func createRuntimeGCFixturePoolMember(t *testing.T, ctx context.Context, workspaceID, suffix string, enabled bool, runtimeID string) {
+	t.Helper()
+	var poolID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO runtime_pool (workspace_id, name, enabled, created_by)
+		VALUES ($1, $2, $3, $4)
+		RETURNING id
+	`, workspaceID, "Runtime GC Pool "+suffix, enabled, testUserID).Scan(&poolID); err != nil {
+		t.Fatalf("create runtime pool fixture: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM runtime_pool_runtime WHERE pool_id = $1`, poolID)
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM runtime_pool WHERE id = $1`, poolID)
+	})
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO runtime_pool_runtime (pool_id, runtime_id, priority, enabled)
+		VALUES ($1, $2, 10, $3)
+	`, poolID, runtimeID, enabled); err != nil {
+		t.Fatalf("add runtime pool member fixture: %v", err)
+	}
 }
 
 func createRuntimeGCFixtureWorkspace(t *testing.T, ctx context.Context, suffix string) string {
