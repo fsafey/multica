@@ -627,6 +627,11 @@ WHERE id = $1;
 -- of every batch and starve otherwise-drainable runtimes. The per-runtime
 -- transaction re-checks every predicate after taking FOR UPDATE, so this is an
 -- efficiency filter rather than the correctness boundary.
+--
+-- Runtime pool membership is declared capacity, not a leftover: a pooled
+-- worker can sit dormant for longer than the offline TTL and must come back
+-- under the same runtime ID, or every pool and the declarations that name its
+-- members drift. Any membership row, enabled or not, keeps the runtime.
 SELECT id FROM agent_runtime
 WHERE status = 'offline'
   AND last_seen_at < now() - make_interval(secs => @stale_seconds::double precision)
@@ -643,6 +648,11 @@ WHERE status = 'offline'
     WHERE agent_task_queue.runtime_id = agent_runtime.id
       AND agent_task_queue.completed_at IS NULL
   )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM runtime_pool_runtime
+    WHERE runtime_pool_runtime.runtime_id = agent_runtime.id
+  )
 ORDER BY last_seen_at ASC, id ASC
 LIMIT @max_per_tick::int;
 
@@ -650,7 +660,8 @@ LIMIT @max_per_tick::int;
 -- Re-checks the mutable GC predicates after the caller has locked the runtime
 -- row FOR UPDATE. Agent inserts/updates and task ownership writes take FOR KEY
 -- SHARE on that row, so no new dependency can commit between this check and
--- DeleteAgentRuntime in the same transaction.
+-- DeleteAgentRuntime in the same transaction. AddRuntimeToPool takes the same
+-- FOR KEY SHARE, so a pool join cannot slip past the membership check either.
 SELECT EXISTS (
   SELECT 1 FROM agent_runtime
   WHERE agent_runtime.id = @id
@@ -663,7 +674,17 @@ SELECT EXISTS (
         AND agent.kind = 'user'
         AND agent.archived_at IS NULL
     )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM runtime_pool_runtime
+      WHERE runtime_pool_runtime.runtime_id = agent_runtime.id
+    )
 ) AS eligible;
+
+-- name: CountRuntimePoolMembershipsByRuntime :one
+-- Pool memberships that exempt this runtime from retention GC, for delete
+-- guidance that must not promise a cleanup the sweeper will never perform.
+SELECT count(*) FROM runtime_pool_runtime WHERE runtime_id = $1;
 
 -- name: CountTasksByRuntime :one
 -- Final fail-closed assertion after UnbindTasksFromRuntime. A non-zero result

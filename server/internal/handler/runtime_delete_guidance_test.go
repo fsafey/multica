@@ -967,6 +967,60 @@ func TestDeleteAgentRuntime_OfflineInstanceMatchesTheRealGCDrainGate(t *testing.
 	}
 }
 
+// Retention GC never reclaims a runtime pool member, so a refusal for one must
+// not promise the cleanup it gives an otherwise dependency-free row — online or
+// offline, since stopping the daemon changes nothing for a pool member either.
+func TestDeleteAgentRuntime_PoolMemberInstanceDoesNotPromiseCleanup(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	runtimeID, _ := createProfileBackedRuntime(t, ctx, "Dormant Pool Worker")
+	var poolID string
+	dbfx.QueryRow(t, `
+		INSERT INTO runtime_pool (workspace_id, name, created_by)
+		VALUES ($1, 'Dormant Pool Worker Pool', $2)
+		RETURNING id`, testWorkspaceID, testUserID).Scan(&poolID)
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM runtime_pool_runtime WHERE pool_id = $1`, poolID)
+		testPool.Exec(context.Background(), `DELETE FROM runtime_pool WHERE id = $1`, poolID)
+	})
+	dbfx.Exec(t, `INSERT INTO runtime_pool_runtime (pool_id, runtime_id) VALUES ($1, $2)`, poolID, runtimeID)
+
+	for _, offline := range []bool{false, true} {
+		if offline {
+			dbfx.Exec(t, `UPDATE agent_runtime SET status='offline', last_seen_at=now()-interval '8 days' WHERE id=$1`, runtimeID)
+			rows, err := testHandler.Queries.ListStaleOfflineRuntimeGCCandidates(ctx, db.ListStaleOfflineRuntimeGCCandidatesParams{
+				StaleSeconds: service.OfflineRuntimeTTLSeconds, MaxPerTick: 10000,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, id := range rows {
+				if uuidToString(id) == runtimeID {
+					t.Fatal("GC unexpectedly allows a runtime pool member")
+				}
+			}
+		}
+		w := httptest.NewRecorder()
+		testHandler.DeleteAgentRuntime(w, withURLParam(newRequest("DELETE", "/api/runtimes/"+runtimeID, nil), "runtimeId", runtimeID))
+		if w.Code != http.StatusConflict {
+			t.Fatalf("offline=%v delete: %d %s", offline, w.Code, w.Body.String())
+		}
+		body := decodeConflict(t, w)
+		msg := conflictMessage(t, body)
+		if strings.Contains(msg, "without any action from you") || strings.Contains(msg, "Stop that daemon first") {
+			t.Errorf("offline=%v: GC never reclaims a pool member, but guidance promises cleanup: %s", offline, msg)
+		}
+		if !strings.Contains(msg, "runtime pool") {
+			t.Errorf("offline=%v: refusal must name the pool membership holding the row: %s", offline, msg)
+		}
+		if got, _ := body["runtime_pool_count"].(float64); got != 1 {
+			t.Errorf("offline=%v: runtime_pool_count = %v, want 1", offline, body["runtime_pool_count"])
+		}
+	}
+}
+
 // The Mika clause makes two claims about product capability, and an earlier
 // version of it had the second one backwards — it said Mika could not be moved,
 // which told an owner who could have fixed the block in one edit to give up.

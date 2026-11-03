@@ -285,6 +285,19 @@ func (q *Queries) CountActiveTasksByRuntime(ctx context.Context, runtimeID pgtyp
 	return count, err
 }
 
+const countRuntimePoolMembershipsByRuntime = `-- name: CountRuntimePoolMembershipsByRuntime :one
+SELECT count(*) FROM runtime_pool_runtime WHERE runtime_id = $1
+`
+
+// Pool memberships that exempt this runtime from retention GC, for delete
+// guidance that must not promise a cleanup the sweeper will never perform.
+func (q *Queries) CountRuntimePoolMembershipsByRuntime(ctx context.Context, runtimeID pgtype.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countRuntimePoolMembershipsByRuntime, runtimeID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const countTasksByRuntime = `-- name: CountTasksByRuntime :one
 SELECT count(*) FROM agent_task_queue WHERE runtime_id = $1
 `
@@ -791,6 +804,11 @@ SELECT EXISTS (
         AND agent.kind = 'user'
         AND agent.archived_at IS NULL
     )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM runtime_pool_runtime
+      WHERE runtime_pool_runtime.runtime_id = agent_runtime.id
+    )
 ) AS eligible
 `
 
@@ -802,7 +820,8 @@ type IsAgentRuntimeEligibleForGCParams struct {
 // Re-checks the mutable GC predicates after the caller has locked the runtime
 // row FOR UPDATE. Agent inserts/updates and task ownership writes take FOR KEY
 // SHARE on that row, so no new dependency can commit between this check and
-// DeleteAgentRuntime in the same transaction.
+// DeleteAgentRuntime in the same transaction. AddRuntimeToPool takes the same
+// FOR KEY SHARE, so a pool join cannot slip past the membership check either.
 func (q *Queries) IsAgentRuntimeEligibleForGC(ctx context.Context, arg IsAgentRuntimeEligibleForGCParams) (bool, error) {
 	row := q.db.QueryRow(ctx, isAgentRuntimeEligibleForGC, arg.ID, arg.StaleSeconds)
 	var eligible bool
@@ -1297,6 +1316,11 @@ WHERE status = 'offline'
     WHERE agent_task_queue.runtime_id = agent_runtime.id
       AND agent_task_queue.completed_at IS NULL
   )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM runtime_pool_runtime
+    WHERE runtime_pool_runtime.runtime_id = agent_runtime.id
+  )
 ORDER BY last_seen_at ASC, id ASC
 LIMIT $2::int
 `
@@ -1311,6 +1335,11 @@ type ListStaleOfflineRuntimeGCCandidatesParams struct {
 // of every batch and starve otherwise-drainable runtimes. The per-runtime
 // transaction re-checks every predicate after taking FOR UPDATE, so this is an
 // efficiency filter rather than the correctness boundary.
+//
+// Runtime pool membership is declared capacity, not a leftover: a pooled
+// worker can sit dormant for longer than the offline TTL and must come back
+// under the same runtime ID, or every pool and the declarations that name its
+// members drift. Any membership row, enabled or not, keeps the runtime.
 func (q *Queries) ListStaleOfflineRuntimeGCCandidates(ctx context.Context, arg ListStaleOfflineRuntimeGCCandidatesParams) ([]pgtype.UUID, error) {
 	rows, err := q.db.Query(ctx, listStaleOfflineRuntimeGCCandidates, arg.StaleSeconds, arg.MaxPerTick)
 	if err != nil {
