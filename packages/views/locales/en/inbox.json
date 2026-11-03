@@ -3,6 +3,15 @@
     "title": "Inbox",
     "back": "Inbox"
   },
+  "sections": {
+    "action": "Needs action",
+    "activity": "Activity",
+    "action_empty": "You're all caught up",
+    "activity_empty": "No recent activity",
+    "activity_waiting_other": "{{count}} updates are waiting in Activity.",
+    "open_activity": "View activity",
+    "activity_waiting_one": "{{count}} update is waiting in Activity."
+  },
   "menu": {
     "mark_all_read": "Mark all as read",
     "archive_all": "Archive all",
@@ -17,6 +26,7 @@
     "priority": "Priority",
     "from": "From",
     "unread_only": "Unread only",
+    "no_agents_working": "No agents working",
     "notification_count_one": "{{count}} notification",
     "notification_count_other": "{{count}} notifications",
     "clear": "Clear filters",
@@ -80,6 +90,7 @@
     "quick_create_failed": "Create with agent failed",
     "quick_create_unconfirmed": "Create with agent unconfirmed",
     "autopilot_paused": "Autopilot paused",
+    "children_done": "Sub-issues finished",
     "autopilot_quota_exceeded": "Autopilot run limit reached"
   },
   "labels": {
@@ -94,7 +105,8 @@
     "reacted_to_comment": "Reacted {{emoji}} to your comment",
     "created_with_agent": "Created with agent: {{identifier}}",
     "failed_with_detail": "Failed: {{detail}}",
-    "autopilot_quota_blocked": "Run blocked because the limit was reached"
+    "autopilot_quota_blocked": "Run blocked because the limit was reached",
+    "children_done_stage": "Stage {{stage}}'s sub-issues finished"
   },
   "toasts": {
     "source_context_retry_started": "Retry started with the original context",

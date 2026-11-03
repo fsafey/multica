@@ -4,6 +4,12 @@
     "title": "You're all caught up",
     "body": "Notifications and agent updates appear here."
   },
+  "sections": {
+    "action": "Needs action",
+    "activity": "Activity",
+    "activity_empty": "No recent activity",
+    "activity_empty_body": "Status changes and agent replies on your issues appear here."
+  },
   "actions": {
     "mark_read": "Mark read",
     "mark_unread": "Mark unread",
@@ -64,6 +70,7 @@
     "quick_create_failed": "Quick-create failed",
     "quick_create_unconfirmed": "Quick-create needs a check",
     "autopilot_paused": "Autopilot paused",
+    "children_done": "Sub-issues finished",
     "autopilot_quota_exceeded": "Autopilot run limit reached",
     "set_status": "Set status to",
     "set_priority": "Set priority to",

@@ -3,6 +3,15 @@
     "title": "Boîte de réception",
     "back": "Boîte de réception"
   },
+  "sections": {
+    "action": "À traiter",
+    "activity": "Activité",
+    "action_empty": "Vous êtes à jour",
+    "activity_empty": "Aucune activité récente",
+    "activity_waiting_other": "{{count}} mises à jour vous attendent dans Activité.",
+    "open_activity": "Voir l'activité",
+    "activity_waiting_one": "{{count}} mise à jour vous attend dans Activité."
+  },
   "menu": {
     "mark_all_read": "Tout marquer comme lu",
     "archive_all": "Tout archiver",
@@ -17,6 +26,7 @@
     "priority": "Priorité",
     "from": "De",
     "unread_only": "Non lues uniquement",
+    "no_agents_working": "Aucun agent au travail",
     "notification_count_one": "{{count}} notification",
     "notification_count_other": "{{count}} notifications",
     "clear": "Effacer les filtres",
@@ -80,6 +90,7 @@
     "quick_create_failed": "Échec de la création avec un agent",
     "quick_create_unconfirmed": "Création avec un agent non confirmée",
     "autopilot_paused": "Automatisation en pause",
+    "children_done": "Sous-tâches terminées",
     "autopilot_quota_exceeded": "Limite d'exécutions d'automatisation atteinte"
   },
   "labels": {
@@ -94,7 +105,8 @@
     "reacted_to_comment": "A réagi {{emoji}} à votre commentaire",
     "created_with_agent": "Créé avec un agent : {{identifier}}",
     "failed_with_detail": "Échec : {{detail}}",
-    "autopilot_quota_blocked": "Exécution bloquée car la limite a été atteinte"
+    "autopilot_quota_blocked": "Exécution bloquée car la limite a été atteinte",
+    "children_done_stage": "Sous-tâches de l’étape {{stage}} terminées"
   },
   "toasts": {
     "source_context_retry_started": "Nouvelle tentative démarrée avec le contexte d'origine",

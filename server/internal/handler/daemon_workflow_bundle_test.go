@@ -16,6 +16,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/middleware"
+	"github.com/multica-ai/multica/server/internal/testutil"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
@@ -104,6 +105,13 @@ func TestWorkflowAttemptMatchesSubmission(t *testing.T) {
 	}
 }
 
+// workflowBundleDaemonContext is a daemon-token context for the test runtime's
+// owner; production daemon tokens carry that owner since MUL-8154.
+func workflowBundleDaemonContext(ctx context.Context, daemonID string) context.Context {
+	ctx = middleware.WithDaemonContext(ctx, testWorkspaceID, daemonID)
+	return middleware.WithDaemonTokenOwnerID(ctx, testUserID)
+}
+
 func TestSubmitWorkflowBundlePreservesArtifactWhenCommitAckIsLost(t *testing.T) {
 	testSubmitWorkflowBundleConvergence(t)
 }
@@ -111,15 +119,11 @@ func TestSubmitWorkflowBundlePreservesArtifactWhenCommitAckIsLost(t *testing.T) 
 func testSubmitWorkflowBundleConvergence(t *testing.T) {
 	ctx := context.Background()
 	daemonID := fmt.Sprintf("workflow-bundle-test-%d", time.Now().UnixNano())
+	// Daemon task routes require the task's runtime to belong to the calling
+	// daemon and token owner (MUL-8154), so the run gets its own runtime.
+	runtimeID := dbfx.Runtime(t, "workflow bundle runtime", testutil.Cols{"daemon_id": daemonID})
 
-	var agentID string
-	if err := testPool.QueryRow(
-		ctx,
-		`SELECT id FROM agent WHERE workspace_id = $1 ORDER BY created_at LIMIT 1`,
-		testWorkspaceID,
-	).Scan(&agentID); err != nil {
-		t.Fatalf("load test agent: %v", err)
-	}
+	agentID := dbfx.Agent(t, "workflow bundle agent", runtimeID)
 
 	var projectID string
 	if err := testPool.QueryRow(ctx, `
@@ -178,7 +182,7 @@ func testSubmitWorkflowBundleConvergence(t *testing.T) {
 		)
 		VALUES ($1, $2, 'running', $3, $4, 1, 'input-1', 'law-1')
 		RETURNING id
-	`, agentID, issueID, testRuntimeID, nodeID).Scan(&taskID); err != nil {
+	`, agentID, issueID, runtimeID, nodeID).Scan(&taskID); err != nil {
 		t.Fatalf("create workflow task: %v", err)
 	}
 	var attemptID string
@@ -189,7 +193,7 @@ func testSubmitWorkflowBundleConvergence(t *testing.T) {
 		)
 		VALUES ($1, 1, $2, $3, $4, 'running', now() + interval '5 minutes', now())
 		RETURNING id
-	`, nodeID, taskID, testRuntimeID, daemonID).Scan(&attemptID); err != nil {
+	`, nodeID, taskID, runtimeID, daemonID).Scan(&attemptID); err != nil {
 		t.Fatalf("create workflow attempt: %v", err)
 	}
 	if _, err := testPool.Exec(ctx,
@@ -248,7 +252,7 @@ func testSubmitWorkflowBundleConvergence(t *testing.T) {
 		BaseCommit:   "base-1",
 		ResultCommit: "result-1",
 		AgentID:      agentID,
-		RuntimeID:    testRuntimeID,
+		RuntimeID:    runtimeID,
 		ChangedPaths: []string{"pipeline-output/passage-1/01-segmented.md"},
 		BundleSHA256: digest,
 	}
@@ -286,13 +290,13 @@ func testSubmitWorkflowBundleConvergence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load workflow task for claim response: %v", err)
 	}
-	claimedRuntime, err := handler.Queries.GetAgentRuntime(ctx, parseUUID(testRuntimeID))
+	claimedRuntime, err := handler.Queries.GetAgentRuntime(ctx, parseUUID(runtimeID))
 	if err != nil {
 		t.Fatalf("load workflow runtime for claim response: %v", err)
 	}
 	claimRequest := newRequest(http.MethodPost, "/api/daemon/tasks/claim", nil)
-	claimRequest = claimRequest.WithContext(middleware.WithDaemonContext(claimRequest.Context(), testWorkspaceID, daemonID))
-	claimResponse, _, _, _, _, claimFailure := handler.buildClaimedTaskResponse(claimRequest, &claimedTask, claimedRuntime, testRuntimeID, testWorkspaceID)
+	claimRequest = claimRequest.WithContext(workflowBundleDaemonContext(claimRequest.Context(), daemonID))
+	claimResponse, _, _, _, _, claimFailure := handler.buildClaimedTaskResponse(claimRequest, &claimedTask, claimedRuntime, runtimeID, testWorkspaceID)
 	if claimFailure != nil {
 		t.Fatalf("workflow claim response failed: %+v", claimFailure)
 	}
@@ -317,7 +321,7 @@ func testSubmitWorkflowBundleConvergence(t *testing.T) {
 		)
 		VALUES ($1, $2, 'workflow.artifact_submitted', '{}'::jsonb, 'processing', $3, $4, now() + interval '5 minutes')
 		RETURNING id
-	`, runID, nodeID, testRuntimeID, daemonID).Scan(&integrationEventID); err != nil {
+	`, runID, nodeID, runtimeID, daemonID).Scan(&integrationEventID); err != nil {
 		t.Fatalf("create claimed workflow integration event: %v", err)
 	}
 	memberIntegrationRequest := newRequest(http.MethodGet, "/api/daemon/workflow-integrations/"+integrationEventID+"/bundle", nil)
@@ -326,7 +330,7 @@ func testSubmitWorkflowBundleConvergence(t *testing.T) {
 		t.Fatalf("member workflow integration access = %t/%d, want false/409", ok, memberIntegrationResponse.Code)
 	}
 	daemonIntegrationRequest := newRequest(http.MethodGet, "/api/daemon/workflow-integrations/"+integrationEventID+"/bundle", nil)
-	daemonIntegrationRequest = daemonIntegrationRequest.WithContext(middleware.WithDaemonContext(daemonIntegrationRequest.Context(), testWorkspaceID, daemonID))
+	daemonIntegrationRequest = daemonIntegrationRequest.WithContext(workflowBundleDaemonContext(daemonIntegrationRequest.Context(), daemonID))
 	daemonIntegrationResponse := httptest.NewRecorder()
 	if _, ok := handler.requireWorkflowIntegrationJob(daemonIntegrationResponse, daemonIntegrationRequest, integrationEventID); !ok {
 		t.Fatalf("claimed daemon workflow integration access refused: %s", daemonIntegrationResponse.Body.String())
@@ -367,11 +371,7 @@ func testSubmitWorkflowBundleConvergence(t *testing.T) {
 	cancelRequest = requestCancel
 	defer requestCancel()
 	requestContext = context.WithValue(requestContext, chi.RouteCtxKey, routeContext)
-	requestContext = middleware.WithDaemonContext(
-		requestContext,
-		testWorkspaceID,
-		daemonID,
-	)
+	requestContext = workflowBundleDaemonContext(requestContext, daemonID)
 	request = request.WithContext(requestContext)
 	response := httptest.NewRecorder()
 
@@ -408,11 +408,7 @@ func testSubmitWorkflowBundleConvergence(t *testing.T) {
 		chi.RouteCtxKey,
 		replayRouteContext,
 	)
-	replayContext = middleware.WithDaemonContext(
-		replayContext,
-		testWorkspaceID,
-		daemonID,
-	)
+	replayContext = workflowBundleDaemonContext(replayContext, daemonID)
 	replayRequest = replayRequest.WithContext(replayContext)
 	replayResponse := httptest.NewRecorder()
 
@@ -444,11 +440,7 @@ func testSubmitWorkflowBundleConvergence(t *testing.T) {
 		chi.RouteCtxKey,
 		expectRouteContext,
 	)
-	expectContext = middleware.WithDaemonContext(
-		expectContext,
-		testWorkspaceID,
-		daemonID,
-	)
+	expectContext = workflowBundleDaemonContext(expectContext, daemonID)
 	expectRequest = expectRequest.WithContext(expectContext)
 	expectResponse := httptest.NewRecorder()
 

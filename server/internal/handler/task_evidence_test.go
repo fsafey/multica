@@ -12,14 +12,19 @@ import (
 	"testing"
 
 	"github.com/multica-ai/multica/server/internal/middleware"
+	"github.com/multica-ai/multica/server/internal/testutil"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/executionevidence"
 )
 
+const evidenceTestDaemonID = "evidence-test-daemon"
+
 func createRunningEvidenceTask(t *testing.T) (runtimeID, agentID, issueID, taskID string) {
 	t.Helper()
 	ctx := context.Background()
-	runtimeID = createClaimReclaimRuntime(t, ctx, "execution evidence runtime")
+	// Daemon task routes require the task's runtime to belong to the calling
+	// daemon (MUL-8154).
+	runtimeID = dbfx.Runtime(t, "execution evidence runtime", testutil.Cols{"daemon_id": evidenceTestDaemonID})
 	agentID, issueID = createClaimReclaimAgentAndIssue(t, ctx, runtimeID, "execution evidence")
 	if err := testPool.QueryRow(ctx, `
 		INSERT INTO agent_task_queue (
@@ -46,7 +51,7 @@ func recordEvidenceRequest(t *testing.T, taskID string, snapshot executioneviden
 	req := newDaemonTokenRequest(http.MethodPost, "/api/daemon/tasks/"+taskID+"/evidence", map[string]any{
 		"snapshot":     snapshot,
 		"payload_hash": digest,
-	}, testWorkspaceID, "evidence-test-daemon")
+	}, testWorkspaceID, evidenceTestDaemonID)
 	req = withURLParam(req, "taskId", taskID)
 	testHandler.RecordTaskExecutionEvidence(w, req)
 	return w
@@ -64,7 +69,7 @@ func TestTaskExecutionEvidenceFutureSchemaReturnsUpgradeError(t *testing.T) {
 			"future_field":   "future-value",
 		},
 		"payload_hash": "sha256:" + strings.Repeat("a", 64),
-	}, testWorkspaceID, "future-evidence-daemon")
+	}, testWorkspaceID, evidenceTestDaemonID)
 	req = withURLParam(req, "taskId", taskID)
 	testHandler.RecordTaskExecutionEvidence(w, req)
 	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "upgrade the server") {
@@ -83,7 +88,7 @@ func TestTaskExecutionEvidenceRejectsOversizedBody(t *testing.T) {
 		"/api/daemon/tasks/"+taskID+"/evidence",
 		nil,
 		testWorkspaceID,
-		"oversized-evidence-daemon",
+		evidenceTestDaemonID,
 	)
 	req.Body = io.NopCloser(strings.NewReader(strings.Repeat("x", maxTaskExecutionEvidenceBodyBytes+1)))
 	req = withURLParam(req, "taskId", taskID)
@@ -135,7 +140,7 @@ func TestTaskExecutionEvidenceEndToEnd(t *testing.T) {
 
 	reportMessages := func(messages []TaskMessageRequest) *httptest.ResponseRecorder {
 		w := httptest.NewRecorder()
-		req := newDaemonTokenRequest(http.MethodPost, "/api/daemon/tasks/"+taskID+"/messages", TaskMessageBatchRequest{Messages: messages}, testWorkspaceID, "evidence-test-daemon")
+		req := newDaemonTokenRequest(http.MethodPost, "/api/daemon/tasks/"+taskID+"/messages", TaskMessageBatchRequest{Messages: messages}, testWorkspaceID, evidenceTestDaemonID)
 		req = withURLParam(req, "taskId", taskID)
 		testHandler.ReportTaskMessages(w, req)
 		return w
