@@ -1,41 +1,25 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import type { QueryClient } from "@tanstack/react-query";
 import { api } from "../api";
-import { inboxKeys, mapArchivedInboxCache, patchArchivedInboxCaches, type ArchivedInboxCache } from "./queries";
+import {
+  inboxItemSection,
+  inboxKeys,
+  mapArchivedInboxCache,
+  patchArchivedInboxCaches,
+  type ArchivedInboxCache,
+} from "./queries";
 import { onInboxInvalidate, onInboxSummaryInvalidate } from "./ws-updaters";
 import { useWorkspaceId } from "../hooks";
 import type { InboxItem } from "../types";
 
 /**
- * Re-read every inbox cache a write can change: both workspace lists and the
- * cross-workspace unread summary.
+ * Refresh workspace inbox lists and the account-level unread summary after a
+ * confirmed write. Use realtime's refresh helpers so in-flight reads are cancelled
+ * before refetching; a workspace query prefix does not reach the summary.
  *
- * The unread badge reads that summary (`useInboxUnreadCount`), and it lives
- * under its own account-level key which `inboxKeys.all(wsId)` does not reach.
- * Every mutation here can change the number it holds, so each one refreshes it
- * once the server has confirmed, rather than waiting for the WebSocket echo of
- * its own action.
- *
- * Deliberately the same entry points realtime uses, not local copies: both
- * refreshes have to cancel any in-flight request first, and a mutation racing
- * a first load hits exactly the same hole a WS event does. A plain
- * `invalidateQueries` on the list here would let the list fall behind the
- * badge — the two are rendered side by side (see `refreshInboxQuery`).
- *
- * Not awaited by `onSettled`: the mutation is finished once the server has
- * answered, and a background refresh should not hold its lifecycle open.
- *
- * The rows are patched optimistically but the badge is NOT: it follows the
- * server's confirmation, which buys a single writer at the cost of the badge
- * trailing the row. Deriving it locally instead — recomputing the count from
- * the list cache and writing that back — reads as instant but is unsound: a
- * list cache proves only that the list was loaded ONCE, never that it is
- * complete or concurrent with the summary, and the account-level summary
- * request is not cancelled by the workspace-scoped `cancelQueries` below, so a
- * response already in flight lands on top of the local value anyway. Under
- * pagination it would be wrong by construction — one loaded page cannot
- * produce a global count. If instant feedback is wanted later, it has to be a
- * per-group delta that handles the race, not a recomputed total.
+ * Rows may patch optimistically, but the unread badge follows server confirmation.
+ * A partial or independently fetched list cannot produce a reliable global total.
+ * Do not hold the completed mutation open while the refresh runs.
  */
 function refreshInboxAfterWrite(qc: QueryClient, wsId: string) {
   void onInboxInvalidate(qc, wsId);
@@ -125,12 +109,15 @@ export function useArchiveInbox() {
     onMutate: async (id) => {
       await qc.cancelQueries({ queryKey: inboxKeys.list(wsId) });
       const prev = qc.getQueryData<InboxItem[]>(inboxKeys.list(wsId));
-      // Archive all items for the same issue (same behavior as store)
+      // Archive the issue's siblings like the server does: an action row takes
+      // the whole issue, an activity row only the issue's other activity.
       const target = prev?.find((i) => i.id === id);
       const issueId = target?.issue_id;
+      const activityOnly = target ? inboxItemSection(target) === "activity" : false;
       qc.setQueryData<InboxItem[]>(inboxKeys.list(wsId), (old) =>
         old?.map((item) =>
-          item.id === id || (issueId && item.issue_id === issueId)
+          item.id === id ||
+          (issueId && item.issue_id === issueId && (!activityOnly || inboxItemSection(item) === "activity"))
             ? { ...item, archived: true }
             : item,
         ),
@@ -183,6 +170,35 @@ export function useUnarchiveInbox() {
       // Both lists: the item moves from one to the other, and the unread badge
       // rises again when it was archived unread.
       refreshInboxAfterWrite(qc, wsId);
+    },
+  });
+}
+
+/**
+ * Mark every notification on an issue read — called when the issue is opened
+ * from anywhere, so reading it through the Work sidebar settles the Inbox too.
+ * Takes `wsId` because the caller (issue detail) may render outside the
+ * workspace route context. Nothing is refetched when nothing changed.
+ */
+export function useMarkIssueInboxRead(wsId: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (issueId: string) => api.markIssueInboxRead(issueId),
+    onMutate: async (issueId) => {
+      await qc.cancelQueries({ queryKey: inboxKeys.list(wsId) });
+      const prev = qc.getQueryData<InboxItem[]>(inboxKeys.list(wsId));
+      qc.setQueryData<InboxItem[]>(inboxKeys.list(wsId), (old) =>
+        old?.map((item) =>
+          item.issue_id === issueId && !item.archived && !item.read ? { ...item, read: true } : item,
+        ),
+      );
+      return { prev };
+    },
+    onError: (_err, _issueId, ctx) => {
+      if (ctx?.prev) qc.setQueryData(inboxKeys.list(wsId), ctx.prev);
+    },
+    onSuccess: (result) => {
+      if (result.count !== 0) refreshInboxAfterWrite(qc, wsId);
     },
   });
 }

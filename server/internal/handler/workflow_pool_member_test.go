@@ -77,7 +77,7 @@ func TestRuntimeDeletionAndLegacyMergeKeepPoolMembershipsConsistent(t *testing.T
 	}
 	dbfx.Cleanup(t, `DELETE FROM runtime_pool_runtime WHERE pool_id = $1`, poolID)
 
-	if err := testHandler.mergeLegacyRuntime(context.Background(), parseUUID(newRuntimeID), parseUUID(oldRuntimeID), "legacy-pool-test", "handler_test_runtime"); err != nil {
+	if err := testHandler.mergeLegacyRuntime(context.Background(), parseUUID(newRuntimeID), parseUUID(oldRuntimeID), "legacy-pool-test", "handler_test_runtime", parseUUID(testUserID)); err != nil {
 		t.Fatalf("merge legacy runtime: %v", err)
 	}
 	if count := dbfx.Count(t, `SELECT count(*) FROM runtime_pool_runtime WHERE pool_id = $1 AND runtime_id = $2`, poolID, oldRuntimeID); count != 0 {

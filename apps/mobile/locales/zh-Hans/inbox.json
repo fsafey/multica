@@ -4,6 +4,12 @@
     "title": "已处理全部通知",
     "body": "通知和智能体更新会显示在这里。"
   },
+  "sections": {
+    "action": "需要处理",
+    "activity": "动态",
+    "activity_empty": "暂无动态",
+    "activity_empty_body": "你的任务上的状态变更和智能体回复会显示在这里。"
+  },
   "actions": {
     "mark_read": "标记已读",
     "mark_unread": "标记未读",
@@ -54,7 +60,7 @@
     "due_date_changed": "截止日期已更改",
     "new_comment": "新评论",
     "mentioned": "提到了你",
-    "review_requested": "请求审核",
+    "review_requested": "请求审查",
     "task_completed": "运行完成",
     "task_failed": "运行失败",
     "agent_blocked": "智能体受阻",
@@ -64,6 +70,7 @@
     "quick_create_failed": "快速创建失败",
     "quick_create_unconfirmed": "快速创建需要确认",
     "autopilot_paused": "自动化已暂停",
+    "children_done": "子任务已全部结束",
     "autopilot_quota_exceeded": "自动化运行次数已达上限",
     "set_status": "状态设为",
     "set_priority": "优先级设为",

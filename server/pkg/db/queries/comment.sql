@@ -386,15 +386,51 @@ LIMIT 1;
 SELECT c.* FROM comment c
 WHERE c.issue_id = @issue_id
   AND (c.id = ANY(@planned_comment_ids::uuid[])
-       OR comment_thread_root_id(c.id) = sqlc.narg('comment_thread_id')::uuid)
+       OR comment_thread_root_id(c.id) = sqlc.narg('comment_thread_id')::uuid
+       -- An agent comment that steered this run but was never read took the
+       -- place of the follow-up its mention would have queued; replay it.
+       OR (c.author_type = 'agent' AND EXISTS (
+           SELECT 1 FROM task_supplement steered
+           WHERE steered.comment_id = c.id AND steered.task_id = sqlc.narg('task_id')::uuid
+             AND steered.status <> 'delivered'
+       )))
   -- A deleted comment is no longer input, even when replies keep its row.
   AND c.deleted_at IS NULL
-  -- Explicit supplements belong only to their bound run, regardless of
-  -- delivery status. Failed delivery must not become an automatic new run.
+  -- A member comment that steered this agent's running turn belongs to that
+  -- turn, regardless of delivery status: failed delivery must not become an
+  -- automatic new run, because the member sees the failure and can retry or
+  -- send it as a new run. No one watches an agent's steering receipt, so an
+  -- agent comment belongs to the turn only once delivered; otherwise it is
+  -- replayed like any other mention. The same comment still reconciles
+  -- normally for any other agent it addressed without steering.
   AND NOT EXISTS (
       SELECT 1 FROM task_supplement s
+      JOIN agent_task_queue bound ON bound.id = s.task_id
       WHERE s.comment_id = c.id AND s.workspace_id = c.workspace_id
+        AND bound.agent_id = @agent_id
+        AND (c.author_type <> 'agent' OR s.status = 'delivered')
   )
+  -- An explicit member/agent cancellation acknowledges the planned input for
+  -- this agent only for completing tasks already in flight at cancellation;
+  -- automatic cancellations deliberately remain replayable.
+  AND NOT EXISTS (
+      SELECT 1
+      FROM agent_task_queue cancelled
+      WHERE cancelled.issue_id = c.issue_id
+        AND cancelled.agent_id = @agent_id
+        AND cancelled.status = 'cancelled'
+        AND cancelled.cancelled_by_type IN ('member', 'agent')
+        AND cancelled.cancelled_by_id IS NOT NULL
+        AND cancelled.completed_at IS NOT NULL
+        AND cancelled.completed_at >= @since
+        AND c.updated_at <= cancelled.completed_at
+        AND (
+            cancelled.trigger_comment_id = c.id
+            OR c.id = ANY(cancelled.coalesced_comment_ids)
+        )
+  )
+  -- Nor does a comment whose author chose not to start this agent for it.
+  AND NOT COALESCE(@agent_id::uuid = ANY(c.suppressed_agent_ids), false)
   AND (
       (
           c.author_type IN ('member', 'agent')
@@ -459,8 +495,8 @@ WITH touched_issue AS (
     WHERE issue.id = sqlc.arg(issue_id) AND issue.workspace_id = sqlc.arg(workspace_id)
     RETURNING issue.id, issue.workspace_id, issue.revision
 ), inserted_comment AS (
-    INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content, type, parent_id, source_task_id, quick_action_id, via_plugin_id, id)
-    SELECT ti.id, ti.workspace_id, sqlc.arg(author_type), sqlc.arg(author_id), sqlc.arg(content), sqlc.arg(type), sqlc.narg(parent_id), sqlc.narg(source_task_id), sqlc.narg(quick_action_id), sqlc.narg(via_plugin_id), COALESCE(sqlc.narg('id')::uuid, gen_random_uuid())
+    INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content, type, parent_id, source_task_id, quick_action_id, via_plugin_id, suppressed_agent_ids, id)
+    SELECT ti.id, ti.workspace_id, sqlc.arg(author_type), sqlc.arg(author_id), sqlc.arg(content), sqlc.arg(type), sqlc.narg(parent_id), sqlc.narg(source_task_id), sqlc.narg(quick_action_id), sqlc.narg(via_plugin_id), sqlc.narg(suppressed_agent_ids)::uuid[], COALESCE(sqlc.narg('id')::uuid, gen_random_uuid())
     FROM touched_issue ti
     RETURNING *
 )
@@ -534,6 +570,11 @@ WITH locked_issue AS MATERIALIZED (
     UPDATE comment SET
         content = $2,
         source_task_id = sqlc.narg(source_task_id)::uuid,
+        -- New text re-decides which agents it must not start, under the same
+        -- revision check as the text itself.
+        suppressed_agent_ids = CASE WHEN target.content IS DISTINCT FROM $2
+                                    THEN sqlc.narg(suppressed_agent_ids)::uuid[]
+                                    ELSE comment.suppressed_agent_ids END,
         revision = comment.revision + CASE WHEN target.did_change THEN 1 ELSE 0 END,
         updated_at = CASE WHEN target.did_change THEN now() ELSE comment.updated_at END
     FROM target
