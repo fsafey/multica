@@ -110,7 +110,7 @@ var runtimePoolAddRuntimeCmd = &cobra.Command{
 
 var runtimePoolPruneStaleRuntimeCmd = &cobra.Command{
 	Use:   "prune-stale-runtime <pool-id> <runtime-id>",
-	Short: "Remove a pool membership whose runtime no longer exists",
+	Short: "Remove a pool membership whose runtime is gone or offline past retention",
 	Args:  exactArgs(2),
 	RunE:  runRuntimePoolPruneStaleRuntime,
 }

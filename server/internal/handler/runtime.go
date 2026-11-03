@@ -964,8 +964,8 @@ func profileInstanceDeleteRefusal(rt db.AgentRuntime, profile db.RuntimeProfile,
 		// and tasks still leaves a row GC never reclaims, so any of those
 		// remedies would promise a cleanup that does not come.
 		parts = append(parts, fmt.Sprintf(
-			"It is a member of %d runtime pool(s), and Multica never removes a pool member automatically, so a dormant pooled worker returns under the same runtime ID; this row will not be reclaimed on its own.",
-			blockers.poolMemberships,
+			"It is a member of %d runtime pool(s), and Multica never removes a pool member automatically, so a dormant pooled worker returns under the same runtime ID; this row will not be reclaimed on its own. To retire it, once it has been offline for %d days a workspace admin can remove it from each pool with `multica dag pool prune-stale-runtime`, after which Multica reclaims it automatically.",
+			blockers.poolMemberships, ttlDays,
 		))
 	case rt.Status == "online":
 		parts = append(parts, fmt.Sprintf(
@@ -1014,11 +1014,15 @@ func profileInstanceDeleteRefusal(rt db.AgentRuntime, profile db.RuntimeProfile,
 		// Structured companions to the sentence above so a client can render
 		// its own localized copy instead of echoing the English (see
 		// writeErrorCode's rationale). The sentence stays the fallback.
-		"profile_id":              uuidToString(profile.ID),
-		"profile_name":            profile.DisplayName,
-		"runtime_status":          rt.Status,
-		"last_seen_at":            timestampToPtr(rt.LastSeenAt),
-		"auto_cleanup_after_days": ttlDays,
+		"profile_id":     uuidToString(profile.ID),
+		"profile_name":   profile.DisplayName,
+		"runtime_status": rt.Status,
+		"last_seen_at":   timestampToPtr(rt.LastSeenAt),
+	}
+	// A pool member is never cleaned up on its own, so a client rendering from
+	// these fields must not find a cleanup deadline the sentence denies.
+	if blockers.poolMemberships == 0 {
+		resp["auto_cleanup_after_days"] = ttlDays
 	}
 	if known {
 		resp["active_agent_count"] = len(blockers.agents)

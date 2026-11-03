@@ -24,7 +24,7 @@ const (
 
 var ErrStaleWorkflowAttempt = errors.New("stale workflow attempt or claim epoch")
 
-var ErrRuntimePoolMemberStillLive = errors.New("runtime still exists; only stale pool memberships can be pruned")
+var ErrRuntimePoolMemberStillLive = errors.New("runtime is not stale; only a removed runtime or one offline past the retention TTL can be pruned from a pool")
 
 var (
 	ErrNoWorkflowNodeReady  = errors.New("no compatible workflow node is ready")
@@ -263,8 +263,11 @@ func (s *WorkflowService) AddRuntimeToPool(
 	})
 }
 
-// PruneStaleRuntimeFromPool removes a dangling membership only after the
-// runtime row has been reaped. The pool's workspace is checked first.
+// PruneStaleRuntimeFromPool removes a membership whose runtime is stale: its
+// row is gone, or it has been offline longer than the retention TTL. Retention
+// GC never collects a pool member, so pruning the last membership of a retired
+// worker is what hands its row back to GC. The pool's workspace is checked
+// first.
 func (s *WorkflowService) PruneStaleRuntimeFromPool(
 	ctx context.Context,
 	workspaceID, poolID, runtimeID pgtype.UUID,
@@ -275,8 +278,10 @@ func (s *WorkflowService) PruneStaleRuntimeFromPool(
 	}); err != nil {
 		return false, fmt.Errorf("load runtime pool: %w", err)
 	}
-	if _, err := s.Queries.GetAgentRuntime(ctx, runtimeID); err == nil {
-		return false, ErrRuntimePoolMemberStillLive
+	if runtime, err := s.Queries.GetAgentRuntime(ctx, runtimeID); err == nil {
+		if !runtimePastRetention(runtime, time.Now()) {
+			return false, ErrRuntimePoolMemberStillLive
+		}
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		return false, fmt.Errorf("load runtime: %w", err)
 	}
@@ -288,6 +293,14 @@ func (s *WorkflowService) PruneStaleRuntimeFromPool(
 		return false, fmt.Errorf("remove runtime from pool: %w", err)
 	}
 	return rows > 0, nil
+}
+
+// runtimePastRetention is the staleness half of the retention GC predicate, so
+// a membership becomes prunable exactly when GC would otherwise reclaim the row.
+func runtimePastRetention(runtime db.AgentRuntime, now time.Time) bool {
+	return runtime.Status == "offline" &&
+		runtime.LastSeenAt.Valid &&
+		now.Sub(runtime.LastSeenAt.Time) > time.Duration(OfflineRuntimeTTLSeconds*float64(time.Second))
 }
 
 func (s *WorkflowService) BindAgentToPool(

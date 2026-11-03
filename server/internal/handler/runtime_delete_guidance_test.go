@@ -1012,11 +1012,14 @@ func TestDeleteAgentRuntime_PoolMemberInstanceDoesNotPromiseCleanup(t *testing.T
 		if strings.Contains(msg, "without any action from you") || strings.Contains(msg, "Stop that daemon first") {
 			t.Errorf("offline=%v: GC never reclaims a pool member, but guidance promises cleanup: %s", offline, msg)
 		}
-		if !strings.Contains(msg, "runtime pool") {
-			t.Errorf("offline=%v: refusal must name the pool membership holding the row: %s", offline, msg)
+		if !strings.Contains(msg, "runtime pool") || !strings.Contains(msg, "prune-stale-runtime") {
+			t.Errorf("offline=%v: refusal must name the pool membership and the way to drop it: %s", offline, msg)
 		}
 		if got, _ := body["runtime_pool_count"].(float64); got != 1 {
 			t.Errorf("offline=%v: runtime_pool_count = %v, want 1", offline, body["runtime_pool_count"])
+		}
+		if days, ok := body["auto_cleanup_after_days"]; ok {
+			t.Errorf("offline=%v: auto_cleanup_after_days = %v on a row GC never reclaims", offline, days)
 		}
 	}
 }
